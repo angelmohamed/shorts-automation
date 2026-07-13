@@ -1,5 +1,11 @@
 import type { MutableRefObject } from 'react';
+import type { MemeLine } from '@/lib/memeOcr';
 import type { TwitterTemplateSettings } from '../twitterTemplateTypes';
+
+/** An OCR-detected text line on an overlay image, plus whether the user wants it narrated and,
+    optionally, which ElevenLabs voice reads it (absent = the default voice). Consecutive enabled
+    lines with the same voice are spoken as one paragraph/take. */
+export interface OcrTextLine extends MemeLine { enabled: boolean; voiceId?: string }
 
 export type Handle = 'tl' | 'tc' | 'tr' | 'bl' | 'bc' | 'br' | 'move';
 
@@ -34,6 +40,21 @@ export interface ImageOverlay {
   x: number; y: number; w: number; h: number;
   start: number; end: number;
   src?: string;
+  /** Progressive reveal steps: at source time `t` the visible (top-anchored) fraction eases to `h`.
+      Sorted by t. Absent = the whole image is always visible. */
+  reveals?: { t: number; h: number }[];
+  /** Narration audio (ElevenLabs): blob lives in IndexedDB under `audioId`; starts playing at
+      `audioStart` (source-time seconds) for `audioDuration` audio-seconds. `audioSrc` is runtime-only. */
+  audioId?: string;
+  audioStart?: number;
+  audioDuration?: number;
+  audioSrc?: string;
+  /** Playback rate of the underlying video while this narration plays (baked into the reveal-step
+      source times at generation). The video runs this much faster than the voice; absent = 1. */
+  audioRate?: number;
+  /** Text lines OCR'd off the image right after it's added (auto). Rendered as click-to-toggle
+      highlights on the selected overlay; only `enabled` lines are narrated/revealed. */
+  ocrLines?: OcrTextLine[];
 }
 
 export interface Framing {
@@ -46,8 +67,8 @@ export interface Framing {
   /** Timeline clips when the video was split/cut into more than one span. Absent = simple trim
       (trimStart/trimEnd describe the single span). Kept alongside trim so legacy blobs restore. */
   segments?: ClipSegment[];
-  /** Image layers on top of the video (src stripped — blobs re-hydrate from IndexedDB by id). */
-  overlays?: Omit<ImageOverlay, 'src'>[];
+  /** Image layers on top of the video (runtime object URLs stripped — blobs re-hydrate from IndexedDB). */
+  overlays?: Omit<ImageOverlay, 'src' | 'audioSrc'>[];
 }
 
 export interface TikTokCanvasProps {
@@ -73,6 +94,11 @@ export interface TikTokCanvasProps {
   /** Fired with the current overlay list whenever it changes (add/move/resize/retime/remove/restore),
       so the workspace can hand it to the timeline. */
   onOverlaysChange?: (overlays: ImageOverlay[]) => void;
+  /** Armed narration-voice brush: while set, clicking an OCR line highlight paints that line with
+      this voice instead of toggling it in/out of the narration. */
+  ocrBrush?: { voiceId: string; color: string } | null;
+  /** voiceId → display color for OCR line highlights (lines with no voice use the accent style). */
+  ocrVoiceColors?: Record<string, string>;
 }
 
 export interface TikTokCanvasRef {
@@ -104,6 +130,9 @@ export interface TikTokCanvasRef {
   updateOverlay: (id: string, patch: Partial<Omit<ImageOverlay, 'id' | 'src'>>) => void;
   removeOverlay: (id: string) => void;
   getOverlays: () => ImageOverlay[];
+  /** Attach generated narration to an overlay: reveal steps + audio (already persisted to IndexedDB).
+      Extends the overlay's end so the narration finishes inside its window. */
+  setOverlayNarration: (id: string, n: { reveals: { t: number; h: number }[]; audioId: string; audioStart: number; audioDuration: number; audioSrc: string; audioRate: number }) => void;
   /** Snapshot the current framing (crop/pan/zoom/trim) for persistence. Returns null while a saved
    *  reel's video is still loading (framing not yet applied) so callers keep the known-good value. */
   getFraming: () => Framing | null;

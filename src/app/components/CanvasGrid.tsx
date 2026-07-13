@@ -10,6 +10,7 @@ import { useReelPersistence, type SavedReel } from '../hooks/useReelPersistence'
 import { makeEmptyEntry, MAX_REELS } from '@/lib/entry';
 import { getCachedVideo, prioritizeVideoFetch } from '@/lib/reelVideoCache';
 import { saveLocalVideo, getLocalVideo, saveOverlayImage } from '@/lib/localVideoStore';
+import { extractMemeLines } from '@/lib/memeOcr';
 import type { Framing, ImageOverlay } from './TikTokCanvas/types';
 import { TemplatesEmptyState } from './TemplatesEmptyState';
 import { defaultTwitterTemplateSettings } from './twitterTemplateTypes';
@@ -76,6 +77,7 @@ const centerGlyph  = (<svg {...SVG_PROPS}><circle cx="12" cy="12" r="2.5" /><pat
 const timelineGlyph = (<svg {...SVG_PROPS}><path d="M3 12h18" /><rect x="8" y="9" width="4" height="6" rx="1" /></svg>);
 const removeVideoGlyph = (<svg {...SVG_PROPS}><rect x="3" y="6" width="13" height="12" rx="2" /><path d="M16 10.5 21 8v8l-5-2.5" /><path d="m3 3 18 18" /></svg>);
 const addImageGlyph = (<svg {...SVG_PROPS}><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></svg>);
+const micGlyph = (<svg {...SVG_PROPS}><rect x="9" y="2" width="6" height="12" rx="3" /><path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8" /></svg>);
 
 // The selected reel's video source — paste a URL / upload a file / fetch. Ported from the old inline card.
 function ReelLinkFlyout({ entry, onUpdateField, onUpdateLocalVideo, onFetch }: {
@@ -133,6 +135,149 @@ function ReelLinkFlyout({ entry, onUpdateField, onUpdateLocalVideo, onFetch }: {
       )}
       <input ref={fileRef} type="file" accept="video/*" className="hidden" onChange={handleFile} />
       {entry.error && !hasLocal && <span className="text-caption text-danger-text">{entry.error}</span>}
+    </div>
+  );
+}
+
+// ── Narration flyout ─────────────────────────────────────────────────────────────────────────────
+// ElevenLabs narration for a meme overlay, straight off the image (OCR). Multiple voices: the first
+// voice is the default narrator; arm another voice as a "brush" and click OCR line highlights on the
+// overlay to paint paragraphs with it. Consecutive same-voice lines are spoken as one take; takes are
+// stitched into one narration track, synced to the playhead in preview and mixed into the export,
+// with the image un-cropping line by line as each line is read.
+const LS_11L_KEY = 'reels:11labs-key';
+const LS_11L_VOICE = 'reels:11labs-voice';       // legacy single-voice key, migrated into the list
+const LS_11L_VOICES = 'reels:11labs-voices';
+const DEFAULT_VOICE = 'TX3LPaxmHKxFdv7VOQHJ';   // ElevenLabs "Liam" — energetic social-media narrator, premade so free-tier keys can use it
+const VOICE_COLORS = ['#38bdf8', '#f472b6', '#a3e635', '#fbbf24', '#c084fc', '#fb7185'];
+
+/** Mono 16-bit PCM WAV — used to stitch multiple ElevenLabs takes into one narration track that both
+    the preview <audio> and the export's decodeAudioData handle without MP3-concatenation glitches. */
+function encodeWavMono(samples: Float32Array, sampleRate: number): Blob {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buf);
+  const writeStr = (o: number, str: string) => { for (let i = 0; i < str.length; i++) view.setUint8(o + i, str.charCodeAt(i)); };
+  writeStr(0, 'RIFF'); view.setUint32(4, 36 + samples.length * 2, true); writeStr(8, 'WAVE');
+  writeStr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  writeStr(36, 'data'); view.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+function loadSavedVoices(): string[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LS_11L_VOICES) ?? 'null');
+    if (Array.isArray(saved) && saved.length > 0) return saved.map(String);
+    return [localStorage.getItem(LS_11L_VOICE) ?? DEFAULT_VOICE];
+  } catch {
+    return [DEFAULT_VOICE];
+  }
+}
+
+function NarrateFlyout({ overlays, voices, onVoicesChange, brushIdx, onBrushChange, onGenerate }: {
+  overlays: ImageOverlay[];
+  voices: string[];
+  onVoicesChange: (v: string[]) => void;
+  brushIdx: number | null;
+  onBrushChange: (i: number | null) => void;
+  onGenerate: (overlayId: string, apiKey: string, onStatus: (s: string) => void) => Promise<string | null>;
+}) {
+  const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem(LS_11L_KEY) ?? ''; } catch { return ''; } });
+  const [targetId, setTargetId] = useState<string>('');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const target = overlays.find(o => o.id === targetId) ?? overlays[0];
+
+  if (overlays.length === 0) {
+    return <p className="text-caption text-fg-3">Add an image overlay first — then narrate it here.</p>;
+  }
+
+  const generate = async () => {
+    if (!target || busy) return;
+    setBusy(true); setMsg('Preparing narration…');
+    try {
+      const err = await onGenerate(target.id, apiKey.trim(), setMsg);
+      setMsg(err ?? 'Narration attached — press play to watch the reveal.');
+    } catch {
+      setMsg('Narration failed — try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      {overlays.length > 1 && (
+        <select
+          value={target?.id ?? ''}
+          onChange={e => setTargetId(e.target.value)}
+          aria-label="Overlay to narrate"
+          className="h-8 rounded-md border border-line-strong bg-transparent px-2 text-body text-fg outline-none"
+        >
+          {overlays.map(o => <option key={o.id} value={o.id}>{o.name || 'Image'}</option>)}
+        </select>
+      )}
+      <input
+        type="password"
+        value={apiKey}
+        onChange={e => { setApiKey(e.target.value); try { localStorage.setItem(LS_11L_KEY, e.target.value); } catch { /* ignore */ } }}
+        placeholder="ElevenLabs API key"
+        className="h-8 rounded-md border border-line-strong bg-transparent px-2 text-body text-fg placeholder:text-fg-3 outline-none"
+      />
+      {/* Voice palette: row 0 is the default narrator; the colored dot arms that voice as a brush for
+          painting lines on the overlay. */}
+      {voices.map((v, i) => (
+        <div key={i} className="flex items-center gap-1.5">
+          <button
+            type="button"
+            aria-label={brushIdx === i ? 'Disarm voice brush' : `Arm voice ${i + 1} brush`}
+            title={brushIdx === i ? 'Brush armed — click lines on the image; click here to disarm' : 'Arm this voice, then click lines on the image to paint them'}
+            onClick={() => onBrushChange(brushIdx === i ? null : i)}
+            className={`grid size-7 shrink-0 place-items-center rounded-md border transition-colors ${brushIdx === i ? 'border-accent bg-accent/15' : 'border-line-strong hover:border-accent-border'}`}
+          >
+            <span className="size-3 rounded-full" style={{ background: VOICE_COLORS[i % VOICE_COLORS.length] }} />
+          </button>
+          <input
+            type="text"
+            value={v}
+            onChange={e => onVoicesChange(voices.map((x, j) => (j === i ? e.target.value : x)))}
+            placeholder={i === 0 ? 'Default voice ID (Liam)' : 'Voice ID'}
+            className="h-7 min-w-0 flex-1 rounded-md border border-line-strong bg-transparent px-2 text-body text-fg placeholder:text-fg-3 outline-none"
+          />
+          {i > 0 && (
+            <button
+              type="button"
+              aria-label="Remove voice"
+              onClick={() => { if (brushIdx === i) onBrushChange(null); onVoicesChange(voices.filter((_, j) => j !== i)); }}
+              className="grid size-7 shrink-0 place-items-center rounded-md text-fg-3 hover:text-danger-text"
+            >
+              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden><path d="M18 6 6 18M6 6l12 12" /></svg>
+            </button>
+          )}
+        </div>
+      ))}
+      {voices.length < VOICE_COLORS.length && (
+        <button
+          type="button"
+          onClick={() => onVoicesChange([...voices, ''])}
+          className="self-start text-caption text-fg-3 hover:text-fg underline underline-offset-2"
+        >
+          + Add voice
+        </button>
+      )}
+      <p className="text-caption text-fg-3">
+        {brushIdx != null
+          ? 'Brush armed — click lines on the image to give them this voice. Same-voice lines read as one paragraph.'
+          : 'Reads the detected text as a hyped take, un-cropping line by line. Click lines on the overlay to skip them, or arm a voice dot to paint paragraphs.'}
+      </p>
+      <Button variant="primary" size="sm" loading={busy} disabled={!apiKey.trim()} onClick={generate}>
+        Generate narration
+      </Button>
+      {msg && <span className="text-caption text-fg-3">{msg}</span>}
     </div>
   );
 }
@@ -326,6 +471,23 @@ export function CanvasGrid({
   const [framingMap, setFramingMap] = useState<Record<string, Framing>>({});
   // entryId → live image-overlay list, reported by each canvas — feeds the timeline's overlay lane.
   const [overlaysMap, setOverlaysMap] = useState<Record<string, ImageOverlay[]>>({});
+  // Narration voice palette (voices[0] = default narrator) + the voice armed as a line-painting
+  // brush on the OCR highlights. Persisted so the cast survives reloads.
+  const [narrationVoices, setNarrationVoices] = useState<string[]>(loadSavedVoices);
+  const [voiceBrushIdx, setVoiceBrushIdx] = useState<number | null>(null);
+  useEffect(() => {
+    try { localStorage.setItem(LS_11L_VOICES, JSON.stringify(narrationVoices)); } catch { /* ignore */ }
+  }, [narrationVoices]);
+  const narrationVoiceColors = useMemo(() => {
+    const m: Record<string, string> = {};
+    narrationVoices.forEach((v, i) => { const id = v.trim(); if (id && !(id in m)) m[id] = VOICE_COLORS[i % VOICE_COLORS.length]; });
+    return m;
+  }, [narrationVoices]);
+  const voiceBrush = useMemo(() => {
+    if (voiceBrushIdx == null) return null;
+    const id = narrationVoices[voiceBrushIdx]?.trim();
+    return id ? { voiceId: id, color: VOICE_COLORS[voiceBrushIdx % VOICE_COLORS.length] } : null;
+  }, [voiceBrushIdx, narrationVoices]);
   const [reelTemplateMap, setReelTemplateMap] = useState<Record<string, string | null>>({}); // entryId → template id
   // entryId → user-given reel name (shown/edited in the bottom strip). Kept OUTSIDE VideoEntry — like
   // framing/template above — because entries model the video pipeline (fetch/upload state) while the name
@@ -662,12 +824,152 @@ export function CanvasGrid({
   const getVideoZoom = useCallback((id: string) => videoZoomMap[id] ?? 1, [videoZoomMap]);
 
   // Add an image overlay to a reel: persist the blob (IndexedDB) so it survives reloads, then hand a
-  // fresh object URL to the canvas, which sizes/centres it and selects it.
+  // fresh object URL to the canvas, which sizes/centres it and selects it. OCR runs in the background
+  // right away so the click-to-toggle narration highlights appear on the overlay once the text is read.
   const addOverlayImage = useCallback(async (id: string, file: File) => {
     const overlayId = `ov-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     await saveOverlayImage(overlayId, file, file.name);
-    canvasRefsMap.current.get(id)?.addImageOverlay(overlayId, URL.createObjectURL(file), file.name);
+    const url = URL.createObjectURL(file);
+    canvasRefsMap.current.get(id)?.addImageOverlay(overlayId, url, file.name);
+    void extractMemeLines(url)
+      .then(lines => {
+        if (lines.length === 0) return;
+        canvasRefsMap.current.get(id)?.updateOverlay(overlayId, { ocrLines: lines.map(l => ({ ...l, enabled: true })) });
+      })
+      .catch(e => console.error('[ocr] auto-detect failed:', e));
   }, [canvasRefsMap]);
+
+  // Generate ElevenLabs narration for an overlay and attach it. The meme's text is read straight off
+  // the image (OCR — nothing to type). Consecutive enabled lines with the same painted voice form one
+  // paragraph, spoken as its own excited take; the takes are stitched into a single narration track.
+  // The reveal is adapted to that audio: character timestamps (offset by each take's position in the
+  // stitched track) say when each OCR text LINE is reached, and the image un-crops to that line's own
+  // boundary just before its first word lands. Returns an error message, or null on success.
+  const generateNarration = useCallback(async (entryId: string, overlayId: string, apiKey: string, onStatus?: (s: string) => void): Promise<string | null> => {
+    const ref = canvasRefsMap.current.get(entryId);
+    const overlay = ref?.getOverlays().find(o => o.id === overlayId);
+    if (!ref || !overlay?.src) return 'The overlay image isn’t loaded yet — try again in a moment.';
+
+    // The image was OCR'd when it was added; run it now only if that hasn't landed yet (e.g. the
+    // user hit Generate immediately). Only lines the user left enabled get narrated.
+    let ocrLines = overlay.ocrLines;
+    if (!ocrLines?.length) {
+      onStatus?.('Reading the meme text…');
+      try {
+        ocrLines = (await extractMemeLines(overlay.src)).map(l => ({ ...l, enabled: true }));
+      } catch (e) {
+        console.error('[narration] OCR failed:', e);
+        return 'Couldn’t read the image — OCR failed to load.';
+      }
+      if (ocrLines.length === 0) return 'No readable text found in the image.';
+      ref.updateOverlay(overlayId, { ocrLines });
+    }
+    const memeLines = ocrLines.filter(l => l.enabled);
+    if (memeLines.length === 0) return 'Every text line is unselected — click lines on the image to include them.';
+
+    // Consecutive same-voice lines form one spoken paragraph (one TTS take with that voice).
+    const defaultVoice = (narrationVoices[0] ?? '').trim() || DEFAULT_VOICE;
+    const groups: { voiceId: string; lines: typeof memeLines }[] = [];
+    for (const line of memeLines) {
+      const vid = (line.voiceId ?? '').trim() || defaultVoice;
+      const g = groups[groups.length - 1];
+      if (g && g.voiceId === vid) g.lines.push(line);
+      else groups.push({ voiceId: vid, lines: [line] });
+    }
+
+    // One take per group. Within a take: lines joined with spaces, terminal punctuation added only at
+    // block ends — the voice pauses between blocks but flows straight through mid-sentence line
+    // wraps. Each take is decoded to PCM so the takes can be stitched into ONE narration track, with
+    // per-line beat times = take offset + the line's first-character timestamp.
+    const MIX_SR = 44100;
+    const GROUP_GAP_S = 0.25;   // breath between voices
+    const segments: { samples: Float32Array; beats: number[] }[] = [];
+    const ac = new AudioContext({ sampleRate: MIX_SR });
+    try {
+      for (let gi = 0; gi < groups.length; gi++) {
+        const g = groups[gi];
+        onStatus?.(groups.length > 1 ? `Generating voice ${gi + 1}/${groups.length}…` : 'Generating narration…');
+        let joined = '';
+        const offs: number[] = [];
+        for (let i = 0; i < g.lines.length; i++) {
+          const line = g.lines[i];
+          const endsBlock = i === g.lines.length - 1 || g.lines[i + 1].blockIdx !== line.blockIdx;
+          if (joined) joined += ' ';
+          offs.push(joined.length);
+          joined += endsBlock && !/[.!?…,:;]$/.test(line.text) ? `${line.text}.` : line.text;
+        }
+
+        const res = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            apiKey, voiceId: g.voiceId, text: joined,
+            // Excited meme-narrator delivery: low stability + high style = animated, hyped read.
+            voiceSettings: { stability: 0.35, similarity_boost: 0.8, style: 0.6, use_speaker_boost: true },
+          }),
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) return (json as { error?: string }).error ?? 'Narration failed.';
+        const { audio_base64: audioB64, alignment } = json as {
+          audio_base64?: string;
+          alignment?: { characters?: string[]; character_start_times_seconds?: number[]; character_end_times_seconds?: number[] };
+        };
+        if (!audioB64 || !alignment?.character_start_times_seconds?.length) return 'ElevenLabs returned no audio.';
+
+        const bytes = Uint8Array.from(atob(audioB64), c => c.charCodeAt(0));
+        let decoded: AudioBuffer;
+        try {
+          decoded = await ac.decodeAudioData(bytes.buffer);
+        } catch {
+          return 'Couldn’t decode the narration audio.';
+        }
+        const starts = alignment.character_start_times_seconds;
+        segments.push({
+          samples: Float32Array.from(decoded.getChannelData(0)),   // ElevenLabs is mono
+          beats: offs.map(off => starts[Math.min(off, starts.length - 1)] ?? 0),
+        });
+      }
+    } finally {
+      void ac.close();
+    }
+
+    // Stitch the takes (with a breath of silence between voices) and WAV-encode the result.
+    const gapSamples = Math.round(GROUP_GAP_S * MIX_SR);
+    const totalSamples = segments.reduce((n, s) => n + s.samples.length, 0) + gapSamples * (segments.length - 1);
+    const stitched = new Float32Array(totalSamples);
+    const beatStarts: number[] = [];   // audio-time per enabled line, in memeLines order
+    let cursor = 0;
+    for (const seg of segments) {
+      for (const b of seg.beats) beatStarts.push(cursor / MIX_SR + b);
+      stitched.set(seg.samples, cursor);
+      cursor += seg.samples.length + gapSamples;
+    }
+    const audioDuration = totalSamples / MIX_SR;
+    const blob = encodeWavMono(stitched, MIX_SR);
+    const audioId = `aud-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    await saveOverlayImage(audioId, blob, 'narration.wav');
+
+    // Each OCR line carries its own crop boundary, so text↔reveal mapping is exact (monotonic —
+    // never crop back up). Each line un-crops a breath BEFORE its first word so the text is on
+    // screen as it's read. Reveal times live in SOURCE time: the background video runs VIDEO_RATE×
+    // faster than the voice, so audio-time beats are scaled up onto the video's clock.
+    const REVEAL_LEAD_S = 0.15;
+    const VIDEO_RATE = 1.25;   // slight background speed-up, brainrot style
+    let lastH = 0;
+    const audioStart = overlay.start;
+    const reveals: { t: number; h: number }[] = [];
+    for (let i = 0; i < memeLines.length; i++) {
+      const h = memeLines[i].bottomFrac;
+      if (h <= lastH && i > 0) continue;
+      lastH = Math.max(lastH, h);
+      reveals.push({ t: audioStart + Math.max(0, beatStarts[i] - REVEAL_LEAD_S) * VIDEO_RATE, h: lastH });
+    }
+
+    onStatus?.(`Narrating ${memeLines.length} line${memeLines.length === 1 ? '' : 's'} in ${groups.length} voice${groups.length === 1 ? '' : 's'}…`);
+
+    ref.setOverlayNarration(overlayId, { reveals, audioId, audioStart, audioDuration, audioSrc: URL.createObjectURL(blob), audioRate: VIDEO_RATE });
+    return null;
+  }, [canvasRefsMap, narrationVoices]);
 
   const applyVideoZoom = useCallback((id: string, s: number) => {
     const clamped = Math.max(0.5, Math.min(3, s));
@@ -898,6 +1200,16 @@ export function CanvasGrid({
                 onUpdateField={(f, v) => recordEdit(selectedEntry.id, f, v)}
                 onUpdateLocalVideo={(s, n) => onUpdateLocalVideo(selectedEntry.id, s, n)}
                 onFetch={() => onFetchVideo(selectedEntry.id)}
+              />
+            ) },
+            { id: 'narrate', label: 'Narration', icon: micGlyph, content: (
+              <NarrateFlyout
+                overlays={overlaysMap[selectedEntry.id] ?? []}
+                voices={narrationVoices}
+                onVoicesChange={setNarrationVoices}
+                brushIdx={voiceBrushIdx}
+                onBrushChange={setVoiceBrushIdx}
+                onGenerate={(overlayId, apiKey, onStatus) => generateNarration(selectedEntry.id, overlayId, apiKey, onStatus)}
               />
             ) },
           ]}
@@ -1181,6 +1493,8 @@ export function CanvasGrid({
                           initialFraming={framingMap[entry.id] ?? null}
                           onFramingChange={markFramingDirty}
                           onOverlaysChange={list => setOverlaysMap(prev => ({ ...prev, [entry.id]: list }))}
+                          ocrBrush={voiceBrush}
+                          ocrVoiceColors={narrationVoiceColors}
                           onRecordingStateChange={state =>
                             setRecordingStateMap(prev => ({ ...prev, [entry.id]: state }))
                           }

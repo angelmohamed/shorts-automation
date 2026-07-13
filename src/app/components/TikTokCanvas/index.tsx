@@ -11,6 +11,7 @@ import { getOverlayImage, deleteOverlayImage } from '@/lib/localVideoStore';
 import { drawHeaderOnContext, computeSonotradeHeaderHeight } from './drawing/drawHeader';
 import { drawReelCells, drawFreeElements, reelLayout, reelVideoRect, ensureReelTextFontsLoaded, shiftFreeElementsForReelCrop, reelFreeElementDrawnRect } from './drawing/drawReelCell';
 import { drawMarketRow } from './drawing/drawMarketRow';
+import { drawImageOverlays } from './drawing/drawOverlays';
 import { resolveTwitterTemplateSettings } from '../twitterTemplateTypes';
 import { VideoOverlays } from './ui/VideoOverlays';
 import { useVideoLoading } from './hooks/useVideoLoading';
@@ -35,6 +36,8 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
   initialFraming = null,
   onFramingChange,
   onOverlaysChange,
+  ocrBrush = null,
+  ocrVoiceColors,
 }: TikTokCanvasProps, ref) {
   // Resolved overlay style (defaults reproduce the original look). twKey lets the draw loop restart
   // only when the style actually changes, not on every render.
@@ -121,15 +124,87 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
   // a reload) — load its blob from IndexedDB and mint a fresh URL.
   useEffect(() => {
     for (const o of overlays) {
-      if (o.src) continue;
-      void getOverlayImage(o.id).then(hit => {
-        if (!hit) return;
-        const src = URL.createObjectURL(hit.blob);
-        if (!overlaysRef.current.some(x => x.id === o.id && !x.src)) { URL.revokeObjectURL(src); return; }
-        commitOverlays(overlaysRef.current.map(x => (x.id === o.id && !x.src ? { ...x, src } : x)), { silent: true });
-      });
+      if (!o.src) {
+        void getOverlayImage(o.id).then(hit => {
+          if (!hit) return;
+          const src = URL.createObjectURL(hit.blob);
+          if (!overlaysRef.current.some(x => x.id === o.id && !x.src)) { URL.revokeObjectURL(src); return; }
+          commitOverlays(overlaysRef.current.map(x => (x.id === o.id && !x.src ? { ...x, src } : x)), { silent: true });
+        });
+      }
+      if (o.audioId && !o.audioSrc) {
+        const audioId = o.audioId;
+        void getOverlayImage(audioId).then(hit => {
+          if (!hit) return;
+          const audioSrc = URL.createObjectURL(hit.blob);
+          if (!overlaysRef.current.some(x => x.id === o.id && !x.audioSrc)) { URL.revokeObjectURL(audioSrc); return; }
+          commitOverlays(overlaysRef.current.map(x => (x.id === o.id && !x.audioSrc ? { ...x, audioSrc } : x)), { silent: true });
+        });
+      }
     }
   }, [overlays, commitOverlays]);
+
+  // ── Narration audio preview: one <audio> per narrated overlay, slaved to the video playhead ──
+  const overlayAudioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  useEffect(() => {
+    const map = overlayAudioElsRef.current;
+    const live = new Set<string>();
+    for (const o of overlays) {
+      if (!o.audioId || !o.audioSrc) continue;
+      live.add(o.id);
+      let el = map.get(o.id);
+      if (!el) { el = new Audio(); el.preload = 'auto'; map.set(o.id, el); }
+      if (el.src !== o.audioSrc) el.src = o.audioSrc;
+    }
+    for (const [id, el] of map) {
+      if (!live.has(id)) { el.pause(); el.removeAttribute('src'); map.delete(id); }
+    }
+  }, [overlays]);
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const els = overlayAudioElsRef.current;
+    const sync = () => {
+      // A narrated overlay silences the underlying video (the voice-over IS the audio) and runs it
+      // slightly fast (the overlay's baked-in rate). Enforced here so it also recovers after an
+      // export, which resets the element to muted/1×.
+      const narrated = overlaysRef.current.filter(o => o.audioId);
+      const wantMuted = narrated.length > 0;
+      const wantRate = narrated.length ? Math.max(1, ...narrated.map(o => o.audioRate ?? 1)) : 1;
+      if (v.muted !== wantMuted) v.muted = wantMuted;
+      if (v.playbackRate !== wantRate) v.playbackRate = wantRate;
+      const ct = v.currentTime;
+      for (const o of overlaysRef.current) {
+        const el = els.get(o.id);
+        if (!el || !o.audioId) continue;
+        // Source time → audio time: the video advances `audioRate`× faster than the voice.
+        const rel = (ct - (o.audioStart ?? o.start)) / (o.audioRate ?? 1);
+        const within = rel >= 0 && rel < (o.audioDuration ?? 0);
+        if (v.paused || !within) {
+          if (!el.paused) el.pause();
+          if (within) el.currentTime = Math.max(0, rel);   // scrub-while-paused keeps it primed
+          continue;
+        }
+        if (Math.abs(el.currentTime - rel) > 0.3) el.currentTime = rel;
+        if (el.paused) void el.play().catch(() => { /* autoplay policy — user will interact */ });
+      }
+    };
+    v.addEventListener('timeupdate', sync);
+    v.addEventListener('play', sync);
+    v.addEventListener('pause', sync);
+    v.addEventListener('seeked', sync);
+    return () => {
+      v.removeEventListener('timeupdate', sync);
+      v.removeEventListener('play', sync);
+      v.removeEventListener('pause', sync);
+      v.removeEventListener('seeked', sync);
+      for (const el of els.values()) el.pause();
+    };
+  }, [videoSrc]);
+  useEffect(() => () => {
+    for (const el of overlayAudioElsRef.current.values()) { el.pause(); el.removeAttribute('src'); }
+    overlayAudioElsRef.current.clear();
+  }, []);
 
   // Lazily decode an overlay's image for the draw loops.
   const getOverlayImg = useCallback((o: ImageOverlay): HTMLImageElement | null => {
@@ -178,9 +253,34 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
     window.addEventListener('pointerup', onUp);
   }, [commitOverlays, notifyFraming]);
 
+  // Click on an OCR line highlight: with a voice brush armed, paint the line with that voice (click
+  // again to unpaint back to the default voice); otherwise flip the line in/out of the narration.
+  const ocrBrushRef = useRef(ocrBrush); ocrBrushRef.current = ocrBrush;
+  const toggleOcrLine = useCallback((id: string, idx: number) => {
+    const brush = ocrBrushRef.current;
+    commitOverlays(overlaysRef.current.map(x => (x.id === id && x.ocrLines
+      ? {
+        ...x,
+        ocrLines: x.ocrLines.map((l, i) => {
+          if (i !== idx) return l;
+          if (brush) {
+            return l.voiceId === brush.voiceId
+              ? { ...l, voiceId: undefined }
+              : { ...l, voiceId: brush.voiceId, enabled: true };   // painting a voice implies narrating it
+          }
+          return { ...l, enabled: !l.enabled };
+        }),
+      }
+      : x)));
+  }, [commitOverlays]);
+
   const removeOverlayFn = useCallback((id: string) => {
     const doomed = overlaysRef.current.find(x => x.id === id);
     if (doomed?.src) URL.revokeObjectURL(doomed.src);
+    if (doomed?.audioSrc) URL.revokeObjectURL(doomed.audioSrc);
+    if (doomed?.audioId) void deleteOverlayImage(doomed.audioId);
+    const audioEl = overlayAudioElsRef.current.get(id);
+    if (audioEl) { audioEl.pause(); audioEl.removeAttribute('src'); overlayAudioElsRef.current.delete(id); }
     overlayImgsRef.current.delete(id);
     commitOverlays(overlaysRef.current.filter(x => x.id !== id));
     setSelectedOverlayId(prev => (prev === id ? null : prev));
@@ -300,10 +400,39 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
       img.src = src;
     },
     updateOverlay: (id: string, patch: Partial<Omit<ImageOverlay, 'id' | 'src'>>) => {
-      commitOverlays(overlaysRef.current.map(x => (x.id === id ? { ...x, ...patch } : x)));
+      commitOverlays(overlaysRef.current.map(x => {
+        if (x.id !== id) return x;
+        const next = { ...x, ...patch };
+        // A timeline MOVE (both edges shift, length preserved) carries the narration with it: reveal
+        // step times and the audio anchor are absolute source times, so shift them by the same delta.
+        // A pure trim (one edge) leaves them anchored.
+        if (patch.start != null && patch.end != null) {
+          const delta = patch.start - x.start;
+          const isMove = Math.abs((patch.end - patch.start) - (x.end - x.start)) < 0.002;
+          if (isMove && Math.abs(delta) > 0.0001) {
+            if (next.reveals) next.reveals = next.reveals.map(r => ({ t: r.t + delta, h: r.h }));
+            if (next.audioStart != null) next.audioStart += delta;
+          }
+        }
+        return next;
+      }));
     },
     removeOverlay: removeOverlayFn,
     getOverlays: () => overlaysRef.current,
+    setOverlayNarration: (id, n) => {
+      commitOverlays(overlaysRef.current.map(x => (x.id === id ? {
+        ...x,
+        reveals: n.reveals,
+        audioId: n.audioId,
+        audioStart: n.audioStart,
+        audioDuration: n.audioDuration,
+        audioSrc: n.audioSrc,
+        audioRate: n.audioRate,
+        // The overlay must stay on screen until the narrator finishes, plus a couple seconds of air
+        // (source-time: the video runs `audioRate`× faster than the voice).
+        end: Math.max(x.end, n.audioStart + (n.audioDuration + 2) * n.audioRate),
+      } : x)));
+    },
     getFraming: (): Framing | null =>
       // Return null while boxRef is still the placeholder (NOT the reel's band), so the autosave/capture
       // never persist it: (a) while the video is loading — boxRef is the full-canvas placeholder until
@@ -319,7 +448,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
         includeEdit: includeEditRef.current,
         segments: timelineSegmentsRef.current ?? undefined,
         overlays: overlaysRef.current.length
-          ? overlaysRef.current.map(({ src: _src, ...rest }) => rest)
+          ? overlaysRef.current.map(({ src: _src, audioSrc: _audioSrc, ...rest }) => rest)
           : undefined,
       }),
     applyFraming: applyFramingFn,
@@ -491,13 +620,10 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
         }
         drawReelCells({ ctx, s: tw, L, logoSrc: overlayLogoSrc, name: overlayDisplayName, handle: overlayHandle, logoImgRef, verifiedImgRef, getCellImg, placeholder: false, overlayCaption });
         drawFreeElements({ ctx, s: cropTw, logoSrc: overlayLogoSrc, name: overlayDisplayName, handle: overlayHandle, logoImgRef, verifiedImgRef, getCellImg, placeholder: false, overlayCaption, from: videoLayer });
-        // Image overlays — topmost layer, visible while the playhead is inside their time window.
-        const ct = video.currentTime;
-        for (const o of overlaysRef.current) {
-          if (ct < o.start || ct > o.end) continue;
-          const img = getOverlayImg(o);
-          if (img) ctx.drawImage(img, o.x, o.y, o.w, o.h);
-        }
+        // Image overlays — topmost layer, visible while the playhead is inside their time window,
+        // un-cropping per their reveal steps (narrated memes).
+        for (const o of overlaysRef.current) getOverlayImg(o);   // lazy-decode into the shared map
+        drawImageOverlays(ctx, overlaysRef.current, overlayImgsRef.current, video.currentTime);
         return;
       }
 
@@ -662,6 +788,32 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
               touchAction: 'none',
             }}
           >
+            {/* OCR text lines as clickable narration highlights: enabled lines glow (tinted by their
+                assigned voice's color), excluded lines dim with a strike. With a voice brush armed,
+                clicking paints the line with that voice. Shown while the overlay is selected. */}
+            {sel && o.ocrLines?.map((ln, i) => {
+              const voiceColor = ln.voiceId ? ocrVoiceColors?.[ln.voiceId] : undefined;
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  title={`${ocrBrush ? 'Click to paint with the armed voice' : ln.enabled ? 'Click to skip' : 'Click to narrate'}: “${ln.text}”`}
+                  aria-label={`${ocrBrush ? 'Paint voice on' : ln.enabled ? 'Exclude from narration' : 'Include in narration'}: ${ln.text}`}
+                  onPointerDown={e => e.stopPropagation()}
+                  onClick={e => { e.stopPropagation(); toggleOcrLine(o.id, i); }}
+                  className={`absolute rounded-[3px] ring-1 transition-colors ${ocrBrush ? 'cursor-crosshair' : ''} ${ln.enabled
+                    ? (voiceColor ? '' : 'ring-accent bg-accent/15 hover:bg-accent/25')
+                    : 'ring-line bg-black/60 hover:bg-black/45'}`}
+                  style={{
+                    left: ln.x0 * o.w * DISPLAY_SCALE - 2, top: ln.y0 * o.h * DISPLAY_SCALE - 2,
+                    width: (ln.x1 - ln.x0) * o.w * DISPLAY_SCALE + 4, height: (ln.y1 - ln.y0) * o.h * DISPLAY_SCALE + 4,
+                    ...(ln.enabled && voiceColor ? { boxShadow: `inset 0 0 0 1px ${voiceColor}`, background: `${voiceColor}2b` } : {}),
+                  }}
+                >
+                  {!ln.enabled && <span className="absolute left-0 right-0 top-1/2 h-px bg-danger-text/80" aria-hidden />}
+                </button>
+              );
+            })}
             {sel && (
               <>
                 <div

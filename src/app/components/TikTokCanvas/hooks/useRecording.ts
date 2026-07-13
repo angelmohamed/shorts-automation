@@ -12,6 +12,8 @@ import {
 import { drawHeaderOnContext, computeSonotradeHeaderHeight } from '../drawing/drawHeader';
 import { drawReelCells, drawFreeElements, reelLayout, reelVideoRect, ensureReelTextFontsLoaded, shiftFreeElementsForReelCrop } from '../drawing/drawReelCell';
 import { drawMarketRow } from '../drawing/drawMarketRow';
+import { drawImageOverlays } from '../drawing/drawOverlays';
+import { getOverlayImage } from '@/lib/localVideoStore';
 import { countCaptionLines } from '../drawing/countCaptionLines';
 import type { Box, ImageOverlay, MarketData } from '../types';
 import type { TwitterTemplateSettings } from '../../twitterTemplateTypes';
@@ -297,9 +299,21 @@ export function useRecording(config: UseRecordingConfig) {
       const lastSample = videoSamples[videoSamples.length - 1];
       const fullDuration = lastSample.timestamp + lastSample.duration;
       const clipStart = trimStartRef.current;
-      const clipEnd = trimEndRef.current > 0 && trimEndRef.current <= fullDuration ? trimEndRef.current : fullDuration;
+      let clipEnd = trimEndRef.current > 0 && trimEndRef.current <= fullDuration ? trimEndRef.current : fullDuration;
+
+      // Narrated reels: the background video runs `audioRate`× fast (baked into the overlay), and
+      // the clip stops a couple of wall-clock seconds after the narrator finishes — no dead air.
+      const narrated = (overlaysRef?.current ?? []).filter(o => o.audioId && (o.audioDuration ?? 0) > 0);
+      const videoRate = narrated.length ? Math.max(1, ...narrated.map(o => o.audioRate ?? 1)) : 1;
+      const POST_NARRATION_PAD_S = 2.5;   // wall-clock seconds of video after the voice-over ends
+      if (narrated.length > 0) {
+        const narrEndSource = Math.max(...narrated.map(o => (o.audioStart ?? o.start) + (o.audioDuration ?? 0) * (o.audioRate ?? 1)));
+        clipEnd = Math.max(clipStart + 0.1, Math.min(clipEnd, narrEndSource + POST_NARRATION_PAD_S * videoRate));
+      }
+
       const clipDuration = Math.max(0.1, clipEnd - clipStart);
-      const totalFrames = Math.floor(clipDuration * EXPORT_FPS);
+      const outputDuration = clipDuration / videoRate;   // sped-up video compresses the output timeline
+      const totalFrames = Math.floor(outputDuration * EXPORT_FPS);
 
       // ── Extract AVC decoder description from MP4Box ──────────────────────────
       let description: Uint8Array | undefined;
@@ -333,7 +347,88 @@ export function useRecording(config: UseRecordingConfig) {
       let audioPackets: TEncodedPacket[] = [];
       let audioDecoderConfigForExport: AudioDecoderConfig | null = null;
 
-      if (audioSamples.length > 0) {
+      // ── Narration track ───────────────────────────────────────────────────────
+      // Overlays with ElevenLabs narration replace the source audio outright (the underlying video
+      // is muted — the meme voice-over IS the audio): decode the narration(s), place them on the
+      // export timeline in an OfflineAudioContext, re-encode AAC. The fast AAC packet-copy path
+      // below can't do that, so a narrated reel whose mix fails exports silent (source audio would
+      // be desynced anyway once the video is sped up).
+      if (narrated.length > 0 && typeof AudioEncoder !== 'undefined' && typeof OfflineAudioContext !== 'undefined') {
+        setRecStatus('Mixing narration...');
+        try {
+          const MIX_SR = 44100, MIX_CH = 2, AFRAME = 1024;
+          const tempCtx = new AudioContext({ sampleRate: MIX_SR });
+          const narrBufs: { start: number; buf: AudioBuffer }[] = [];
+          for (const o of narrated) {
+            const rec = await getOverlayImage(o.audioId!);
+            if (!rec) continue;
+            try {
+              narrBufs.push({ start: (o.audioStart ?? o.start), buf: await tempCtx.decodeAudioData(await rec.blob.arrayBuffer()) });
+            } catch { /* skip an undecodable narration */ }
+          }
+          await tempCtx.close();
+
+          if (narrBufs.length > 0) {
+            const offA = new OfflineAudioContext(MIX_CH, Math.ceil(outputDuration * MIX_SR), MIX_SR);
+            for (const n of narrBufs) {
+              const src = offA.createBufferSource();
+              src.buffer = n.buf;
+              src.connect(offA.destination);
+              // Narration anchor on the OUTPUT timeline: source-time offset compressed by the
+              // video speed-up (the voice itself plays at 1×).
+              const when = (n.start - clipStart) / videoRate;
+              if (when >= 0) src.start(when);
+              else src.start(0, -when);           // clip starts mid-narration → skip its head
+            }
+            const mixed = await offA.startRendering();
+
+            const chunks: EncodedAudioChunk[] = [];
+            let encCfg: AudioDecoderConfig | null = null;
+            let encErr: Error | null = null;
+            const enc = new AudioEncoder({
+              output: (chunk: EncodedAudioChunk, meta?: EncodedAudioChunkMetadata) => {
+                chunks.push(chunk);
+                if (meta?.decoderConfig && !encCfg) encCfg = meta.decoderConfig;
+              },
+              error: (e: Error) => { encErr = e; },
+            });
+            enc.configure({ codec: 'mp4a.40.2', sampleRate: MIX_SR, numberOfChannels: MIX_CH, bitrate: 128_000 });
+            const chData = Array.from({ length: MIX_CH }, (_, c) => mixed.getChannelData(c));
+            let tMicros = 0;
+            for (let offset = 0; offset < mixed.length; offset += AFRAME) {
+              const fc = Math.min(AFRAME, mixed.length - offset);
+              const planar = new Float32Array(fc * MIX_CH);
+              for (let c = 0; c < MIX_CH; c++) {
+                const chan = chData[c];
+                for (let i = 0; i < fc; i++) planar[c * fc + i] = chan[offset + i] ?? 0;
+              }
+              const ad = new AudioData({ format: 'f32-planar', sampleRate: MIX_SR, numberOfFrames: fc, numberOfChannels: MIX_CH, timestamp: tMicros, data: planar });
+              enc.encode(ad);
+              ad.close();
+              tMicros += Math.round((fc / MIX_SR) * 1_000_000);
+            }
+            await enc.flush();
+            enc.close();
+            if (encErr) throw encErr;
+
+            if (chunks.length > 0) {
+              if (!encCfg) {
+                const sfIdx = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350].indexOf(MIX_SR);
+                const si = sfIdx >= 0 ? sfIdx : 4;
+                encCfg = { codec: 'mp4a.40.2', sampleRate: MIX_SR, numberOfChannels: MIX_CH, description: new Uint8Array([(2 << 3) | (si >> 1), ((si & 1) << 7) | (MIX_CH << 3)]) };
+              }
+              audioSource = new EncodedAudioPacketSource('aac');
+              output.addAudioTrack(audioSource);
+              audioPackets = chunks.map(chunk => EncodedPacket.fromEncodedChunk(chunk));
+              audioDecoderConfigForExport = encCfg;
+            }
+          }
+        } catch (e) {
+          console.error('[narration mix] failed — exporting without audio:', e);
+        }
+      }
+
+      if (!audioSource && narrated.length === 0 && audioSamples.length > 0) {
         try {
           const input = new Input({ source: new BlobSource(new Blob([arrayBuffer], { type: 'video/mp4' })), formats: ALL_FORMATS });
           const audioTrack = await input.getPrimaryAudioTrack();
@@ -540,7 +635,8 @@ export function useRecording(config: UseRecordingConfig) {
         for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
           if (signal.aborted) throw new Error('Cancelled');
 
-          const targetTs = frameIdx * EXPORT_FRAME_DURATION + clipStart;
+          // Source position advances videoRate× per output frame — the background plays sped-up.
+          const targetTs = frameIdx * EXPORT_FRAME_DURATION * videoRate + clipStart;
           await advanceTo(targetTs);
           if (!currentFrame) {
             console.warn('[EXPORT] no frame available at idx', frameIdx, '— stopping render early');
@@ -643,12 +739,9 @@ export function useRecording(config: UseRecordingConfig) {
                 logoSrc: overlayLogoSrc, name: overlayDisplayName, handle: overlayHandle,
                 logoImgRef, verifiedImgRef, placeholder: false, getCellImg, overlayCaption, from: videoLayer,
               });
-              // Image overlays — topmost layer; targetTs is source-time seconds, same domain as [start,end].
-              for (const o of overlaysRef?.current ?? []) {
-                if (targetTs < o.start || targetTs > o.end) continue;
-                const img = overlayImgsRef?.current.get(o.id);
-                if (img?.complete && img.naturalWidth > 0) offCtx.drawImage(img, o.x, o.y, o.w, o.h);
-              }
+              // Image overlays — topmost layer; targetTs is source-time seconds, same domain as the
+              // overlays' [start,end] windows and reveal-step times.
+              drawImageOverlays(offCtx, overlaysRef?.current ?? [], overlayImgsRef?.current ?? new Map(), targetTs);
             } else {
               // ── Market reels: X header above the video + market row (legacy layout) ──
               const cropBox = boxRef.current;
@@ -687,7 +780,9 @@ export function useRecording(config: UseRecordingConfig) {
             }
           }
 
-          const sample = new VideoSample(offscreen, { timestamp: targetTs, duration: EXPORT_FRAME_DURATION });
+          // Output timestamps stay uniform at EXPORT_FPS — the speed-up lives in how far targetTs
+          // stepped through the SOURCE per frame, not in the output timing.
+          const sample = new VideoSample(offscreen, { timestamp: frameIdx * EXPORT_FRAME_DURATION + clipStart, duration: EXPORT_FRAME_DURATION });
           await videoSource.add(sample);
           sample.close();
           setRecProgress(0.15 + (frameIdx / totalFrames) * 0.7);
@@ -716,7 +811,7 @@ export function useRecording(config: UseRecordingConfig) {
 
       let buffer = output.target.buffer;
       if (!buffer) throw new Error('No buffer received from output');
-      if (includeEditRef.current) buffer = await mergeWithEdit(buffer, clipDuration);
+      if (includeEditRef.current) buffer = await mergeWithEdit(buffer, outputDuration);
 
       const blob = new Blob([buffer], { type: 'video/mp4' });
 
