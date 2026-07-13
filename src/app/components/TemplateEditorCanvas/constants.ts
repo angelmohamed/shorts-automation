@@ -1,0 +1,9 @@
+export const CAROUSEL_W = 1080;
+export const CAROUSEL_H = 1350;
+export const CAROUSEL_PREVIEW_W = 410;
+export const CAROUSEL_PREVIEW_H = Math.round(CAROUSEL_PREVIEW_W * CAROUSEL_H / CAROUSEL_W);
+export const DISPLAY_SCALE = CAROUSEL_PREVIEW_W / CAROUSEL_W;
+export const LOGO_PW = 100;
+export const LOGO_PH = 28;
+export const LOGO_CW = Math.round(LOGO_PW / DISPLAY_SCALE);
+export const LOGO_CH = Math.round(LOGO_PH / DISPLAY_SCALE);
