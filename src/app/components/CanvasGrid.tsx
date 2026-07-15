@@ -228,10 +228,14 @@ interface ImportedRedditComment {
   body: string; timeAgo?: string; score?: string; depth: number; isOP?: boolean;
 }
 
+const splitParagraphs = (body?: string) => (body ?? '').split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+
 /** Re-normalize depths for an arbitrary selection: a reply whose parent isn't selected is promoted
     to one level under its nearest SELECTED ancestor (or to top level) so connector rails on the
-    card only ever point at comments that are actually there. */
-function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditComment[], selected: Set<number>): RedditCardData {
+    card only ever point at comments that are actually there. The post body is opt-in per
+    paragraph — long story posts would otherwise dwarf the card (title is always the header). */
+function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditComment[], selected: Set<number>, selectedParas: Set<number>): RedditCardData {
+  const paras = splitParagraphs(post.body).filter((_, i) => selectedParas.has(i));
   const chain: (number | null)[] = [];   // chain[origDepth] = new depth of last SELECTED comment there
   const sel: RedditComment[] = [];
   comments.forEach((c, i) => {
@@ -247,7 +251,8 @@ function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditC
     }
   });
   return {
-    user: post.user, timeAgo: post.timeAgo, title: post.title, body: post.body,
+    user: post.user, timeAgo: post.timeAgo, title: post.title,
+    body: paras.length ? paras.join('\n\n') : undefined,
     score: post.score || undefined, commentCount: post.commentCount || undefined, comments: sel,
   };
 }
@@ -262,9 +267,10 @@ function RedditFlyout({ hasVideo, onAdd }: {
   const [post, setPost] = useState<ImportedRedditPost | null>(null);
   const [comments, setComments] = useState<ImportedRedditComment[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [selectedParas, setSelectedParas] = useState<Set<number>>(new Set());
 
   async function importThread() {
-    setBusy('import'); setError(''); setPost(null); setComments([]); setSelected(new Set());
+    setBusy('import'); setError(''); setPost(null); setComments([]); setSelected(new Set()); setSelectedParas(new Set());
     try {
       const res = await fetch('/api/reddit', {
         method: 'POST',
@@ -283,19 +289,23 @@ function RedditFlyout({ hasVideo, onAdd }: {
     }
   }
 
-  function toggle(i: number) {
-    setSelected(prev => {
+  const toggleIn = (setter: Dispatch<SetStateAction<Set<number>>>) => (i: number) =>
+    setter(prev => {
       const next = new Set(prev);
       if (next.has(i)) next.delete(i); else next.add(i);
       return next;
     });
-  }
+  const toggle = toggleIn(setSelected);
+  const togglePara = toggleIn(setSelectedParas);
+
+  const paragraphs = post ? splitParagraphs(post.body) : [];
+  const totalSelected = selected.size + selectedParas.size;
 
   async function addToReel() {
     if (!post) return;
     setBusy('add'); setError('');
     try {
-      const card = await renderRedditCard(buildRedditCardData(post, comments, selected));
+      const card = await renderRedditCard(buildRedditCardData(post, comments, selected, selectedParas));
       await onAdd(card.blob, card.lines, { w: card.width, h: card.height });
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Couldn’t render the card.');
@@ -330,6 +340,29 @@ function RedditFlyout({ hasVideo, onAdd }: {
             <span className="text-fg font-medium">{post.user.name}</span> · {post.title.length > 90 ? `${post.title.slice(0, 90)}…` : post.title}
           </div>
           <div className="max-h-64 overflow-y-auto flex flex-col gap-0.5 pr-1">
+            {paragraphs.length > 0 && (
+              <>
+                <span className="text-caption text-fg-3 pt-0.5">Post text — tick the paragraphs to include:</span>
+                {paragraphs.map((para, i) => (
+                  <button
+                    key={`p${i}`}
+                    type="button"
+                    onClick={() => togglePara(i)}
+                    className={`flex items-start gap-2 py-1.5 px-1.5 rounded-sm text-left transition-colors focus-ring ${
+                      selectedParas.has(i) ? 'bg-active' : 'hover:bg-hover'
+                    }`}
+                  >
+                    <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${
+                      selectedParas.has(i) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'
+                    }`}>
+                      <CheckIcon size={9} />
+                    </span>
+                    <span className="min-w-0 flex-1 text-caption text-fg-3 truncate">{para}</span>
+                  </button>
+                ))}
+                <span className="text-caption text-fg-3 pt-1">Comments:</span>
+              </>
+            )}
             {comments.map((c, i) => (
               <button
                 key={i}
@@ -367,9 +400,9 @@ function RedditFlyout({ hasVideo, onAdd }: {
           <Button
             variant="primary"
             onClick={() => void addToReel()}
-            disabled={busy !== null || selected.size === 0 || !hasVideo}
+            disabled={busy !== null || totalSelected === 0 || !hasVideo}
           >
-            {busy === 'add' ? 'Adding…' : `Add to reel${selected.size ? ` (${selected.size})` : ''}`}
+            {busy === 'add' ? 'Adding…' : `Add to reel${totalSelected ? ` (${totalSelected})` : ''}`}
           </Button>
           {!hasVideo && <span className="text-caption text-fg-3">Add a video to the reel first — the card overlays it.</span>}
         </>
