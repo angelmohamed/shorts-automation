@@ -8,6 +8,12 @@ const TRANSITION_S = 0.35;   // seconds one reveal step takes to ease open
 const easeOutCubic = (u: number) => 1 - Math.pow(1 - u, 3);
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
+// Teleprompter scroll for narrated cards taller than the reading zone: the reveal front stays
+// pinned MAX_VISIBLE_H below the card's top — as more lines open, the whole card slides up and
+// old content exits through the top of the frame (reference: reddit-story shorts). Derived from
+// the eased reveal fraction, so the scroll eases with it; canvas bounds clip what slides off.
+const MAX_VISIBLE_H = 1150;   // px on the 1080x1920 canvas ≈ 60% of frame height
+
 /** Visible fraction (0..1, top-anchored) of an overlay at source time `t`. No reveal steps = fully visible. */
 export function overlayRevealFraction(o: ImageOverlay, t: number): number {
   const steps = o.reveals;
@@ -38,10 +44,12 @@ export function drawImageOverlays(
     if (!img || !img.complete || img.naturalWidth <= 0) continue;
     const f = overlayRevealFraction(o, t);
     if (f <= 0.001) continue;
+    const visibleH = Math.max(1, o.h * f);
+    const yShift = o.reveals?.length ? Math.max(0, visibleH - MAX_VISIBLE_H) : 0;
     ctx.drawImage(
       img,
       0, 0, img.naturalWidth, Math.max(1, img.naturalHeight * f),
-      o.x, o.y, o.w, Math.max(1, o.h * f),
+      o.x, o.y - yShift, o.w, visibleH,
     );
   }
 }

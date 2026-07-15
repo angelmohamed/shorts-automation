@@ -142,12 +142,22 @@ export default function RedditCardDev() {
       </div>
       {img && (
         <div style={{ display: 'flex', gap: 32, alignItems: 'flex-start' }}>
-          {/* reveal-cropped view, as the reel will show it */}
-          <div style={{ width: display, overflow: 'hidden', position: 'relative', borderRadius: 12 }}>
-            <div style={{ height: dims.h * scale * visibleFrac, overflow: 'hidden' }}>
-              <img src={img} width={display} alt="reddit card (reveal preview)" style={{ display: 'block' }} />
-            </div>
-          </div>
+          {/* reveal-cropped view with the teleprompter reading window, as the reel will show it:
+              on-canvas the card is 886px wide with the reveal front pinned 1150px below its top —
+              scaled to this preview, the window is 1150 * (display/886) px tall. */}
+          {(() => {
+            const windowH = 1150 * (display / 886);
+            const cropH = dims.h * scale * visibleFrac;
+            const shift = Math.max(0, cropH - windowH);
+            return (
+              <div style={{ width: display }}>
+                <div style={{ height: Math.min(cropH, windowH), overflow: 'hidden', borderRadius: 12 }}>
+                  <img src={img} width={display} alt="reddit card (reveal preview)" style={{ display: 'block', transform: `translateY(-${shift}px)` }} />
+                </div>
+                {shift > 0 && <div style={{ fontSize: 11, color: '#8ba2ad', marginTop: 6 }}>scrolled {Math.round(shift)}px — older lines exited the top</div>}
+              </div>
+            );
+          })()}
           {/* full card + debug overlay */}
           <div style={{ position: 'relative', width: display }}>
             <img src={img} width={display} alt="reddit card (full)" style={{ display: 'block', borderRadius: 12 }} />

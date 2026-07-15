@@ -254,7 +254,7 @@ function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditC
 
 function RedditFlyout({ hasVideo, onAdd }: {
   hasVideo: boolean;
-  onAdd: (blob: Blob, lines: MemeLine[]) => Promise<void>;
+  onAdd: (blob: Blob, lines: MemeLine[], dims: { w: number; h: number }) => Promise<void>;
 }) {
   const [url, setUrl] = useState('');
   const [busy, setBusy] = useState<'import' | 'add' | null>(null);
@@ -296,7 +296,7 @@ function RedditFlyout({ hasVideo, onAdd }: {
     setBusy('add'); setError('');
     try {
       const card = await renderRedditCard(buildRedditCardData(post, comments, selected));
-      await onAdd(card.blob, card.lines);
+      await onAdd(card.blob, card.lines, { w: card.width, h: card.height });
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Couldn’t render the card.');
     } finally {
@@ -1083,15 +1083,21 @@ export function CanvasGrid({
   // narration lines are synthetic (from the renderer's layout) instead of OCR'd. addImageOverlay
   // commits the overlay inside img.onload, so the lines attach via a short retry loop; if they
   // somehow miss, generateNarration's OCR fallback still reads the card.
-  const addRedditCard = useCallback(async (id: string, blob: Blob, lines: MemeLine[]) => {
+  const addRedditCard = useCallback(async (id: string, blob: Blob, lines: MemeLine[], dims: { w: number; h: number }) => {
     const overlayId = `ov-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     await saveOverlayImage(overlayId, blob, 'reddit-card.png');
     const url = URL.createObjectURL(blob);
     canvasRefsMap.current.get(id)?.addImageOverlay(overlayId, url, 'Reddit thread');
     const ocrLines = lines.map(l => ({ ...l, enabled: true }));
+    // Pre-narration the whole card must be on screen (voice painting needs every line clickable),
+    // so fit it inside the 1080x1920 frame however long the thread is. Narrating snaps it to the
+    // readable top-anchored layout and the teleprompter scroll takes over.
+    const w = Math.round(Math.min(0.8 * 1080, 1632 * (dims.w / dims.h)));
+    const h = Math.round(w * (dims.h / dims.w));
+    const rect = { w, h, x: Math.round((1080 - w) / 2), y: Math.round((1920 - h) / 2) };
     for (let attempt = 0; attempt < 10; attempt++) {
       await new Promise(r => setTimeout(r, 150));
-      canvasRefsMap.current.get(id)?.updateOverlay(overlayId, { ocrLines });
+      canvasRefsMap.current.get(id)?.updateOverlay(overlayId, { ocrLines, ...rect });
     }
   }, [canvasRefsMap]);
 
@@ -1224,6 +1230,14 @@ export function CanvasGrid({
     onStatus?.(`Narrating ${memeLines.length} line${memeLines.length === 1 ? '' : 's'} in ${groups.length} voice${groups.length === 1 ? '' : 's'}…`);
 
     ref.setOverlayNarration(overlayId, { reveals, audioId, audioStart, audioDuration, audioSrc: URL.createObjectURL(blob), audioRate: VIDEO_RATE });
+
+    // Reddit thread cards snap to the reading layout once narrated: readable width, top-anchored.
+    // The teleprompter scroll in drawOverlays keeps the reveal front pinned on screen from there,
+    // however long the thread is (reference: reddit-story shorts).
+    if (overlay.name === 'Reddit thread') {
+      const w = 886;   // ~82% of the 1080 canvas — comment text stays readable in the export
+      ref.updateOverlay(overlayId, { x: Math.round((1080 - w) / 2), y: 110, w, h: Math.round(w * (overlay.h / overlay.w)) });
+    }
     return null;
   }, [canvasRefsMap, narrationVoices]);
 
@@ -1473,7 +1487,7 @@ export function CanvasGrid({
             { id: 'reddit', label: 'Reddit thread', icon: redditGlyph, content: (
               <RedditFlyout
                 hasVideo={!!(selectedEntry.localVideoSrc || selectedEntry.data || selectedEntry.videoUrl)}
-                onAdd={(blob, lines) => addRedditCard(selectedEntry.id, blob, lines)}
+                onAdd={(blob, lines, dims) => addRedditCard(selectedEntry.id, blob, lines, dims)}
               />
             ) },
             { id: 'narrate', label: 'Narration', icon: micGlyph, content: (
