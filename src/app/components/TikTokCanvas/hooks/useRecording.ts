@@ -12,7 +12,7 @@ import {
 import { drawHeaderOnContext, computeSonotradeHeaderHeight } from '../drawing/drawHeader';
 import { drawReelCells, drawFreeElements, reelLayout, reelVideoRect, ensureReelTextFontsLoaded, shiftFreeElementsForReelCrop } from '../drawing/drawReelCell';
 import { drawMarketRow } from '../drawing/drawMarketRow';
-import { trackById, trackStreamSrc, MUSIC_VOLUME } from '@/lib/music';
+import { trackById, trackStreamSrc, DEFAULT_MUSIC_VOLUME } from '@/lib/music';
 import { drawImageOverlays } from '../drawing/drawOverlays';
 import { getOverlayImage } from '@/lib/localVideoStore';
 import { countCaptionLines } from '../drawing/countCaptionLines';
@@ -53,8 +53,10 @@ export interface UseRecordingConfig {
   marketAvatarImgRef?: MutableRefObject<HTMLImageElement | null>;
   marketAvatarUrlRef?: MutableRefObject<string | null>;
   twitterSettings: TwitterTemplateSettings;
-  /** Background-music track id (lib/music.ts) — mixed under the export audio at MUSIC_VOLUME. */
+  /** Background-music track id (lib/music.ts) — mixed under the export audio. */
   musicIdRef?: MutableRefObject<string | null>;
+  /** Music bed volume 0..1 (default DEFAULT_MUSIC_VOLUME). */
+  musicVolumeRef?: MutableRefObject<number>;
 }
 
 export function useRecording(config: UseRecordingConfig) {
@@ -82,7 +84,7 @@ export function useRecording(config: UseRecordingConfig) {
       overlayCaption, overlayLogoSrc, overlayDisplayName, overlayHandle, overlayVerified,
       marketData, marketAvatarImgRef, marketAvatarUrlRef,
       twitterSettings,
-      musicIdRef,
+      musicIdRef, musicVolumeRef,
     } = config;
 
     const canvas = canvasRef.current;
@@ -402,7 +404,7 @@ export function useRecording(config: UseRecordingConfig) {
             }
             if (musicBuf) {
               const gain = offA.createGain();
-              gain.gain.value = MUSIC_VOLUME;
+              gain.gain.value = musicVolumeRef?.current ?? DEFAULT_MUSIC_VOLUME;
               gain.connect(offA.destination);
               const src = offA.createBufferSource();
               src.buffer = musicBuf;

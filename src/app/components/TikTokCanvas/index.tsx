@@ -16,7 +16,7 @@ import { resolveTwitterTemplateSettings } from '../twitterTemplateTypes';
 import { VideoOverlays } from './ui/VideoOverlays';
 import { useVideoLoading } from './hooks/useVideoLoading';
 import { useRecording } from './hooks/useRecording';
-import { trackById, trackStreamSrc, MUSIC_VOLUME } from '@/lib/music';
+import { trackById, trackStreamSrc, DEFAULT_MUSIC_VOLUME } from '@/lib/music';
 
 export type { TikTokCanvasRef, MarketData, SparkPoint } from './types';
 
@@ -40,6 +40,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
   ocrBrush = null,
   ocrVoiceColors,
   musicId = null,
+  musicVolume = null,
 }: TikTokCanvasProps, ref) {
   // Resolved overlay style (defaults reproduce the original look). twKey lets the draw loop restart
   // only when the style actually changes, not on every render.
@@ -212,14 +213,18 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
   // The export mixes the same track at the same gain, so preview matches the MP4.
   const musicIdRef = useRef<string | null>(musicId);
   musicIdRef.current = musicId;
+  const musicVolumeRef = useRef<number>(musicVolume ?? DEFAULT_MUSIC_VOLUME);
+  musicVolumeRef.current = musicVolume ?? DEFAULT_MUSIC_VOLUME;
+  const musicElRef = useRef<HTMLAudioElement | null>(null);
   useEffect(() => {
     const track = trackById(musicId);
     const v = videoRef.current;
     if (!track || !v) return;
     const el = new Audio(trackStreamSrc(track));
     el.loop = true;
-    el.volume = MUSIC_VOLUME;
+    el.volume = musicVolumeRef.current;
     el.preload = 'auto';
+    musicElRef.current = el;
     const sync = () => {
       if (v.paused) { if (!el.paused) el.pause(); }
       else if (el.paused) void el.play().catch(() => { /* autoplay policy — user will interact */ });
@@ -232,8 +237,13 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
       v.removeEventListener('pause', sync);
       el.pause();
       el.removeAttribute('src');
+      if (musicElRef.current === el) musicElRef.current = null;
     };
   }, [musicId, videoSrc, videoRef]);
+  // Volume changes apply live to the running loop (no element re-creation, no loop restart).
+  useEffect(() => {
+    if (musicElRef.current) musicElRef.current.volume = musicVolume ?? DEFAULT_MUSIC_VOLUME;
+  }, [musicVolume]);
 
   // Lazily decode an overlay's image for the draw loops.
   const getOverlayImg = useCallback((o: ImageOverlay): HTMLImageElement | null => {
@@ -343,7 +353,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
     marketData, marketAvatarImgRef, marketAvatarUrlRef,
     twitterSettings: tw,
     overlaysRef, overlayImgsRef,
-    musicIdRef,
+    musicIdRef, musicVolumeRef,
   });
 
   // Re-apply a saved framing (crop/pan/zoom/trim). Setters from useState/useVideoLoading are stable.
@@ -496,6 +506,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
           ? overlaysRef.current.map(({ src: _src, audioSrc: _audioSrc, ...rest }) => rest)
           : undefined,
         musicId: musicIdRef.current ?? undefined,
+        musicVolume: musicIdRef.current ? musicVolumeRef.current : undefined,
       }),
     applyFraming: applyFramingFn,
   }), [isRecording, startRecording, cancelRecording, videoDuration, trimStart, trimEnd, includeEdit, videoScale, zoomIn, zoomOut, resetZoom, applyFramingFn, swapToLocalBlob, commitOverlays, removeOverlayFn]);

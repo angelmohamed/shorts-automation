@@ -35,7 +35,7 @@ import {
 import { fetchFootageManifest, isFootageUrl, type FootageSegment } from '@/lib/footage';
 import { renderRedditCard, type RedditCardData, type RedditComment } from '@/lib/redditCard';
 import type { MemeLine } from '@/lib/memeOcr';
-import { BACKGROUND_TRACKS } from '@/lib/music';
+import { BACKGROUND_TRACKS, DEFAULT_MUSIC_VOLUME } from '@/lib/music';
 
 const CARD_W = CAROUSEL_PREVIEW_W; // 410 — same width as canvas preview
 
@@ -1641,6 +1641,24 @@ export function CanvasGrid({
                     </button>
                   );
                 })}
+                {framingMap[selectedEntry.id]?.musicId && (
+                  <label className="flex items-center gap-2 pt-1.5">
+                    <span className="text-caption text-fg-3 shrink-0">Volume</span>
+                    <input
+                      type="range" min={0} max={0.5} step={0.01}
+                      value={framingMap[selectedEntry.id]?.musicVolume ?? DEFAULT_MUSIC_VOLUME}
+                      onChange={e => {
+                        const v = Number(e.target.value);
+                        setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], musicVolume: v } }));
+                        markFramingDirty();
+                      }}
+                      className="flex-1 min-w-0 accent-[var(--color-accent,#46d160)]"
+                    />
+                    <span className="text-caption text-fg-2 w-9 text-right">
+                      {Math.round((framingMap[selectedEntry.id]?.musicVolume ?? DEFAULT_MUSIC_VOLUME) * 100)}%
+                    </span>
+                  </label>
+                )}
                 <span className="text-caption text-fg-3 pt-1">Loops quietly under the narration — in preview and in the export.</span>
               </div>
             ) },
@@ -1937,6 +1955,7 @@ export function CanvasGrid({
                           twitterSettings={rowSettings}
                           initialFraming={framingMap[entry.id] ?? null}
                           musicId={framingMap[entry.id]?.musicId ?? null}
+                          musicVolume={framingMap[entry.id]?.musicVolume ?? null}
                           onFramingChange={markFramingDirty}
                           onOverlaysChange={list => setOverlaysMap(prev => ({ ...prev, [entry.id]: list }))}
                           ocrBrush={voiceBrush}

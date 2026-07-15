@@ -71,6 +71,8 @@ export interface Framing {
   overlays?: Omit<ImageOverlay, 'src' | 'audioSrc'>[];
   /** Background-music track id (lib/music.ts); absent = no music. */
   musicId?: string;
+  /** Music bed volume 0..1 (absent = DEFAULT_MUSIC_VOLUME). */
+  musicVolume?: number;
 }
 
 export interface TikTokCanvasProps {
@@ -101,6 +103,8 @@ export interface TikTokCanvasProps {
   ocrBrush?: { voiceId: string; color: string } | null;
   /** Background-music track id (lib/music.ts): loops quietly under playback and mixes into the export. */
   musicId?: string | null;
+  /** Music bed volume 0..1 (default DEFAULT_MUSIC_VOLUME) — same gain in preview and export. */
+  musicVolume?: number | null;
   /** voiceId → display color for OCR line highlights (lines with no voice use the accent style). */
   ocrVoiceColors?: Record<string, string>;
 }
