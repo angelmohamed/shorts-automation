@@ -430,6 +430,10 @@ const LS_11L_VOICES = 'reels:11labs-voices';
 // Fixed voice cast for Reddit thread cards (ElevenLabs voice IDs). The post always reads as Mark;
 // each distinct commenter draws a random voice from the pool (stable per author on a card, no
 // repeats until the pool is exhausted; an OP reply reuses Mark). Edit here to recast.
+// Narration delivery speed via ElevenLabs' native `speed` setting (1 = natural, 1.2 = max).
+// Applies to every generated take (Reddit cast and meme narration alike).
+const NARRATION_SPEED = 1.15;
+
 const REDDIT_POST_VOICE = { id: 'UgBBYS2sOqTuMpoF3BR0', name: 'Mark' };          // Natural Conversations (US)
 const REDDIT_COMMENT_VOICES = [
   { id: 'Bj9UqZbhQsanLzgalpEG', name: 'Austin' },     // Deep Raspy and Authentic (US Southern)
@@ -1259,7 +1263,9 @@ export function CanvasGrid({
           body: JSON.stringify({
             apiKey, voiceId: g.voiceId, text: joined,
             // Excited meme-narrator delivery: low stability + high style = animated, hyped read.
-            voiceSettings: { stability: 0.35, similarity_boost: 0.8, style: 0.6, use_speaker_boost: true },
+            // NARRATION_SPEED is ElevenLabs' native pacing (1 = natural, 1.2 = max) — reveal sync
+            // holds automatically because the returned timestamps describe the sped audio.
+            voiceSettings: { stability: 0.35, similarity_boost: 0.8, style: 0.6, use_speaker_boost: true, speed: NARRATION_SPEED },
           }),
         });
         const json = await res.json().catch(() => ({}));

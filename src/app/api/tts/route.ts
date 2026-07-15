@@ -20,6 +20,9 @@ const Schema = z.object({
     similarity_boost: z.number().min(0).max(1),
     style: z.number().min(0).max(1),
     use_speaker_boost: z.boolean(),
+    /** ElevenLabs native delivery speed (1 = natural, max 1.2). Timestamps reflect the sped audio,
+        so reveal sync holds with no extra work. */
+    speed: z.number().min(0.7).max(1.2),
   }).partial().optional(),
 });
 
