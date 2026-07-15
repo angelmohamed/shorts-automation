@@ -4,10 +4,10 @@
 // no Tesseract pass. The result plugs into the existing image-overlay narration pipeline untouched
 // (ocrLines → voice brushes → ElevenLabs beats → progressive top-anchored crop).
 //
-// Reveal semantics mirror the OCR pipeline's chrome handling: usernames, avatars, and the
-// score/meta row are never narrated. Chrome ABOVE a block's first line (a comment's header) reveals
-// together with that first line; chrome BELOW a block's last line (the post's meta row) reveals
-// with that block — boundaries sit in the visual gap between blocks, so a crop never slices a row.
+// Visual language mirrors new-Reddit dark mode: pill action buttons under the post, flat threaded
+// comments connected by curved rails with ⊖ collapse dots, per-comment vote/Reply/Share rows, blue
+// OP badge, multi-paragraph bodies. Chrome (headers, pills, action rows) is never narrated: it
+// reveals together with the neighbouring text block, and crop boundaries always sit in visual gaps.
 
 import { wrapText, roundRectPath } from '@/app/components/TemplateEditorCanvas/drawing/helpers';
 import type { MemeLine } from './memeOcr';
@@ -20,8 +20,11 @@ export interface RedditUser {
 
 export interface RedditComment {
   user: RedditUser;
-  body: string;
+  body: string;              // \n\n separates paragraphs
   timeAgo?: string;
+  score?: string;            // shown in the comment's action row
+  depth?: number;            // 0 = top-level, 1 = reply, 2 = reply-to-reply…
+  isOP?: boolean;            // blue OP badge next to the username
 }
 
 export interface RedditCardData {
@@ -29,11 +32,10 @@ export interface RedditCardData {
   timeAgo?: string;
   title: string;
   body?: string;
-  /** Meta row under the post text — both optional; row is drawn if either is present. */
-  score?: string;            // e.g. "12.4K"
-  commentCount?: string;     // e.g. "3.1K"
+  score?: string;            // post pill row (drawn if either is present)
+  commentCount?: string;
   comments: RedditComment[];
-  /** Draw the blue Join pill in the header (default true — it sells the look). */
+  /** Draw the blue Join pill in the header (default true). */
   showJoin?: boolean;
 }
 
@@ -41,46 +43,48 @@ export interface RedditCardResult {
   blob: Blob;
   width: number;
   height: number;
-  /** Narratable lines (title/body/comment text only — never usernames or meta chrome). */
+  /** Narratable lines (title/body/comment text only — never usernames, pills or action rows). */
   lines: MemeLine[];
 }
 
-// ── Design constants (new-Reddit dark mode, drawn at 2x-ish for crispness) ──────────────────────
+// ── Design constants (new-Reddit dark mode, drawn at ~2x for crispness) ─────────────────────────
 const W = 1024;
 const PAD = 48;
 const RADIUS = 36;
 const FONT = `-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif`;
 
 const C = {
-  cardBg: '#14181b',
-  border: 'rgba(255,255,255,0.07)',
+  cardBg: '#101416',
+  border: 'rgba(255,255,255,0.06)',
   text: '#f2f4f5',
   textSoft: '#d7dadc',
-  meta: '#8ba2ad',
+  meta: '#94a3ab',
+  action: '#aab8bf',
+  pillBg: '#1e2528',
+  rail: 'rgba(255,255,255,0.16)',
   join: '#0a67c2',
   joinText: '#ffffff',
-  divider: 'rgba(255,255,255,0.08)',
-  upvote: '#ff4500',
+  op: '#4d9df6',
 };
 
-// Reddit snoo-avatar background palette for users without an avatar image.
 const AVATAR_COLORS = ['#ff4500', '#0079d3', '#ea0027', '#ff8717', '#46d160', '#25b79f', '#7193ff', '#ff66ac'];
 const avatarColor = (name: string) =>
   AVATAR_COLORS[[...name].reduce((s, c) => s + c.charCodeAt(0), 0) % AVATAR_COLORS.length];
 
-const POST = { avatar: 76, name: 32, time: 28, title: 46, titleLH: 58, body: 36, bodyLH: 52, meta: 30 };
-const COMMENT = { avatar: 60, name: 30, time: 26, body: 36, bodyLH: 52 };
+const POST = { avatar: 76, name: 32, time: 28, title: 46, titleLH: 58, body: 36, bodyLH: 52 };
+const CMT = { avatar: 52, name: 29, time: 26, body: 34, bodyLH: 50, indent: 64, actionText: 26, actionH: 44 };
 const GAP = {
-  headerToTitle: 30, titleToBody: 18, bodyToMeta: 30, metaH: 56,
-  blockGap: 44, commentHeaderToBody: 18, commentGap: 40,
+  headerToTitle: 30, titleToBody: 18, textToPills: 36, pillH: 62, pillsToComments: 44,
+  headerToBody: 16, para: 26, bodyToAction: 20, commentGap: 40,
 };
 
 interface TextRow { text: string; x: number; y: number; w: number; h: number; blockIdx: number }
-interface BlockSpan { blockIdx: number; topPx: number; bottomPx: number }
-
-function font(weight: number, size: number): string {
-  return `${weight} ${size}px ${FONT}`;
+interface CommentLayout {
+  c: RedditComment; x: number; top: number; avatarCx: number; avatarCy: number;
+  actionY: number; bottom: number; hasChild: boolean; parentIdx: number | null;
 }
+
+const font = (weight: number, size: number) => `${weight} ${size}px ${FONT}`;
 
 async function loadAvatar(src?: string): Promise<HTMLImageElement | null> {
   if (!src) return null;
@@ -98,7 +102,6 @@ function drawAvatar(ctx: CanvasRenderingContext2D, user: RedditUser, img: HTMLIm
   ctx.arc(x + d / 2, y + d / 2, d / 2, 0, Math.PI * 2);
   ctx.clip();
   if (img) {
-    // cover-fit
     const s = Math.max(d / img.naturalWidth, d / img.naturalHeight);
     const dw = img.naturalWidth * s, dh = img.naturalHeight * s;
     ctx.drawImage(img, x + (d - dw) / 2, y + (d - dh) / 2, dw, dh);
@@ -116,116 +119,226 @@ function drawAvatar(ctx: CanvasRenderingContext2D, user: RedditUser, img: HTMLIm
   ctx.restore();
 }
 
-function drawNameRow(ctx: CanvasRenderingContext2D, user: RedditUser, timeAgo: string | undefined, x: number, cy: number, nameSize: number, timeSize: number) {
+function drawNameRow(
+  ctx: CanvasRenderingContext2D, user: RedditUser, timeAgo: string | undefined,
+  x: number, cy: number, nameSize: number, timeSize: number, isOP = false,
+) {
   ctx.textBaseline = 'middle';
   ctx.font = font(600, nameSize);
   ctx.fillStyle = C.text;
   ctx.fillText(user.name, x, cy);
+  let cx = x + ctx.measureText(user.name).width;
+  if (isOP) {
+    ctx.font = font(700, nameSize * 0.85);
+    ctx.fillStyle = C.op;
+    ctx.fillText('OP', cx + 12, cy);
+    cx += 12 + ctx.measureText('OP').width;
+  }
   if (timeAgo) {
-    const nameW = ctx.measureText(user.name).width;
     ctx.font = font(400, timeSize);
     ctx.fillStyle = C.meta;
-    ctx.fillText(`· ${timeAgo}`, x + nameW + 14, cy);
+    ctx.fillText(`· ${timeAgo}`, cx + 12, cy);
   }
   ctx.textBaseline = 'alphabetic';
 }
 
-/** Up/downvote arrows + score + comment bubble + count. Returns nothing narratable. */
-function drawMetaRow(ctx: CanvasRenderingContext2D, x: number, cy: number, score?: string, comments?: string) {
-  ctx.strokeStyle = C.meta;
-  ctx.fillStyle = C.meta;
-  ctx.lineWidth = 3.5;
+// Reddit's outline vote arrow: triangular head + open stem, rounded joins.
+function voteArrow(ctx: CanvasRenderingContext2D, cx: number, cy: number, size: number, up: boolean) {
+  const s = size, dir = up ? 1 : -1;
+  ctx.save();
+  ctx.lineWidth = 3;
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
-  const arrow = (cx: number, up: boolean) => {
-    const s = 11, dir = up ? -1 : 1;
+  ctx.beginPath();
+  ctx.moveTo(cx - s * 0.42, cy + s * 0.5 * dir);
+  ctx.lineTo(cx - s * 0.42, cy - s * 0.05 * dir);
+  ctx.lineTo(cx - s * 0.7, cy - s * 0.05 * dir);
+  ctx.lineTo(cx, cy - s * 0.72 * dir);
+  ctx.lineTo(cx + s * 0.7, cy - s * 0.05 * dir);
+  ctx.lineTo(cx + s * 0.42, cy - s * 0.05 * dir);
+  ctx.lineTo(cx + s * 0.42, cy + s * 0.5 * dir);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function bubbleIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
+  ctx.save();
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, Math.PI * 0.52, Math.PI * 2.42);
+  ctx.lineTo(cx - r * 0.45, cy + r * 1.12);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function shareIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: number) {
+  ctx.save();
+  ctx.lineWidth = 3;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.beginPath();                                  // arrow
+  ctx.moveTo(cx - s * 0.1, cy - s * 0.15);
+  ctx.quadraticCurveTo(cx - s * 0.75, cy - s * 0.05, cx - s * 0.75, cy + s * 0.6);
+  ctx.quadraticCurveTo(cx - s * 0.35, cy + s * 0.05, cx + s * 0.3, cy + s * 0.12);
+  ctx.moveTo(cx + s * 0.3, cy + s * 0.12);
+  ctx.lineTo(cx + s * 0.3, cy + s * 0.38);
+  ctx.lineTo(cx + s * 0.85, cy - s * 0.12);
+  ctx.lineTo(cx + s * 0.3, cy - s * 0.62);
+  ctx.lineTo(cx + s * 0.3, cy - s * 0.15);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function dotsIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number) {
+  ctx.save();
+  ctx.fillStyle = C.action;
+  for (const dx of [-11, 0, 11]) {
     ctx.beginPath();
-    ctx.moveTo(cx - s, cy + (s * 0.45) * -dir);
-    ctx.lineTo(cx, cy + s * 0.75 * dir);
-    ctx.lineTo(cx + s, cy + (s * 0.45) * -dir);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(cx, cy + s * 0.7 * dir);
-    ctx.lineTo(cx, cy - s * 0.75 * dir);
-    ctx.stroke();
-  };
-  let cx = x + 12;
-  ctx.strokeStyle = C.upvote;
-  arrow(cx, true);
-  cx += 34;
-  ctx.font = font(600, POST.meta);
+    ctx.arc(cx + dx, cy, 2.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/** Post action pills: [↑ score ↓] [🗨 count] [↗ Share]. Returns nothing narratable. */
+function drawPostPills(ctx: CanvasRenderingContext2D, x: number, top: number, score?: string, comments?: string) {
+  const h = GAP.pillH, r = h / 2;
+  let cx = x;
   ctx.textBaseline = 'middle';
-  if (score) { ctx.fillStyle = C.text; ctx.fillText(score, cx, cy); cx += ctx.measureText(score).width + 30; }
-  ctx.strokeStyle = C.meta;
-  arrow(cx, false);
-  cx += 44;
-  if (comments) {
-    // comment bubble
-    ctx.beginPath();
-    const bs = 13;
-    ctx.arc(cx, cy, bs, Math.PI * 0.55, Math.PI * 2.45);
-    ctx.lineTo(cx - bs * 0.5, cy + bs * 1.15);
-    ctx.closePath();
-    ctx.stroke();
+  const pill = (w: number) => {
+    ctx.fillStyle = C.pillBg;
+    roundRectPath(ctx, cx, top, w, h, r);
+    ctx.fill();
+  };
+  ctx.font = font(600, 30);
+  if (score) {
+    const tw = ctx.measureText(score).width;
+    const w = 44 + tw + 16 + 44;
+    pill(w);
+    ctx.strokeStyle = C.text;
+    voteArrow(ctx, cx + 30, top + h / 2, 15, true);
     ctx.fillStyle = C.text;
-    ctx.fillText(comments, cx + 24, cy);
+    ctx.font = font(600, 30);
+    ctx.fillText(score, cx + 52, top + h / 2 + 1);
+    ctx.strokeStyle = C.text;
+    voteArrow(ctx, cx + 52 + tw + 26, top + h / 2, 15, false);
+    cx += w + 20;
+  }
+  if (comments) {
+    ctx.font = font(600, 30);
+    const tw = ctx.measureText(comments).width;
+    const w = 58 + tw + 26;
+    pill(w);
+    ctx.strokeStyle = C.text;
+    bubbleIcon(ctx, cx + 32, top + h / 2, 13);
+    ctx.fillStyle = C.text;
+    ctx.fillText(comments, cx + 56, top + h / 2 + 1);
+    cx += w + 20;
+  }
+  {
+    ctx.font = font(600, 30);
+    const tw = ctx.measureText('Share').width;
+    const w = 62 + tw + 26;
+    pill(w);
+    ctx.strokeStyle = C.text;
+    shareIcon(ctx, cx + 34, top + h / 2, 16);
+    ctx.fillStyle = C.text;
+    ctx.fillText('Share', cx + 60, top + h / 2 + 1);
   }
   ctx.textBaseline = 'alphabetic';
 }
 
+/** Comment action row: ⊖ (on the rail, when threaded) ↑ score ↓  Reply  Share  ···  */
+function drawCommentActions(ctx: CanvasRenderingContext2D, x: number, cy: number, score?: string) {
+  ctx.textBaseline = 'middle';
+  ctx.strokeStyle = C.action;
+  ctx.fillStyle = C.action;
+  let cx = x;
+  voteArrow(ctx, cx + 12, cy, 13, true);
+  cx += 34;
+  ctx.font = font(600, CMT.actionText);
+  if (score) { ctx.fillText(score, cx, cy + 1); cx += ctx.measureText(score).width + 14; }
+  voteArrow(ctx, cx + 12, cy, 13, false);
+  cx += 46;
+  bubbleIcon(ctx, cx + 10, cy, 11);
+  ctx.font = font(600, CMT.actionText);
+  ctx.fillText('Reply', cx + 30, cy + 1);
+  cx += 30 + ctx.measureText('Reply').width + 34;
+  shareIcon(ctx, cx + 12, cy, 13);
+  ctx.fillText('Share', cx + 32, cy + 1);
+  cx += 32 + ctx.measureText('Share').width + 34;
+  dotsIcon(ctx, cx + 12, cy);
+  ctx.textBaseline = 'alphabetic';
+}
+
+const paragraphs = (body: string) => body.split(/\n\s*\n/).map(p => p.replace(/\s+/g, ' ').trim()).filter(Boolean);
+
 export async function renderRedditCard(data: RedditCardData): Promise<RedditCardResult> {
-  // Measuring pass uses a throwaway context; layout is computed in px rows, then drawn at exact height.
   const measure = document.createElement('canvas').getContext('2d')!;
   const textW = W - PAD * 2;
 
   measure.font = font(700, POST.title);
   const titleLines = wrapText(measure, data.title, textW);
-  measure.font = font(400, POST.body);
-  const bodyLines = data.body ? wrapText(measure, data.body, textW) : [];
-  const hasMeta = !!(data.score || data.commentCount);
-
-  const commentBodyX = PAD + COMMENT.avatar + 22;
-  const commentLines = data.comments.map(c => {
-    measure.font = font(400, COMMENT.body);
-    return wrapText(measure, c.body, W - commentBodyX - PAD);
-  });
+  const postParas = data.body ? paragraphs(data.body) : [];
+  const hasPills = !!(data.score || data.commentCount);
 
   // ── Vertical layout ────────────────────────────────────────────────────────────────────────────
   const rows: TextRow[] = [];
-  const blocks: BlockSpan[] = [];
   let y = PAD;
 
-  const postBlockTop = y;
-  y += POST.avatar;                                    // header (avatar row)
-  y += GAP.headerToTitle;
-  let blockIdx = 0;
+  y += POST.avatar + GAP.headerToTitle;                       // post header
   for (const line of titleLines) {
-    rows.push({ text: line, x: PAD, y, w: measureWidth(measure, font(700, POST.title), line), h: POST.titleLH, blockIdx });
+    measure.font = font(700, POST.title);
+    rows.push({ text: line, x: PAD, y, w: measure.measureText(line).width, h: POST.titleLH, blockIdx: 0 });
     y += POST.titleLH;
   }
-  if (bodyLines.length) {
+  if (postParas.length) {
     y += GAP.titleToBody;
-    blockIdx = 1;
-    for (const line of bodyLines) {
-      rows.push({ text: line, x: PAD, y, w: measureWidth(measure, font(400, POST.body), line), h: POST.bodyLH, blockIdx });
-      y += POST.bodyLH;
+    for (const [pi, para] of postParas.entries()) {
+      if (pi > 0) y += GAP.para;
+      measure.font = font(400, POST.body);
+      for (const line of wrapText(measure, para, textW)) {
+        rows.push({ text: line, x: PAD, y, w: measure.measureText(line).width, h: POST.bodyLH, blockIdx: 1 });
+        y += POST.bodyLH;
+      }
     }
   }
-  if (hasMeta) { y += GAP.bodyToMeta + GAP.metaH; }
-  blocks.push({ blockIdx: 0, topPx: postBlockTop, bottomPx: y });   // whole post (title+body+meta) spans block 0..1
+  if (hasPills) y += GAP.textToPills + GAP.pillH;
+  const postBottom = y;
 
-  const commentTops: number[] = [];
+  const layouts: CommentLayout[] = [];
+  const depthStack: number[] = [];                            // layout index of the latest comment at each depth
   data.comments.forEach((c, i) => {
-    y += i === 0 ? GAP.blockGap : GAP.commentGap;
+    const depth = Math.max(0, c.depth ?? 0);
+    const x = PAD + depth * CMT.indent;
+    y += i === 0 ? GAP.pillsToComments : GAP.commentGap;
     const top = y;
-    commentTops.push(top);
+    const bodyX = x + CMT.avatar + 18;
+    const bodyW = W - bodyX - PAD;
+    y += CMT.avatar + GAP.headerToBody;
     const cBlock = 2 + i;
-    y += COMMENT.avatar + GAP.commentHeaderToBody;
-    for (const line of commentLines[i]) {
-      rows.push({ text: line, x: commentBodyX, y, w: measureWidth(measure, font(400, COMMENT.body), line), h: COMMENT.bodyLH, blockIdx: cBlock });
-      y += COMMENT.bodyLH;
+    for (const [pi, para] of paragraphs(c.body).entries()) {
+      if (pi > 0) y += GAP.para;
+      measure.font = font(400, CMT.body);
+      for (const line of wrapText(measure, para, bodyW)) {
+        rows.push({ text: line, x: bodyX, y, w: measure.measureText(line).width, h: CMT.bodyLH, blockIdx: cBlock });
+        y += CMT.bodyLH;
+      }
     }
-    blocks.push({ blockIdx: cBlock, topPx: top, bottomPx: y });
+    y += GAP.bodyToAction;
+    const actionY = y + CMT.actionH / 2;
+    y += CMT.actionH;
+    const parentIdx = depth > 0 ? depthStack[depth - 1] ?? null : null;
+    depthStack[depth] = layouts.length;
+    depthStack.length = depth + 1;
+    layouts.push({
+      c, x, top, avatarCx: x + CMT.avatar / 2, avatarCy: top + CMT.avatar / 2,
+      actionY, bottom: y, hasChild: false, parentIdx,
+    });
+    if (parentIdx !== null && layouts[parentIdx]) layouts[parentIdx].hasChild = true;
   });
 
   const H = Math.round(y + PAD);
@@ -242,6 +355,22 @@ export async function renderRedditCard(data: RedditCardData): Promise<RedditCard
   ctx.lineWidth = 2;
   roundRectPath(ctx, 1, 1, W - 2, H - 2, RADIUS);
   ctx.stroke();
+
+  // thread rails first (behind avatars): parent avatar → curve into child avatar
+  ctx.strokeStyle = C.rail;
+  ctx.lineWidth = 3;
+  for (const l of layouts) {
+    if (l.parentIdx === null) continue;
+    const p = layouts[l.parentIdx];
+    if (!p) continue;
+    const px = p.avatarCx;
+    ctx.beginPath();
+    ctx.moveTo(px, p.avatarCy + CMT.avatar / 2 + 6);
+    ctx.lineTo(px, l.avatarCy - 18);
+    ctx.quadraticCurveTo(px, l.avatarCy, px + 18, l.avatarCy);
+    ctx.lineTo(l.x - 8, l.avatarCy);
+    ctx.stroke();
+  }
 
   // post header
   const postAvatar = await loadAvatar(data.user.avatar);
@@ -261,57 +390,64 @@ export async function renderRedditCard(data: RedditCardData): Promise<RedditCard
     ctx.textBaseline = 'alphabetic';
   }
 
-  // narratable text rows
+  // narratable text
   ctx.textBaseline = 'middle';
   for (const row of rows) {
     const isTitle = row.blockIdx === 0;
-    const isComment = row.blockIdx >= 2;
-    ctx.font = isTitle ? font(700, POST.title) : font(400, isComment ? COMMENT.body : POST.body);
+    ctx.font = isTitle ? font(700, POST.title) : font(400, row.blockIdx >= 2 ? CMT.body : POST.body);
     ctx.fillStyle = isTitle ? C.text : C.textSoft;
     ctx.fillText(row.text, row.x, row.y + row.h / 2);
   }
   ctx.textBaseline = 'alphabetic';
 
-  // post meta row
-  if (hasMeta) {
+  // post pills
+  if (hasPills) {
     const postTextBottom = rows.filter(r => r.blockIdx <= 1).reduce((m, r) => Math.max(m, r.y + r.h), 0);
-    drawMetaRow(ctx, PAD - 12, postTextBottom + GAP.bodyToMeta + GAP.metaH / 2, data.score, data.commentCount);
+    drawPostPills(ctx, PAD, postTextBottom + GAP.textToPills, data.score, data.commentCount);
   }
 
-  // comment headers + thread accent
-  for (let i = 0; i < data.comments.length; i++) {
-    const c = data.comments[i];
-    const top = commentTops[i];
-    ctx.strokeStyle = C.divider;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(PAD, top - (i === 0 ? GAP.blockGap : GAP.commentGap) / 2);
-    ctx.lineTo(W - PAD, top - (i === 0 ? GAP.blockGap : GAP.commentGap) / 2);
-    ctx.stroke();
-    const img = await loadAvatar(c.user.avatar);
-    drawAvatar(ctx, c.user, img, PAD, top, COMMENT.avatar);
-    drawNameRow(ctx, c.user, c.timeAgo, PAD + COMMENT.avatar + 20, top + COMMENT.avatar / 2, COMMENT.name, COMMENT.time);
+  // comments: avatar, name row, action row, collapse dot on the rail below threaded parents
+  for (const l of layouts) {
+    const img = await loadAvatar(l.c.user.avatar);
+    drawAvatar(ctx, l.c.user, img, l.x, l.top, CMT.avatar);
+    drawNameRow(ctx, l.c.user, l.c.timeAgo, l.x + CMT.avatar + 18, l.avatarCy, CMT.name, CMT.time, l.c.isOP);
+    drawCommentActions(ctx, l.x + CMT.avatar + 18, l.actionY, l.c.score);
+    if (l.hasChild) {
+      // ⊖ on the comment's own column at action-row height, with the rail continuing beneath
+      ctx.strokeStyle = C.rail;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(l.avatarCx, l.avatarCy + CMT.avatar / 2 + 6);
+      ctx.lineTo(l.avatarCx, l.actionY - 16);
+      ctx.stroke();
+      ctx.strokeStyle = C.action;
+      ctx.beginPath();
+      ctx.arc(l.avatarCx, l.actionY, 13, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(l.avatarCx - 6, l.actionY);
+      ctx.lineTo(l.avatarCx + 6, l.actionY);
+      ctx.stroke();
+    }
   }
 
   // ── Narration line map ────────────────────────────────────────────────────────────────────────
   // bottomFrac: intra-block → midpoint of the gap to the next line; block end → midpoint of the
-  // visual gap before the next block (so headers/meta reveal with their neighbours); last line → 1.
+  // visual gap before the next block (headers/pills/action rows reveal with their neighbours);
+  // last line → 1.
+  const blockBottom = (blockIdx: number): number =>
+    blockIdx <= 1 ? postBottom : layouts[blockIdx - 2]?.bottom ?? H;
+  const blockTop = (blockIdx: number): number =>
+    blockIdx <= 1 ? PAD : layouts[blockIdx - 2]?.top ?? H;
+
   const lines: MemeLine[] = rows.map((row, i) => {
     const next = rows[i + 1];
     const sameBlock = next && next.blockIdx === row.blockIdx;
-    // post title and body narrate as separate blocks but share one visual span (block 0's card
-    // section), so a title→body boundary is still just the inter-line midpoint.
     const samePostSpan = next && row.blockIdx <= 1 && next.blockIdx <= 1;
     let boundaryPx: number;
-    if (!next) {
-      boundaryPx = H;
-    } else if (sameBlock || samePostSpan) {
-      boundaryPx = (row.y + row.h + next.y) / 2;
-    } else {
-      const thisSpan = blocks.find(b => row.blockIdx <= 1 ? b.blockIdx === 0 : b.blockIdx === row.blockIdx)!;
-      const nextSpan = blocks.find(b => next.blockIdx <= 1 ? b.blockIdx === 0 : b.blockIdx === next.blockIdx)!;
-      boundaryPx = (thisSpan.bottomPx + nextSpan.topPx) / 2;
-    }
+    if (!next) boundaryPx = H;
+    else if (sameBlock || samePostSpan) boundaryPx = (row.y + row.h + next.y) / 2;
+    else boundaryPx = (blockBottom(row.blockIdx) + blockTop(next.blockIdx)) / 2;
     return {
       text: row.text,
       bottomFrac: Math.min(1, boundaryPx / H),
@@ -327,9 +463,4 @@ export async function renderRedditCard(data: RedditCardData): Promise<RedditCard
   const blob = await new Promise<Blob>((res, rej) =>
     canvas.toBlob(b => (b ? res(b) : rej(new Error('toBlob failed'))), 'image/png'));
   return { blob, width: W, height: H, lines };
-}
-
-function measureWidth(ctx: CanvasRenderingContext2D, f: string, text: string): number {
-  ctx.font = f;
-  return ctx.measureText(text).width;
 }
