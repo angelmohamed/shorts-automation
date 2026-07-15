@@ -30,9 +30,11 @@ import { useObservedSize, fitScaleFor } from '@/app/hooks/useElementSize';
 import { useEditorZoomPan, EDITOR_ZOOM_MIN as ZOOM_MIN, EDITOR_ZOOM_MAX as ZOOM_MAX } from '@/app/hooks/useEditorZoomPan';
 import {
   UploadIcon, ArrowRightIcon, SpinnerIcon,
-  CloseIcon, DownloadIcon, VideoIcon, LinkIcon, ChevronDownIcon, ChevronUpIcon, TrashIcon,
+  CloseIcon, DownloadIcon, VideoIcon, LinkIcon, ChevronDownIcon, ChevronUpIcon, TrashIcon, CheckIcon,
 } from '@/lib/icons';
 import { fetchFootageManifest, isFootageUrl, type FootageSegment } from '@/lib/footage';
+import { renderRedditCard, type RedditCardData, type RedditComment } from '@/lib/redditCard';
+import type { MemeLine } from '@/lib/memeOcr';
 
 const CARD_W = CAROUSEL_PREVIEW_W; // 410 — same width as canvas preview
 
@@ -80,6 +82,7 @@ const removeVideoGlyph = (<svg {...SVG_PROPS}><rect x="3" y="6" width="13" heigh
 const addImageGlyph = (<svg {...SVG_PROPS}><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></svg>);
 const micGlyph = (<svg {...SVG_PROPS}><rect x="9" y="2" width="6" height="12" rx="3" /><path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8" /></svg>);
 const shuffleGlyph = (<svg {...SVG_PROPS} width={13} height={13}><path d="M16 3h5v5" /><path d="M4 20 21 3" /><path d="M21 16v5h-5" /><path d="m15 15 6 6" /><path d="M4 4l5 5" /></svg>);
+const redditGlyph = (<svg {...SVG_PROPS}><circle cx="12" cy="14" r="7" /><circle cx="9.5" cy="14" r="0.7" fill="currentColor" stroke="none" /><circle cx="14.5" cy="14" r="0.7" fill="currentColor" stroke="none" /><path d="M12 7c0-2.5 1.5-4 3.5-4" /><circle cx="16.5" cy="3" r="1.2" /></svg>);
 
 // Browse the shared background-footage library (R2 bucket) and pick a segment for the reel.
 function FootagePicker({ activeUrl, onPick }: { activeUrl: string; onPick: (seg: FootageSegment) => void }) {
@@ -208,6 +211,161 @@ function ReelLinkFlyout({ entry, onUpdateField, onUpdateLocalVideo, onFetch, onP
       <FootagePicker activeUrl={isFootageUrl(entry.url) ? entry.url : ''} onPick={onPickFootage} />
       <input ref={fileRef} type="file" accept="video/*" className="hidden" onChange={handleFile} />
       {entry.error && !hasLocal && <span className="text-caption text-danger-text">{entry.error}</span>}
+    </div>
+  );
+}
+
+// ── Reddit thread flyout ─────────────────────────────────────────────────────────────────────────
+// Paste a thread link → /api/reddit imports post + comments → tick the comments/replies to feature →
+// the card renders (redditCard.ts) and lands on the canvas as a narratable image overlay whose
+// ocrLines are synthetic (pixel-exact, no OCR pass).
+interface ImportedRedditPost {
+  user: { name: string; avatar?: string };
+  timeAgo?: string; title: string; body?: string; score?: string; commentCount?: string;
+}
+interface ImportedRedditComment {
+  user: { name: string; avatar?: string };
+  body: string; timeAgo?: string; score?: string; depth: number; isOP?: boolean;
+}
+
+/** Re-normalize depths for an arbitrary selection: a reply whose parent isn't selected is promoted
+    to one level under its nearest SELECTED ancestor (or to top level) so connector rails on the
+    card only ever point at comments that are actually there. */
+function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditComment[], selected: Set<number>): RedditCardData {
+  const chain: (number | null)[] = [];   // chain[origDepth] = new depth of last SELECTED comment there
+  const sel: RedditComment[] = [];
+  comments.forEach((c, i) => {
+    chain.length = c.depth;
+    if (selected.has(i)) {
+      let parentNew: number | null = null;
+      for (let d = c.depth - 1; d >= 0; d--) { const v = chain[d]; if (v != null) { parentNew = v; break; } }
+      const nd = parentNew == null ? 0 : parentNew + 1;
+      sel.push({ user: c.user, body: c.body, timeAgo: c.timeAgo, score: c.score || undefined, depth: nd, isOP: c.isOP });
+      chain[c.depth] = nd;
+    } else {
+      chain[c.depth] = null;
+    }
+  });
+  return {
+    user: post.user, timeAgo: post.timeAgo, title: post.title, body: post.body,
+    score: post.score || undefined, commentCount: post.commentCount || undefined, comments: sel,
+  };
+}
+
+function RedditFlyout({ hasVideo, onAdd }: {
+  hasVideo: boolean;
+  onAdd: (blob: Blob, lines: MemeLine[]) => Promise<void>;
+}) {
+  const [url, setUrl] = useState('');
+  const [busy, setBusy] = useState<'import' | 'add' | null>(null);
+  const [error, setError] = useState('');
+  const [post, setPost] = useState<ImportedRedditPost | null>(null);
+  const [comments, setComments] = useState<ImportedRedditComment[]>([]);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+
+  async function importThread() {
+    setBusy('import'); setError(''); setPost(null); setComments([]); setSelected(new Set());
+    try {
+      const res = await fetch('/api/reddit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+        signal: AbortSignal.timeout(240_000),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? 'Import failed.');
+      setPost(json.post);
+      setComments(json.comments ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Import failed.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function toggle(i: number) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i); else next.add(i);
+      return next;
+    });
+  }
+
+  async function addToReel() {
+    if (!post) return;
+    setBusy('add'); setError('');
+    try {
+      const card = await renderRedditCard(buildRedditCardData(post, comments, selected));
+      await onAdd(card.blob, card.lines);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Couldn’t render the card.');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2 border border-line-strong rounded-md px-2.5 h-9">
+        <LinkIcon size={13} className="text-fg-3 shrink-0" />
+        <input
+          type="url"
+          value={url}
+          onChange={e => setUrl(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && url.trim() && !busy) void importThread(); }}
+          placeholder="Paste a Reddit thread link…"
+          className="flex-1 min-w-0 bg-transparent text-body text-fg placeholder:text-fg-3 outline-none"
+        />
+        <IconButton
+          icon={busy === 'import' ? <SpinnerIcon style={{ animation: 'spin 1s linear infinite' }} /> : <ArrowRightIcon />}
+          label="Import thread"
+          variant="secondary"
+          onClick={() => void importThread()}
+          disabled={!url.trim() || busy !== null}
+        />
+      </div>
+      {post && (
+        <>
+          <div className="text-caption text-fg-2 leading-snug border-l-2 border-line-strong pl-2">
+            <span className="text-fg font-medium">{post.user.name}</span> · {post.title.length > 90 ? `${post.title.slice(0, 90)}…` : post.title}
+          </div>
+          <div className="max-h-64 overflow-y-auto flex flex-col gap-0.5 pr-1">
+            {comments.map((c, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => toggle(i)}
+                style={{ paddingLeft: 6 + Math.min(c.depth, 4) * 14 }}
+                className={`flex items-start gap-2 py-1.5 pr-1.5 rounded-sm text-left transition-colors focus-ring ${
+                  selected.has(i) ? 'bg-active' : 'hover:bg-hover'
+                }`}
+              >
+                <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${
+                  selected.has(i) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'
+                }`}>
+                  <CheckIcon size={9} />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-caption text-fg truncate">
+                    {c.user.name}{c.isOP ? ' · OP' : ''}{c.timeAgo ? ` · ${c.timeAgo}` : ''}
+                  </span>
+                  <span className="block text-caption text-fg-3 truncate">{c.body}</span>
+                </span>
+              </button>
+            ))}
+            {comments.length === 0 && <span className="text-caption text-fg-3">No usable comments in that thread.</span>}
+          </div>
+          <Button
+            variant="primary"
+            onClick={() => void addToReel()}
+            disabled={busy !== null || selected.size === 0 || !hasVideo}
+          >
+            {busy === 'add' ? 'Adding…' : `Add to reel${selected.size ? ` (${selected.size})` : ''}`}
+          </Button>
+          {!hasVideo && <span className="text-caption text-fg-3">Add a video to the reel first — the card overlays it.</span>}
+        </>
+      )}
+      {error && <span className="text-caption text-danger-text">{error}</span>}
     </div>
   );
 }
@@ -912,6 +1070,22 @@ export function CanvasGrid({
       .catch(e => console.error('[ocr] auto-detect failed:', e));
   }, [canvasRefsMap]);
 
+  // Add a rendered Reddit card as an overlay. Same persistence path as an uploaded image, but the
+  // narration lines are synthetic (from the renderer's layout) instead of OCR'd. addImageOverlay
+  // commits the overlay inside img.onload, so the lines attach via a short retry loop; if they
+  // somehow miss, generateNarration's OCR fallback still reads the card.
+  const addRedditCard = useCallback(async (id: string, blob: Blob, lines: MemeLine[]) => {
+    const overlayId = `ov-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    await saveOverlayImage(overlayId, blob, 'reddit-card.png');
+    const url = URL.createObjectURL(blob);
+    canvasRefsMap.current.get(id)?.addImageOverlay(overlayId, url, 'Reddit thread');
+    const ocrLines = lines.map(l => ({ ...l, enabled: true }));
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await new Promise(r => setTimeout(r, 150));
+      canvasRefsMap.current.get(id)?.updateOverlay(overlayId, { ocrLines });
+    }
+  }, [canvasRefsMap]);
+
   // Generate ElevenLabs narration for an overlay and attach it. The meme's text is read straight off
   // the image (OCR — nothing to type). Consecutive enabled lines with the same painted voice form one
   // paragraph, spoken as its own excited take; the takes are stitched into a single narration track.
@@ -1285,6 +1459,12 @@ export function CanvasGrid({
                   // bestVideoUrl(footageVideoData(url)) resolves to proxyStreamUrl(url).
                   void getVideoBlob(proxyStreamUrl(seg.url));
                 }}
+              />
+            ) },
+            { id: 'reddit', label: 'Reddit thread', icon: redditGlyph, content: (
+              <RedditFlyout
+                hasVideo={!!(selectedEntry.localVideoSrc || selectedEntry.data || selectedEntry.videoUrl)}
+                onAdd={(blob, lines) => addRedditCard(selectedEntry.id, blob, lines)}
               />
             ) },
             { id: 'narrate', label: 'Narration', icon: micGlyph, content: (
