@@ -8,7 +8,9 @@ import { z } from 'zod';
 export const runtime = 'nodejs';
 
 const Schema = z.object({
-  apiKey: z.string().min(8).max(200),
+  // Optional when the server has ELEVENLABS_API_KEY configured (.env.local) — the client key,
+  // if present, still wins so individual users can keep their own quota.
+  apiKey: z.string().max(200).optional(),
   voiceId: z.string().min(4).max(80),
   text: z.string().min(1).max(5000),
   modelId: z.string().max(80).optional(),
@@ -23,8 +25,15 @@ const Schema = z.object({
 
 export async function POST(request: NextRequest) {
   const parsed = Schema.safeParse(await request.json().catch(() => ({})));
-  if (!parsed.success) return NextResponse.json({ error: 'apiKey, voiceId and text are required' }, { status: 400 });
-  const { apiKey, voiceId, text, modelId, voiceSettings } = parsed.data;
+  if (!parsed.success) return NextResponse.json({ error: 'voiceId and text are required' }, { status: 400 });
+  const { voiceId, text, modelId, voiceSettings } = parsed.data;
+  const apiKey = parsed.data.apiKey?.trim() || process.env.ELEVENLABS_API_KEY;
+  if (!apiKey || apiKey.length < 8) {
+    return NextResponse.json(
+      { error: 'No ElevenLabs key — paste one in the Narration panel, or set ELEVENLABS_API_KEY in .env.local.' },
+      { status: 401 },
+    );
+  }
 
   try {
     const res = await fetch(

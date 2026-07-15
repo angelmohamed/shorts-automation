@@ -503,7 +503,7 @@ function NarrateFlyout({ overlays, voices, onVoicesChange, brushIdx, onBrushChan
         type="password"
         value={apiKey}
         onChange={e => { setApiKey(e.target.value); try { localStorage.setItem(LS_11L_KEY, e.target.value); } catch { /* ignore */ } }}
-        placeholder="ElevenLabs API key"
+        placeholder="ElevenLabs API key (blank = server key)"
         className="h-8 rounded-md border border-line-strong bg-transparent px-2 text-body text-fg placeholder:text-fg-3 outline-none"
       />
       {/* Voice palette: row 0 is the default narrator; the colored dot arms that voice as a brush for
@@ -552,7 +552,7 @@ function NarrateFlyout({ overlays, voices, onVoicesChange, brushIdx, onBrushChan
           ? 'Brush armed — click lines on the image to give them this voice. Same-voice lines read as one paragraph.'
           : 'Reads the detected text as a hyped take, un-cropping line by line. Click lines on the overlay to skip them, or arm a voice dot to paint paragraphs.'}
       </p>
-      <Button variant="primary" size="sm" loading={busy} disabled={!apiKey.trim()} onClick={generate}>
+      <Button variant="primary" size="sm" loading={busy} onClick={generate}>
         Generate narration
       </Button>
       {msg && <span className="text-caption text-fg-3">{msg}</span>}
