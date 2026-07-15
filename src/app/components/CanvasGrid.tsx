@@ -259,7 +259,7 @@ function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditC
 
 function RedditFlyout({ hasVideo, onAdd }: {
   hasVideo: boolean;
-  onAdd: (blob: Blob, lines: MemeLine[], dims: { w: number; h: number }) => Promise<void>;
+  onAdd: (blob: Blob, lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) => Promise<void>;
 }) {
   const [url, setUrl] = useState('');
   const [busy, setBusy] = useState<'import' | 'add' | null>(null);
@@ -305,8 +305,13 @@ function RedditFlyout({ hasVideo, onAdd }: {
     if (!post) return;
     setBusy('add'); setError('');
     try {
-      const card = await renderRedditCard(buildRedditCardData(post, comments, selected, selectedParas));
-      await onAdd(card.blob, card.lines, { w: card.width, h: card.height });
+      const data = buildRedditCardData(post, comments, selected, selectedParas);
+      const card = await renderRedditCard(data);
+      // Author per narration block, aligned with MemeLine.blockIdx: 0/1 = post title/body,
+      // 2+i = the i-th comment on the card. Lets the overlay arrive pre-painted per participant.
+      const postAuthor = data.user.name.replace(/^u\//, '');
+      const blockAuthors = [postAuthor, postAuthor, ...data.comments.map(c => c.user.name.replace(/^u\//, ''))];
+      await onAdd(card.blob, card.lines, { w: card.width, h: card.height }, blockAuthors);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Couldn’t render the card.');
     } finally {
@@ -1116,12 +1121,22 @@ export function CanvasGrid({
   // narration lines are synthetic (from the renderer's layout) instead of OCR'd. addImageOverlay
   // commits the overlay inside img.onload, so the lines attach via a short retry loop; if they
   // somehow miss, generateNarration's OCR fallback still reads the card.
-  const addRedditCard = useCallback(async (id: string, blob: Blob, lines: MemeLine[], dims: { w: number; h: number }) => {
+  const addRedditCard = useCallback(async (id: string, blob: Blob, lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) => {
     const overlayId = `ov-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     await saveOverlayImage(overlayId, blob, 'reddit-card.png');
     const url = URL.createObjectURL(blob);
     canvasRefsMap.current.get(id)?.addImageOverlay(overlayId, url, 'Reddit thread');
-    const ocrLines = lines.map(l => ({ ...l, enabled: true }));
+    // Auto-cast the thread: each distinct author (in card order) gets the next voice from the
+    // palette, cycling — the post author reads with voices[0] (the default narrator), and an OP
+    // reply reuses the post's voice. Needs ≥2 voices to mean anything; the brush can repaint.
+    const voiceIds = narrationVoices.map(v => v.trim()).filter(Boolean);
+    const authorVoice = new Map<string, string>();
+    if (voiceIds.length >= 2) {
+      for (const author of blockAuthors) {
+        if (!authorVoice.has(author)) authorVoice.set(author, voiceIds[authorVoice.size % voiceIds.length]);
+      }
+    }
+    const ocrLines = lines.map(l => ({ ...l, enabled: true, voiceId: authorVoice.get(blockAuthors[l.blockIdx] ?? '') }));
     // Pre-narration the whole card must be on screen (voice painting needs every line clickable),
     // so fit it inside the 1080x1920 frame however long the thread is. Narrating snaps it to the
     // readable top-anchored layout and the teleprompter scroll takes over.
@@ -1132,7 +1147,7 @@ export function CanvasGrid({
       await new Promise(r => setTimeout(r, 150));
       canvasRefsMap.current.get(id)?.updateOverlay(overlayId, { ocrLines, ...rect });
     }
-  }, [canvasRefsMap]);
+  }, [canvasRefsMap, narrationVoices]);
 
   // Generate ElevenLabs narration for an overlay and attach it. The meme's text is read straight off
   // the image (OCR — nothing to type). Consecutive enabled lines with the same painted voice form one
@@ -1520,7 +1535,7 @@ export function CanvasGrid({
             { id: 'reddit', label: 'Reddit thread', icon: redditGlyph, content: (
               <RedditFlyout
                 hasVideo={!!(selectedEntry.localVideoSrc || selectedEntry.data || selectedEntry.videoUrl)}
-                onAdd={(blob, lines, dims) => addRedditCard(selectedEntry.id, blob, lines, dims)}
+                onAdd={(blob, lines, dims, blockAuthors) => addRedditCard(selectedEntry.id, blob, lines, dims, blockAuthors)}
               />
             ) },
             { id: 'narrate', label: 'Narration', icon: micGlyph, content: (
