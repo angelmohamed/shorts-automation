@@ -430,9 +430,11 @@ const LS_11L_VOICES = 'reels:11labs-voices';
 // Fixed voice cast for Reddit thread cards (ElevenLabs voice IDs). The post always reads as Mark;
 // each distinct commenter draws a random voice from the pool (stable per author on a card, no
 // repeats until the pool is exhausted; an OP reply reuses Mark). Edit here to recast.
-// Narration delivery speed via ElevenLabs' native `speed` setting (1 = natural, 1.2 = max).
-// Applies to every generated take (Reddit cast and meme narration alike).
-const NARRATION_SPEED = 1.15;
+// Narration delivery speed via ElevenLabs' native `speed` setting (1 = natural, 1.2 = the API's
+// max). Chosen in the Narration flyout, persisted per browser, applies to every generated take.
+const LS_NARRATION_SPEED = 'reels:narration-speed';
+const NARRATION_SPEEDS = [1, 1.05, 1.1, 1.15, 1.2] as const;
+const DEFAULT_NARRATION_SPEED = 1.15;
 
 const REDDIT_POST_VOICE = { id: 'UgBBYS2sOqTuMpoF3BR0', name: 'Mark' };          // Natural Conversations (US)
 const REDDIT_COMMENT_VOICES = [
@@ -472,13 +474,15 @@ function loadSavedVoices(): string[] {
   }
 }
 
-function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChange, voiceColors, onGenerate }: {
+function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChange, voiceColors, speed, onSpeedChange, onGenerate }: {
   overlays: ImageOverlay[];
   voices: string[];
   onVoicesChange: (v: string[]) => void;
   brushId: string | null;
   onBrushChange: (id: string | null) => void;
   voiceColors: Record<string, string>;
+  speed: number;
+  onSpeedChange: (s: number) => void;
   onGenerate: (overlayId: string, apiKey: string, onStatus: (s: string) => void) => Promise<string | null>;
 }) {
   const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem(LS_11L_KEY) ?? ''; } catch { return ''; } });
@@ -598,6 +602,23 @@ function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChang
             ? 'The post reads as Mark; each commenter gets a random cast voice, revealing line by line in sync.'
             : 'Reads the detected text as a hyped take, un-cropping line by line. Click lines on the overlay to skip them, or arm a voice dot to paint paragraphs.'}
       </p>
+      {/* Delivery speed: ElevenLabs re-performs the read faster (1.2 is the API max) — reveal
+          timing follows automatically. Applies to the next Generate. */}
+      <div className="flex flex-wrap items-center gap-1">
+        <span className="text-caption text-fg-3 mr-0.5">Speed</span>
+        {NARRATION_SPEEDS.map(s => (
+          <button
+            key={s}
+            type="button"
+            onClick={() => onSpeedChange(s)}
+            className={`h-6 px-1.5 rounded-md border text-caption transition-colors ${
+              speed === s ? 'border-accent bg-accent/15 text-fg' : 'border-line-strong text-fg-2 hover:text-fg hover:border-accent-border'
+            }`}
+          >
+            {s === 1 ? '1x' : `${s}x`}
+          </button>
+        ))}
+      </div>
       <Button variant="primary" size="sm" loading={busy} onClick={generate}>
         Generate narration
       </Button>
@@ -799,6 +820,15 @@ export function CanvasGrid({
   // brush on the OCR highlights. Persisted so the cast survives reloads.
   const [narrationVoices, setNarrationVoices] = useState<string[]>(loadSavedVoices);
   const [voiceBrushId, setVoiceBrushId] = useState<string | null>(null);
+  const [narrationSpeed, setNarrationSpeed] = useState<number>(() => {
+    try {
+      const saved = Number(localStorage.getItem(LS_NARRATION_SPEED));
+      return NARRATION_SPEEDS.includes(saved as typeof NARRATION_SPEEDS[number]) ? saved : DEFAULT_NARRATION_SPEED;
+    } catch { return DEFAULT_NARRATION_SPEED; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(LS_NARRATION_SPEED, String(narrationSpeed)); } catch { /* ignore */ }
+  }, [narrationSpeed]);
   useEffect(() => {
     try { localStorage.setItem(LS_11L_VOICES, JSON.stringify(narrationVoices)); } catch { /* ignore */ }
   }, [narrationVoices]);
@@ -1263,9 +1293,9 @@ export function CanvasGrid({
           body: JSON.stringify({
             apiKey, voiceId: g.voiceId, text: joined,
             // Excited meme-narrator delivery: low stability + high style = animated, hyped read.
-            // NARRATION_SPEED is ElevenLabs' native pacing (1 = natural, 1.2 = max) — reveal sync
-            // holds automatically because the returned timestamps describe the sped audio.
-            voiceSettings: { stability: 0.35, similarity_boost: 0.8, style: 0.6, use_speaker_boost: true, speed: NARRATION_SPEED },
+            // `speed` is ElevenLabs' native pacing (1 = natural, 1.2 = max) — reveal sync holds
+            // automatically because the returned timestamps describe the sped audio.
+            voiceSettings: { stability: 0.35, similarity_boost: 0.8, style: 0.6, use_speaker_boost: true, speed: narrationSpeed },
           }),
         });
         const json = await res.json().catch(() => ({}));
@@ -1337,7 +1367,7 @@ export function CanvasGrid({
       ref.updateOverlay(overlayId, { x: Math.round((1080 - w) / 2), y: 110, w, h: Math.round(w * (overlay.h / overlay.w)) });
     }
     return null;
-  }, [canvasRefsMap, narrationVoices]);
+  }, [canvasRefsMap, narrationVoices, narrationSpeed]);
 
   const applyVideoZoom = useCallback((id: string, s: number) => {
     const clamped = Math.max(0.5, Math.min(3, s));
@@ -1596,6 +1626,8 @@ export function CanvasGrid({
                 brushId={voiceBrushId}
                 onBrushChange={setVoiceBrushId}
                 voiceColors={narrationVoiceColors}
+                speed={narrationSpeed}
+                onSpeedChange={setNarrationSpeed}
                 onGenerate={(overlayId, apiKey, onStatus) => generateNarration(selectedEntry.id, overlayId, apiKey, onStatus)}
               />
             ) },
