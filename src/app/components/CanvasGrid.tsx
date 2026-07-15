@@ -426,6 +426,18 @@ function RedditFlyout({ hasVideo, onAdd }: {
 const LS_11L_KEY = 'reels:11labs-key';
 const LS_11L_VOICE = 'reels:11labs-voice';       // legacy single-voice key, migrated into the list
 const LS_11L_VOICES = 'reels:11labs-voices';
+
+// Fixed voice cast for Reddit thread cards (ElevenLabs voice IDs). The post always reads as Mark;
+// each distinct commenter draws a random voice from the pool (stable per author on a card, no
+// repeats until the pool is exhausted; an OP reply reuses Mark). Edit here to recast.
+const REDDIT_POST_VOICE = 'UgBBYS2sOqTuMpoF3BR0';   // Mark — Natural Conversations (US)
+const REDDIT_COMMENT_VOICES = [
+  'Bj9UqZbhQsanLzgalpEG',   // Austin — Deep Raspy and Authentic (US Southern)
+  'NNl6r8mD7vthiJatiJt1',   // Bradford — Expressive and Articulate (British)
+  'EkK5I93UQWFDigLMpZcX',   // James — Husky, Engaging and Bold (US)
+  'Z3R5wn05IrDiVCyEkUrK',   // Arabella — Mysterious and Emotive (US)
+  'aMSt68OGf4xUZAnLpTU8',   // Juniper — Grounded and Professional (US)
+];
 const DEFAULT_VOICE = 'TX3LPaxmHKxFdv7VOQHJ';   // ElevenLabs "Liam" — energetic social-media narrator, premade so free-tier keys can use it
 const VOICE_COLORS = ['#38bdf8', '#f472b6', '#a3e635', '#fbbf24', '#c084fc', '#fb7185'];
 
@@ -759,6 +771,10 @@ export function CanvasGrid({
   const narrationVoiceColors = useMemo(() => {
     const m: Record<string, string> = {};
     narrationVoices.forEach((v, i) => { const id = v.trim(); if (id && !(id in m)) m[id] = VOICE_COLORS[i % VOICE_COLORS.length]; });
+    // The Reddit cast gets stable tints too, so auto-cast highlights are distinct out of the box.
+    for (const id of [REDDIT_POST_VOICE, ...REDDIT_COMMENT_VOICES]) {
+      if (!(id in m)) m[id] = VOICE_COLORS[Object.keys(m).length % VOICE_COLORS.length];
+    }
     return m;
   }, [narrationVoices]);
   const voiceBrush = useMemo(() => {
@@ -1126,15 +1142,14 @@ export function CanvasGrid({
     await saveOverlayImage(overlayId, blob, 'reddit-card.png');
     const url = URL.createObjectURL(blob);
     canvasRefsMap.current.get(id)?.addImageOverlay(overlayId, url, 'Reddit thread');
-    // Auto-cast the thread: each distinct author (in card order) gets the next voice from the
-    // palette, cycling — the post author reads with voices[0] (the default narrator), and an OP
-    // reply reuses the post's voice. Needs ≥2 voices to mean anything; the brush can repaint.
-    const voiceIds = narrationVoices.map(v => v.trim()).filter(Boolean);
-    const authorVoice = new Map<string, string>();
-    if (voiceIds.length >= 2) {
-      for (const author of blockAuthors) {
-        if (!authorVoice.has(author)) authorVoice.set(author, voiceIds[authorVoice.size % voiceIds.length]);
-      }
+    // Auto-cast the thread from the fixed Reddit cast: the post (blocks 0/1) reads as Mark, each
+    // distinct commenter draws the next voice from a per-card shuffle of the comment pool (an OP
+    // reply matches the post author's name, so it reuses Mark). The brush can repaint any line.
+    const pool = [...REDDIT_COMMENT_VOICES].sort(() => Math.random() - 0.5);
+    const authorVoice = new Map<string, string>([[blockAuthors[0] ?? '', REDDIT_POST_VOICE]]);
+    let commenterCount = 0;
+    for (const author of blockAuthors.slice(2)) {
+      if (!authorVoice.has(author)) authorVoice.set(author, pool[commenterCount++ % pool.length]);
     }
     const ocrLines = lines.map(l => ({ ...l, enabled: true, voiceId: authorVoice.get(blockAuthors[l.blockIdx] ?? '') }));
     // Pre-narration the whole card must be on screen (voice painting needs every line clickable),
@@ -1147,7 +1162,7 @@ export function CanvasGrid({
       await new Promise(r => setTimeout(r, 150));
       canvasRefsMap.current.get(id)?.updateOverlay(overlayId, { ocrLines, ...rect });
     }
-  }, [canvasRefsMap, narrationVoices]);
+  }, [canvasRefsMap]);
 
   // Generate ElevenLabs narration for an overlay and attach it. The meme's text is read straight off
   // the image (OCR — nothing to type). Consecutive enabled lines with the same painted voice form one
