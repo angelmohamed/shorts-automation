@@ -45,18 +45,40 @@ export default function RedditCardDev() {
   const [dims, setDims] = useState({ w: 0, h: 0 });
   const [debug, setDebug] = useState(false);
   const [revealIdx, setRevealIdx] = useState<number | null>(null);
+  const [data, setData] = useState<RedditCardData>(SAMPLE);
+  const [threadUrl, setThreadUrl] = useState('');
+  const [importState, setImportState] = useState('');
   const overlayRef = useRef<HTMLCanvasElement>(null);
+
+  // Import a real thread through /api/reddit and render it (first 4 comments for the demo).
+  async function importThread() {
+    setImportState('importing…');
+    try {
+      const res = await fetch('/api/reddit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: threadUrl }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? 'import failed');
+      setData({ ...json.post, comments: json.comments.slice(0, 4) });
+      setImportState(`imported · ${json.comments.length} comments available`);
+    } catch (e) {
+      setImportState(e instanceof Error ? e.message : 'import failed');
+    }
+  }
 
   useEffect(() => {
     let url = '';
-    renderRedditCard(SAMPLE).then(r => {
+    renderRedditCard(data).then(r => {
       url = URL.createObjectURL(r.blob);
       setImg(url);
       setLines(r.lines);
       setDims({ w: r.width, h: r.height });
+      setRevealIdx(null);
     });
     return () => { if (url) URL.revokeObjectURL(url); };
-  }, []);
+  }, [data]);
 
   // debug overlay: line bboxes (green) + reveal boundaries (red)
   useEffect(() => {
@@ -88,6 +110,18 @@ export default function RedditCardDev() {
       <p style={{ fontSize: 13, color: '#8ba2ad', marginBottom: 20 }}>
         Real renderer output. Use the reveal slider to preview the narration crop; toggle debug to see the line map.
       </p>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 14, fontSize: 13 }}>
+        <input
+          value={threadUrl}
+          onChange={e => setThreadUrl(e.target.value)}
+          placeholder="Paste a Reddit thread URL to render it for real…"
+          style={{ width: 420, background: '#14181b', border: '1px solid #2a3236', borderRadius: 8, color: '#f2f4f5', padding: '7px 10px' }}
+        />
+        <button onClick={importThread} disabled={!threadUrl.trim()} style={{ background: '#0a67c2', color: '#fff', border: 0, borderRadius: 6, padding: '7px 14px', cursor: 'pointer' }}>
+          import
+        </button>
+        <span style={{ color: '#8ba2ad' }}>{importState}</span>
+      </div>
       <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 24, fontSize: 13 }}>
         <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <input type="checkbox" checked={debug} onChange={e => setDebug(e.target.checked)} /> line map

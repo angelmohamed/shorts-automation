@@ -102,9 +102,13 @@ function drawAvatar(ctx: CanvasRenderingContext2D, user: RedditUser, img: HTMLIm
   ctx.arc(x + d / 2, y + d / 2, d / 2, 0, Math.PI * 2);
   ctx.clip();
   if (img) {
+    // Backdrop disc first: snoovatars are transparent PNGs and need a color behind them
+    // (Reddit does the same). Cover-fit, but TOP-anchored for tall images so heads stay in frame.
+    ctx.fillStyle = avatarColor(user.name);
+    ctx.fillRect(x, y, d, d);
     const s = Math.max(d / img.naturalWidth, d / img.naturalHeight);
     const dw = img.naturalWidth * s, dh = img.naturalHeight * s;
-    ctx.drawImage(img, x + (d - dw) / 2, y + (d - dh) / 2, dw, dh);
+    ctx.drawImage(img, x + (d - dw) / 2, dh > d ? y : y + (d - dh) / 2, dw, dh);
   } else {
     ctx.fillStyle = avatarColor(user.name);
     ctx.fillRect(x, y, d, d);

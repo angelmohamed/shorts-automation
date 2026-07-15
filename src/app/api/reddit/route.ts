@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { isSafePublicUrl } from '@/lib/http';
+import { redditBrowserJson } from '@/lib/redditBrowser';
 
-// Resolve a Reddit thread URL into normalized card data for the Reddit template. Uses the official
-// OAuth API (application-only client_credentials grant) — Reddit hard-403s anonymous .json access,
-// so REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET must be set (a free "script" app from
-// reddit.com/prefs/apps). Avatars are fetched server-side and inlined as data URIs so the canvas
-// renderer never deals with cross-origin images.
+// Resolve a Reddit thread URL into normalized card data for the Reddit template. Two transports:
+// the official OAuth API when REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET are configured (a free
+// "script" app from reddit.com/prefs/apps — preferred, ToS-clean), else a headless-Chrome session
+// that passes Reddit's bot challenge and reads the public .json endpoints (Reddit hard-403s plain
+// HTTP clients). Avatars are fetched server-side and inlined as data URIs so the canvas renderer
+// never deals with cross-origin images.
 
 export const runtime = 'nodejs';
 
@@ -48,6 +50,15 @@ async function oauthGet(path: string): Promise<unknown> {
   });
   if (!res.ok) throw new Error(`reddit api ${res.status}`);
   return res.json();
+}
+
+/** Transport-agnostic GET: OAuth when configured, else the headless-browser session.
+    `path` has no .json suffix (e.g. "/comments/abc123"); `query` is the raw query string. */
+async function redditGet(path: string, query: string): Promise<unknown> {
+  if (process.env.REDDIT_CLIENT_ID && process.env.REDDIT_CLIENT_SECRET) {
+    return oauthGet(`${path}?${query}`);
+  }
+  return redditBrowserJson(`${path}.json?${query}`);
 }
 
 // ── URL → thread id ──────────────────────────────────────────────────────────────────────────────
@@ -133,7 +144,7 @@ function flattenComments(children: RawComment[], postAuthor: string, depth = 0, 
     back to the colored initial disc). */
 async function fetchAvatar(name: string): Promise<string | undefined> {
   try {
-    const about = await oauthGet(`/user/${encodeURIComponent(name)}/about?raw_json=1`) as
+    const about = await redditGet(`/user/${encodeURIComponent(name)}/about`, 'raw_json=1') as
       { data?: { snoovatar_img?: string; icon_img?: string } };
     const src = about.data?.snoovatar_img || about.data?.icon_img;
     if (!src || !(await isSafePublicUrl(src))) return undefined;
@@ -157,7 +168,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'That doesn’t look like a Reddit thread link.' }, { status: 400 });
     }
 
-    const listing = await oauthGet(`/comments/${threadId}?limit=60&depth=4&raw_json=1&sort=top`) as
+    const listing = await redditGet(`/comments/${threadId}`, 'limit=60&depth=4&raw_json=1&sort=top') as
       [{ data: { children: [{ data: Record<string, unknown> }] } }, { data: { children: RawComment[] } }];
     const p = listing[0]?.data?.children?.[0]?.data as {
       author?: string; title?: string; selftext?: string; score?: number;
