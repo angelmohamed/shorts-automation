@@ -79,6 +79,7 @@ const timelineGlyph = (<svg {...SVG_PROPS}><path d="M3 12h18" /><rect x="8" y="9
 const removeVideoGlyph = (<svg {...SVG_PROPS}><rect x="3" y="6" width="13" height="12" rx="2" /><path d="M16 10.5 21 8v8l-5-2.5" /><path d="m3 3 18 18" /></svg>);
 const addImageGlyph = (<svg {...SVG_PROPS}><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></svg>);
 const micGlyph = (<svg {...SVG_PROPS}><rect x="9" y="2" width="6" height="12" rx="3" /><path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8" /></svg>);
+const shuffleGlyph = (<svg {...SVG_PROPS} width={13} height={13}><path d="M16 3h5v5" /><path d="M4 20 21 3" /><path d="M21 16v5h-5" /><path d="m15 15 6 6" /><path d="M4 4l5 5" /></svg>);
 
 // Browse the shared background-footage library (R2 bucket) and pick a segment for the reel.
 function FootagePicker({ activeUrl, onPick }: { activeUrl: string; onPick: (seg: FootageSegment) => void }) {
@@ -89,17 +90,40 @@ function FootagePicker({ activeUrl, onPick }: { activeUrl: string; onPick: (seg:
     if (!open || segments) return;
     fetchFootageManifest().then(setSegments).catch(() => setError('Couldn’t load the footage library.'));
   }, [open, segments]);
+  // Pick a random segment (never the one already active) — loads the manifest on demand so the
+  // shuffle works without opening the list first.
+  async function pickRandom() {
+    try {
+      const segs = segments ?? await fetchFootageManifest();
+      if (!segments) setSegments(segs);
+      const pool = segs.filter(s => s.url !== activeUrl);
+      if (pool.length) onPick(pool[Math.floor(Math.random() * pool.length)]);
+    } catch {
+      setError('Couldn’t load the footage library.');
+    }
+  }
   return (
     <div className="flex flex-col gap-1">
-      <button
-        type="button"
-        onClick={() => { setError(''); setOpen(o => !o); }}
-        className="flex items-center gap-2 h-7 text-body text-fg-2 hover:text-fg transition-colors focus-ring rounded-sm"
-      >
-        <VideoIcon size={13} className="shrink-0" />
-        <span className="flex-1 text-left">Background footage</span>
-        {open ? <ChevronUpIcon size={13} /> : <ChevronDownIcon size={13} />}
-      </button>
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={() => { setError(''); setOpen(o => !o); }}
+          className="flex items-center gap-2 h-7 flex-1 min-w-0 text-body text-fg-2 hover:text-fg transition-colors focus-ring rounded-sm"
+        >
+          <VideoIcon size={13} className="shrink-0" />
+          <span className="flex-1 text-left">Background footage</span>
+          {open ? <ChevronUpIcon size={13} /> : <ChevronDownIcon size={13} />}
+        </button>
+        <button
+          type="button"
+          onClick={pickRandom}
+          title="Pick random footage"
+          aria-label="Pick random footage"
+          className="flex items-center justify-center size-7 shrink-0 rounded-sm text-fg-2 hover:text-fg hover:bg-hover transition-colors focus-ring"
+        >
+          {shuffleGlyph}
+        </button>
+      </div>
       {open && (
         error ? <span className="text-caption text-danger-text">{error}</span>
         : !segments ? <span className="text-caption text-fg-3">Loading footage…</span>
