@@ -335,21 +335,30 @@ function RedditFlyout({ hasVideo, onAdd }: {
                 key={i}
                 type="button"
                 onClick={() => toggle(i)}
-                style={{ paddingLeft: 6 + Math.min(c.depth, 4) * 14 }}
-                className={`flex items-start gap-2 py-1.5 pr-1.5 rounded-sm text-left transition-colors focus-ring ${
+                className={`flex items-stretch pl-1.5 pr-1.5 rounded-sm text-left transition-colors focus-ring ${
                   selected.has(i) ? 'bg-active' : 'hover:bg-hover'
                 }`}
               >
-                <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${
-                  selected.has(i) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'
-                }`}>
-                  <CheckIcon size={9} />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block text-caption text-fg truncate">
-                    {c.user.name}{c.isOP ? ' · OP' : ''}{c.timeAgo ? ` · ${c.timeAgo}` : ''}
+                {/* thread rails: one vertical line per ancestor level, aligned across rows */}
+                {Array.from({ length: Math.min(c.depth, 4) }, (_, d) => (
+                  <span key={d} aria-hidden className="w-3 shrink-0 border-l-2 border-line-strong ml-0.5" />
+                ))}
+                {c.depth > 0 && <span aria-hidden className="self-center mr-1 text-fg-3 text-caption leading-none">↳</span>}
+                <span className="flex items-start gap-2 py-1.5 min-w-0 flex-1">
+                  <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${
+                    selected.has(i) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'
+                  }`}>
+                    <CheckIcon size={9} />
                   </span>
-                  <span className="block text-caption text-fg-3 truncate">{c.body}</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-caption truncate">
+                      <span className={c.depth === 0 ? 'text-fg font-medium' : 'text-fg'}>{c.user.name}</span>
+                      {c.isOP && <span className="text-[#4d9df6] font-semibold"> OP</span>}
+                      {c.timeAgo && <span className="text-fg-3"> · {c.timeAgo}</span>}
+                      {c.depth > 0 && <span className="text-fg-3"> · reply</span>}
+                    </span>
+                    <span className="block text-caption text-fg-3 truncate">{c.body}</span>
+                  </span>
                 </span>
               </button>
             ))}

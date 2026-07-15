@@ -231,58 +231,24 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'That doesn’t look like a Reddit thread link.' }, { status: 400 });
     }
 
-    // Apify is the primary transport when configured; on failure fall through to oauth/browser.
-    if (process.env.APIFY_TOKEN) {
-      try {
-        const data = await apifyImport(`https://www.reddit.com/comments/${threadId}/`);
-        // The actor doesn't scrape user profiles, so avatars come from a best-effort enrichment
-        // pass over the oauth/browser transport. Any failure (no Chrome, wall, timeout) just
-        // leaves the renderer's colored initial discs in place.
-        try {
-          const names = [...new Set([
-            data.post.user.name.replace(/^u\//, ''),
-            ...data.comments.map(c => c.user.name),
-          ])].slice(0, MAX_AVATARS);
-          const avatars = new Map(await Promise.all(names.map(async n => [n, await fetchAvatar(n)] as const)));
-          const postAuthor = data.post.user.name.replace(/^u\//, '');
-          (data.post.user as { avatar?: string }).avatar = avatars.get(postAuthor);
-          for (const c of data.comments) c.user.avatar = avatars.get(c.user.name) ?? undefined;
-        } catch (e) {
-          console.warn('[reddit] avatar enrichment unavailable:', e instanceof Error ? e.message : e);
-        }
-        return NextResponse.json(data);
-      } catch (e) {
-        console.error('[reddit] apify transport failed, falling back:', e);
-      }
+    // Transport order: native (oauth/browser) first — it carries the real comment TREE, scores and
+    // avatars, while the Apify actor flattens every comment to depth 0 and hides votes. Apify is
+    // the fallback for environments without Chrome, or the primary with REDDIT_TRANSPORT=apify.
+    const nativeFirst = process.env.REDDIT_TRANSPORT !== 'apify';
+    if (!nativeFirst && process.env.APIFY_TOKEN) {
+      try { return NextResponse.json(await apifyWithAvatars(threadId)); }
+      catch (e) { console.error('[reddit] apify transport failed, trying native:', e); }
     }
-
-    const listing = await redditGet(`/comments/${threadId}`, 'limit=60&depth=4&raw_json=1&sort=top') as
-      [{ data: { children: [{ data: Record<string, unknown> }] } }, { data: { children: RawComment[] } }];
-    const p = listing[0]?.data?.children?.[0]?.data as {
-      author?: string; title?: string; selftext?: string; score?: number;
-      num_comments?: number; created_utc?: number; subreddit_name_prefixed?: string;
-    } | undefined;
-    if (!p?.title) return NextResponse.json({ error: 'Couldn’t read that thread — is it public?' }, { status: 404 });
-
-    const comments = flattenComments(listing[1]?.data?.children ?? [], p.author ?? '');
-
-    // avatars: post author first, then commenters in order, capped
-    const names = [...new Set([p.author, ...comments.map(c => c.user.name)])].filter((n): n is string => !!n && n !== '[deleted]').slice(0, MAX_AVATARS);
-    const avatars = new Map(await Promise.all(names.map(async n => [n, await fetchAvatar(n)] as const)));
-    for (const c of comments) c.user.avatar = avatars.get(c.user.name) ?? undefined;
-
-    return NextResponse.json({
-      post: {
-        user: { name: `u/${p.author ?? 'unknown'}`, avatar: p.author ? avatars.get(p.author) : undefined },
-        subreddit: p.subreddit_name_prefixed,
-        timeAgo: timeAgo(p.created_utc ?? Date.now() / 1000),
-        title: plainText(p.title),
-        body: p.selftext ? plainText(p.selftext) : undefined,
-        score: fmtScore(p.score ?? 0),
-        commentCount: fmtScore(p.num_comments ?? 0),
-      },
-      comments,
-    });
+    try {
+      return NextResponse.json(await nativeImport(threadId));
+    } catch (e) {
+      if (e instanceof ConfigError) throw e;
+      if (nativeFirst && process.env.APIFY_TOKEN) {
+        console.error('[reddit] native transport failed, falling back to apify:', e);
+        return NextResponse.json(await apifyWithAvatars(threadId));
+      }
+      throw e;
+    }
   } catch (e) {
     if (e instanceof ConfigError) {
       return NextResponse.json(
@@ -294,4 +260,54 @@ export async function POST(request: NextRequest) {
     const timedOut = e instanceof Error && e.name === 'TimeoutError';
     return NextResponse.json({ error: timedOut ? 'Reddit took too long — try again.' : 'Couldn’t fetch that thread from Reddit.' }, { status: 502 });
   }
+}
+
+/** Apify thread import + best-effort avatar enrichment over the native transport (the actor
+    doesn't scrape user profiles). Enrichment failure just leaves the initial discs. */
+async function apifyWithAvatars(threadId: string) {
+  const data = await apifyImport(`https://www.reddit.com/comments/${threadId}/`);
+  try {
+    const names = [...new Set([
+      data.post.user.name.replace(/^u\//, ''),
+      ...data.comments.map(c => c.user.name),
+    ])].slice(0, MAX_AVATARS);
+    const avatars = new Map(await Promise.all(names.map(async n => [n, await fetchAvatar(n)] as const)));
+    const postAuthor = data.post.user.name.replace(/^u\//, '');
+    (data.post.user as { avatar?: string }).avatar = avatars.get(postAuthor);
+    for (const c of data.comments) c.user.avatar = avatars.get(c.user.name) ?? undefined;
+  } catch (e) {
+    console.warn('[reddit] avatar enrichment unavailable:', e instanceof Error ? e.message : e);
+  }
+  return data;
+}
+
+/** Full-fidelity import over oauth/browser: real comment tree, scores, and avatars. */
+async function nativeImport(threadId: string) {
+  const listing = await redditGet(`/comments/${threadId}`, 'limit=60&depth=4&raw_json=1&sort=top') as
+      [{ data: { children: [{ data: Record<string, unknown> }] } }, { data: { children: RawComment[] } }];
+    const p = listing[0]?.data?.children?.[0]?.data as {
+      author?: string; title?: string; selftext?: string; score?: number;
+      num_comments?: number; created_utc?: number; subreddit_name_prefixed?: string;
+    } | undefined;
+    if (!p?.title) throw new Error('thread unreadable — deleted or private?');
+
+    const comments = flattenComments(listing[1]?.data?.children ?? [], p.author ?? '');
+
+    // avatars: post author first, then commenters in order, capped
+    const names = [...new Set([p.author, ...comments.map(c => c.user.name)])].filter((n): n is string => !!n && n !== '[deleted]').slice(0, MAX_AVATARS);
+    const avatars = new Map(await Promise.all(names.map(async n => [n, await fetchAvatar(n)] as const)));
+    for (const c of comments) c.user.avatar = avatars.get(c.user.name) ?? undefined;
+
+    return {
+      post: {
+        user: { name: `u/${p.author ?? 'unknown'}`, avatar: p.author ? avatars.get(p.author) : undefined },
+        subreddit: p.subreddit_name_prefixed,
+        timeAgo: timeAgo(p.created_utc ?? Date.now() / 1000),
+        title: plainText(p.title),
+        body: p.selftext ? plainText(p.selftext) : undefined,
+        score: fmtScore(p.score ?? 0),
+        commentCount: fmtScore(p.num_comments ?? 0),
+      },
+      comments,
+    };
 }
