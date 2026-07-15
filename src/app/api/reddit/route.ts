@@ -61,6 +61,69 @@ async function redditGet(path: string, query: string): Promise<unknown> {
   return redditBrowserJson(`${path}.json?${query}`);
 }
 
+// ── Apify transport (primary when APIFY_TOKEN is set) ────────────────────────────────────────────
+// Pay-per-result actor; returns a flat dataset of one post item + comment items in a single
+// synchronous call. Reddit hides vote data from it, so scores are best-effort and often 0 —
+// zero scores are mapped to '' so the template hides them instead of rendering "0".
+const APIFY_ACTOR = process.env.APIFY_ACTOR ?? 'automation-lab~reddit-scraper';
+
+interface ApifyItem {
+  type: 'post' | 'comment';
+  title?: string; author?: string; subreddit?: string; selfText?: string;
+  body?: string; score?: number; numComments?: number; createdAt?: string;
+  depth?: number; isSubmitter?: boolean;
+}
+
+const isoToEpoch = (iso?: string): number => {
+  const t = iso ? Date.parse(iso) : NaN;
+  return Number.isNaN(t) ? Date.now() / 1000 : t / 1000;
+};
+
+async function apifyImport(threadUrl: string) {
+  const res = await fetch(
+    `https://api.apify.com/v2/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${process.env.APIFY_TOKEN}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ urls: [threadUrl], includeComments: true, maxCommentsPerPost: 60, commentDepth: 4 }),
+      signal: AbortSignal.timeout(180_000),
+    },
+  );
+  if (!res.ok) throw new Error(`apify ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const items = await res.json() as ApifyItem[];
+  const p = items.find(i => i.type === 'post');
+  if (!p?.title) throw new Error('apify returned no post');
+
+  const body = p.selfText && !/^submitted by \/u\//.test(p.selfText) ? plainText(p.selfText) : undefined;
+  const comments: OutComment[] = items
+    .filter(i => i.type === 'comment')
+    .map(c => ({ ...c, cleanBody: plainText(c.body ?? '') }))
+    .filter(c => c.author && c.author !== '[deleted]' && c.author !== 'AutoModerator'
+      && c.cleanBody && c.cleanBody !== '[removed]' && c.cleanBody !== '[deleted]')
+    .slice(0, MAX_COMMENTS)
+    .map(c => ({
+      user: { name: c.author! },
+      body: c.cleanBody,
+      timeAgo: timeAgo(isoToEpoch(c.createdAt)),
+      score: c.score && c.score > 0 ? fmtScore(c.score) : '',
+      depth: Math.max(0, c.depth ?? 0),
+      isOP: !!c.isSubmitter,
+    }));
+
+  return {
+    post: {
+      user: { name: `u/${p.author ?? 'unknown'}` },
+      subreddit: p.subreddit ? `r/${p.subreddit}` : undefined,
+      timeAgo: timeAgo(isoToEpoch(p.createdAt)),
+      title: plainText(p.title),
+      body,
+      score: p.score && p.score > 0 ? fmtScore(p.score) : '',
+      commentCount: p.numComments && p.numComments > 0 ? fmtScore(p.numComments) : '',
+    },
+    comments,
+  };
+}
+
 // ── URL → thread id ──────────────────────────────────────────────────────────────────────────────
 async function resolveThreadId(raw: string): Promise<string | null> {
   let url: URL;
@@ -166,6 +229,15 @@ export async function POST(request: NextRequest) {
     const threadId = await resolveThreadId(parsed.data.url.trim());
     if (!threadId) {
       return NextResponse.json({ error: 'That doesn’t look like a Reddit thread link.' }, { status: 400 });
+    }
+
+    // Apify is the primary transport when configured; on failure fall through to oauth/browser.
+    if (process.env.APIFY_TOKEN) {
+      try {
+        return NextResponse.json(await apifyImport(`https://www.reddit.com/comments/${threadId}/`));
+      } catch (e) {
+        console.error('[reddit] apify transport failed, falling back:', e);
+      }
     }
 
     const listing = await redditGet(`/comments/${threadId}`, 'limit=60&depth=4&raw_json=1&sort=top') as
