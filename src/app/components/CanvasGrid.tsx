@@ -17,7 +17,7 @@ import { defaultTwitterTemplateSettings } from './twitterTemplateTypes';
 import type { VideoEntry, BrandProps } from '../types';
 import type { RecordingState } from './TikTokCanvas/types';
 import { VideoControlsBar } from './VideoControlsBar';
-import { bestVideoUrl } from '@/lib/utils';
+import { bestVideoUrl, proxyStreamUrl } from '@/lib/utils';
 import { getVideoBlob } from '@/lib/reelVideoBlob';
 import { Button, IconButton, Modal, HEADER_H } from './ui';
 import { AutosaveChip } from './AutosaveChip';
@@ -1280,6 +1280,10 @@ export function CanvasGrid({
                   onUpdateLocalVideo(selectedEntry.id, '', '');
                   autoFetched.current.delete(selectedEntry.id);
                   recordEdit(selectedEntry.id, 'url', seg.url);
+                  // Pre-warm the blob cache so the timeline's filmstrip (which needs the whole file)
+                  // opens instantly by the time the user gets there. Same key the canvas/timeline use:
+                  // bestVideoUrl(footageVideoData(url)) resolves to proxyStreamUrl(url).
+                  void getVideoBlob(proxyStreamUrl(seg.url));
                 }}
               />
             ) },
