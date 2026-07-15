@@ -142,53 +142,29 @@ function drawNameRow(
   ctx.textBaseline = 'alphabetic';
 }
 
-// Reddit's outline vote arrow: triangular head + open stem, rounded joins.
-function voteArrow(ctx: CanvasRenderingContext2D, cx: number, cy: number, size: number, up: boolean) {
-  const s = size, dir = up ? 1 : -1;
-  ctx.save();
-  ctx.lineWidth = 3;
-  ctx.lineJoin = 'round';
-  ctx.lineCap = 'round';
-  ctx.beginPath();
-  ctx.moveTo(cx - s * 0.42, cy + s * 0.5 * dir);
-  ctx.lineTo(cx - s * 0.42, cy - s * 0.05 * dir);
-  ctx.lineTo(cx - s * 0.7, cy - s * 0.05 * dir);
-  ctx.lineTo(cx, cy - s * 0.72 * dir);
-  ctx.lineTo(cx + s * 0.7, cy - s * 0.05 * dir);
-  ctx.lineTo(cx + s * 0.42, cy - s * 0.05 * dir);
-  ctx.lineTo(cx + s * 0.42, cy + s * 0.5 * dir);
-  ctx.closePath();
-  ctx.stroke();
-  ctx.restore();
-}
+// Reddit's actual RPL icon paths, extracted from reddit.com's rendered DOM (svg[icon-name] inside
+// shreddit shadow roots, viewBox 0 0 20 20, fill="currentColor"). Canvas Path2D renders SVG path
+// data verbatim, so these are pixel-identical to the real thing.
+const RPL_ICONS = {
+  upvote:
+    'M10 19a3.966 3.966 0 01-3.96-3.962V10.98H2.838a1.731 1.731 0 01-1.605-1.073 1.734 1.734 0 01.377-1.895L9.364.254a.925.925 0 011.272 0l7.754 7.759c.498.499.646 1.242.376 1.894-.27.652-.9 1.073-1.605 1.073h-3.202v4.058A3.965 3.965 0 019.999 19H10zM2.989 9.179H7.84v5.731c0 1.13.81 2.163 1.934 2.278a2.163 2.163 0 002.386-2.15V9.179h4.851L10 2.163 2.989 9.179z',
+  downvote:
+    'M10 1a3.966 3.966 0 013.96 3.962V9.02h3.202c.706 0 1.335.42 1.605 1.073.27.652.122 1.396-.377 1.895l-7.754 7.759a.925.925 0 01-1.272 0l-7.754-7.76a1.734 1.734 0 01-.376-1.894c.27-.652.9-1.073 1.605-1.073h3.202V4.962A3.965 3.965 0 0110 1zm7.01 9.82h-4.85V5.09c0-1.13-.81-2.163-1.934-2.278a2.163 2.163 0 00-2.386 2.15v5.859H2.989l7.01 7.016 7.012-7.016z',
+  comment:
+    'M10 1a9 9 0 00-9 9c0 1.947.79 3.58 1.935 4.957L.231 17.661A.784.784 0 00.785 19H10a9 9 0 009-9 9 9 0 00-9-9zm0 16.2H6.162c-.994.004-1.907.053-3.045.144l-.076-.188a36.981 36.981 0 002.328-2.087l-1.05-1.263C3.297 12.576 2.8 11.331 2.8 10c0-3.97 3.23-7.2 7.2-7.2s7.2 3.23 7.2 7.2-3.23 7.2-7.2 7.2z',
+  share:
+    'M12.8 17.524l6.89-6.887a.9.9 0 000-1.273L12.8 2.477a1.64 1.64 0 00-1.782-.349 1.64 1.64 0 00-1.014 1.518v2.593C4.054 6.728 1.192 12.075 1 17.376a1.353 1.353 0 00.862 1.32 1.35 1.35 0 001.531-.364l.334-.381c1.705-1.944 3.323-3.791 6.277-4.103v2.509c0 .667.398 1.262 1.014 1.518a1.638 1.638 0 001.783-.349v-.002zm-.994-1.548V12h-.9c-3.969 0-6.162 2.1-8.001 4.161.514-4.011 2.823-8.16 8-8.16h.9V4.024L17.784 10l-5.977 5.976z',
+} as const;
 
-function bubbleIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number) {
+const iconCache = new Map<string, Path2D>();
+function drawIcon(ctx: CanvasRenderingContext2D, name: keyof typeof RPL_ICONS, cx: number, cy: number, size: number, color: string) {
+  let p = iconCache.get(name);
+  if (!p) { p = new Path2D(RPL_ICONS[name]); iconCache.set(name, p); }
   ctx.save();
-  ctx.lineWidth = 3;
-  ctx.lineCap = 'round';
-  ctx.beginPath();
-  ctx.arc(cx, cy, r, Math.PI * 0.52, Math.PI * 2.42);
-  ctx.lineTo(cx - r * 0.45, cy + r * 1.12);
-  ctx.closePath();
-  ctx.stroke();
-  ctx.restore();
-}
-
-function shareIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: number) {
-  ctx.save();
-  ctx.lineWidth = 3;
-  ctx.lineJoin = 'round';
-  ctx.lineCap = 'round';
-  ctx.beginPath();                                  // arrow
-  ctx.moveTo(cx - s * 0.1, cy - s * 0.15);
-  ctx.quadraticCurveTo(cx - s * 0.75, cy - s * 0.05, cx - s * 0.75, cy + s * 0.6);
-  ctx.quadraticCurveTo(cx - s * 0.35, cy + s * 0.05, cx + s * 0.3, cy + s * 0.12);
-  ctx.moveTo(cx + s * 0.3, cy + s * 0.12);
-  ctx.lineTo(cx + s * 0.3, cy + s * 0.38);
-  ctx.lineTo(cx + s * 0.85, cy - s * 0.12);
-  ctx.lineTo(cx + s * 0.3, cy - s * 0.62);
-  ctx.lineTo(cx + s * 0.3, cy - s * 0.15);
-  ctx.stroke();
+  ctx.translate(cx - size / 2, cy - size / 2);
+  ctx.scale(size / 20, size / 20);
+  ctx.fillStyle = color;
+  ctx.fill(p);
   ctx.restore();
 }
 
@@ -216,37 +192,33 @@ function drawPostPills(ctx: CanvasRenderingContext2D, x: number, top: number, sc
   ctx.font = font(600, 30);
   if (score) {
     const tw = ctx.measureText(score).width;
-    const w = 44 + tw + 16 + 44;
+    const w = 48 + tw + 18 + 48;
     pill(w);
-    ctx.strokeStyle = C.text;
-    voteArrow(ctx, cx + 30, top + h / 2, 15, true);
+    drawIcon(ctx, 'upvote', cx + 32, top + h / 2, 30, C.text);
     ctx.fillStyle = C.text;
     ctx.font = font(600, 30);
-    ctx.fillText(score, cx + 52, top + h / 2 + 1);
-    ctx.strokeStyle = C.text;
-    voteArrow(ctx, cx + 52 + tw + 26, top + h / 2, 15, false);
+    ctx.fillText(score, cx + 56, top + h / 2 + 1);
+    drawIcon(ctx, 'downvote', cx + 56 + tw + 30, top + h / 2, 30, C.text);
     cx += w + 20;
   }
   if (comments) {
     ctx.font = font(600, 30);
     const tw = ctx.measureText(comments).width;
-    const w = 58 + tw + 26;
+    const w = 62 + tw + 26;
     pill(w);
-    ctx.strokeStyle = C.text;
-    bubbleIcon(ctx, cx + 32, top + h / 2, 13);
+    drawIcon(ctx, 'comment', cx + 34, top + h / 2, 30, C.text);
     ctx.fillStyle = C.text;
-    ctx.fillText(comments, cx + 56, top + h / 2 + 1);
+    ctx.fillText(comments, cx + 58, top + h / 2 + 1);
     cx += w + 20;
   }
   {
     ctx.font = font(600, 30);
     const tw = ctx.measureText('Share').width;
-    const w = 62 + tw + 26;
+    const w = 66 + tw + 26;
     pill(w);
-    ctx.strokeStyle = C.text;
-    shareIcon(ctx, cx + 34, top + h / 2, 16);
+    drawIcon(ctx, 'share', cx + 36, top + h / 2, 30, C.text);
     ctx.fillStyle = C.text;
-    ctx.fillText('Share', cx + 60, top + h / 2 + 1);
+    ctx.fillText('Share', cx + 62, top + h / 2 + 1);
   }
   ctx.textBaseline = 'alphabetic';
 }
@@ -254,22 +226,24 @@ function drawPostPills(ctx: CanvasRenderingContext2D, x: number, top: number, sc
 /** Comment action row: ⊖ (on the rail, when threaded) ↑ score ↓  Reply  Share  ···  */
 function drawCommentActions(ctx: CanvasRenderingContext2D, x: number, cy: number, score?: string) {
   ctx.textBaseline = 'middle';
-  ctx.strokeStyle = C.action;
   ctx.fillStyle = C.action;
   let cx = x;
-  voteArrow(ctx, cx + 12, cy, 13, true);
-  cx += 34;
+  drawIcon(ctx, 'upvote', cx + 12, cy, 26, C.action);
+  cx += 36;
   ctx.font = font(600, CMT.actionText);
-  if (score) { ctx.fillText(score, cx, cy + 1); cx += ctx.measureText(score).width + 14; }
-  voteArrow(ctx, cx + 12, cy, 13, false);
-  cx += 46;
-  bubbleIcon(ctx, cx + 10, cy, 11);
+  ctx.fillStyle = C.action;
+  if (score) { ctx.fillText(score, cx, cy + 1); cx += ctx.measureText(score).width + 16; }
+  drawIcon(ctx, 'downvote', cx + 12, cy, 26, C.action);
+  cx += 48;
+  drawIcon(ctx, 'comment', cx + 12, cy, 25, C.action);
   ctx.font = font(600, CMT.actionText);
-  ctx.fillText('Reply', cx + 30, cy + 1);
-  cx += 30 + ctx.measureText('Reply').width + 34;
-  shareIcon(ctx, cx + 12, cy, 13);
-  ctx.fillText('Share', cx + 32, cy + 1);
-  cx += 32 + ctx.measureText('Share').width + 34;
+  ctx.fillStyle = C.action;
+  ctx.fillText('Reply', cx + 32, cy + 1);
+  cx += 32 + ctx.measureText('Reply').width + 34;
+  drawIcon(ctx, 'share', cx + 12, cy, 25, C.action);
+  ctx.fillStyle = C.action;
+  ctx.fillText('Share', cx + 33, cy + 1);
+  cx += 33 + ctx.measureText('Share').width + 34;
   dotsIcon(ctx, cx + 12, cy);
   ctx.textBaseline = 'alphabetic';
 }
