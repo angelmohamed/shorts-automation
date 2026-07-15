@@ -234,7 +234,23 @@ export async function POST(request: NextRequest) {
     // Apify is the primary transport when configured; on failure fall through to oauth/browser.
     if (process.env.APIFY_TOKEN) {
       try {
-        return NextResponse.json(await apifyImport(`https://www.reddit.com/comments/${threadId}/`));
+        const data = await apifyImport(`https://www.reddit.com/comments/${threadId}/`);
+        // The actor doesn't scrape user profiles, so avatars come from a best-effort enrichment
+        // pass over the oauth/browser transport. Any failure (no Chrome, wall, timeout) just
+        // leaves the renderer's colored initial discs in place.
+        try {
+          const names = [...new Set([
+            data.post.user.name.replace(/^u\//, ''),
+            ...data.comments.map(c => c.user.name),
+          ])].slice(0, MAX_AVATARS);
+          const avatars = new Map(await Promise.all(names.map(async n => [n, await fetchAvatar(n)] as const)));
+          const postAuthor = data.post.user.name.replace(/^u\//, '');
+          (data.post.user as { avatar?: string }).avatar = avatars.get(postAuthor);
+          for (const c of data.comments) c.user.avatar = avatars.get(c.user.name) ?? undefined;
+        } catch (e) {
+          console.warn('[reddit] avatar enrichment unavailable:', e instanceof Error ? e.message : e);
+        }
+        return NextResponse.json(data);
       } catch (e) {
         console.error('[reddit] apify transport failed, falling back:', e);
       }
