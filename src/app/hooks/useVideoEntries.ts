@@ -5,6 +5,7 @@ import type { TikTokCanvasRef } from '../components/TikTokCanvas';
 import type { VideoEntry, VideoData, VideoMode } from '../types';
 import { makeEmptyEntry, MAX_REELS } from '@/lib/entry';
 import { getCachedVideo, setCachedVideo, enqueueVideoFetch } from '@/lib/reelVideoCache';
+import { isFootageUrl, footageVideoData } from '@/lib/footage';
 import { proxyStreamUrl } from '@/lib/utils';
 import { deleteLocalVideo, pruneLocalVideos, clearOverlayImages } from '@/lib/localVideoStore';
 
@@ -125,6 +126,17 @@ export function useVideoEntries() {
     if (cached) {
       setEntries(prev => prev.map(e =>
         e.id === id ? { ...e, loading: false, error: '', data: cached, videoFailed: false } : e
+      ));
+      return;
+    }
+
+    // Footage-library URLs point at our own R2 bucket — no resolver, no rate-limit queue, no codec
+    // sniff (the library is H.264 by construction). Synthesize the VideoData directly.
+    if (isFootageUrl(url)) {
+      const data = footageVideoData(url);
+      setCachedVideo(url, data);
+      setEntries(prev => prev.map(e =>
+        e.id === id ? { ...e, loading: false, error: '', data, videoFailed: false } : e
       ));
       return;
     }

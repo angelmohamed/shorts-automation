@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { isSafePublicUrl } from '@/lib/http';
+import { FOOTAGE_PUBLIC_BASE } from '@/lib/footage';
 
 const ALLOWED_HOSTS = [
+  new URL(FOOTAGE_PUBLIC_BASE).hostname,   // R2 footage library (shared background segments)
   'tikwm.com',
   'tiktokcdn.com',
   'tiktokv.com',

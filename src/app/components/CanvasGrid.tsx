@@ -30,8 +30,9 @@ import { useObservedSize, fitScaleFor } from '@/app/hooks/useElementSize';
 import { useEditorZoomPan, EDITOR_ZOOM_MIN as ZOOM_MIN, EDITOR_ZOOM_MAX as ZOOM_MAX } from '@/app/hooks/useEditorZoomPan';
 import {
   UploadIcon, ArrowRightIcon, SpinnerIcon,
-  CloseIcon, DownloadIcon, VideoIcon, LinkIcon, ChevronDownIcon, TrashIcon,
+  CloseIcon, DownloadIcon, VideoIcon, LinkIcon, ChevronDownIcon, ChevronUpIcon, TrashIcon,
 } from '@/lib/icons';
+import { fetchFootageManifest, isFootageUrl, type FootageSegment } from '@/lib/footage';
 
 const CARD_W = CAROUSEL_PREVIEW_W; // 410 — same width as canvas preview
 
@@ -79,12 +80,59 @@ const removeVideoGlyph = (<svg {...SVG_PROPS}><rect x="3" y="6" width="13" heigh
 const addImageGlyph = (<svg {...SVG_PROPS}><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></svg>);
 const micGlyph = (<svg {...SVG_PROPS}><rect x="9" y="2" width="6" height="12" rx="3" /><path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8" /></svg>);
 
-// The selected reel's video source — paste a URL / upload a file / fetch. Ported from the old inline card.
-function ReelLinkFlyout({ entry, onUpdateField, onUpdateLocalVideo, onFetch }: {
+// Browse the shared background-footage library (R2 bucket) and pick a segment for the reel.
+function FootagePicker({ activeUrl, onPick }: { activeUrl: string; onPick: (seg: FootageSegment) => void }) {
+  const [open, setOpen] = useState(false);
+  const [segments, setSegments] = useState<FootageSegment[] | null>(null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    if (!open || segments) return;
+    fetchFootageManifest().then(setSegments).catch(() => setError('Couldn’t load the footage library.'));
+  }, [open, segments]);
+  return (
+    <div className="flex flex-col gap-1">
+      <button
+        type="button"
+        onClick={() => { setError(''); setOpen(o => !o); }}
+        className="flex items-center gap-2 h-7 text-body text-fg-2 hover:text-fg transition-colors focus-ring rounded-sm"
+      >
+        <VideoIcon size={13} className="shrink-0" />
+        <span className="flex-1 text-left">Background footage</span>
+        {open ? <ChevronUpIcon size={13} /> : <ChevronDownIcon size={13} />}
+      </button>
+      {open && (
+        error ? <span className="text-caption text-danger-text">{error}</span>
+        : !segments ? <span className="text-caption text-fg-3">Loading footage…</span>
+        : segments.length === 0 ? <span className="text-caption text-fg-3">No footage uploaded yet.</span>
+        : (
+          <div className="max-h-56 overflow-y-auto flex flex-col gap-0.5 pr-1">
+            {segments.map(s => (
+              <button
+                key={s.name}
+                type="button"
+                onClick={() => onPick(s)}
+                className={`flex items-center gap-2 px-1.5 h-7 rounded-sm text-caption text-left transition-colors focus-ring ${
+                  activeUrl === s.url ? 'bg-active text-fg' : 'text-fg-2 hover:text-fg hover:bg-hover'
+                }`}
+              >
+                <span className="flex-1 truncate">{s.name.replace(/\.mp4$/, '')}</span>
+                <span className="text-fg-3 shrink-0">{Math.round(s.size / 1e6)} MB</span>
+              </button>
+            ))}
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+// The selected reel's video source — paste a URL / upload a file / pick library footage / fetch.
+function ReelLinkFlyout({ entry, onUpdateField, onUpdateLocalVideo, onFetch, onPickFootage }: {
   entry: VideoEntry;
   onUpdateField: (field: 'url' | 'caption', value: string) => void;
   onUpdateLocalVideo: (src: string, name: string) => void;
   onFetch: () => void;
+  onPickFootage: (seg: FootageSegment) => void;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const hasLocal = !!entry.localVideoSrc;
@@ -133,6 +181,7 @@ function ReelLinkFlyout({ entry, onUpdateField, onUpdateLocalVideo, onFetch }: {
           </div>
         </>
       )}
+      <FootagePicker activeUrl={isFootageUrl(entry.url) ? entry.url : ''} onPick={onPickFootage} />
       <input ref={fileRef} type="file" accept="video/*" className="hidden" onChange={handleFile} />
       {entry.error && !hasLocal && <span className="text-caption text-danger-text">{entry.error}</span>}
     </div>
@@ -1200,6 +1249,14 @@ export function CanvasGrid({
                 onUpdateField={(f, v) => recordEdit(selectedEntry.id, f, v)}
                 onUpdateLocalVideo={(s, n) => onUpdateLocalVideo(selectedEntry.id, s, n)}
                 onFetch={() => onFetchVideo(selectedEntry.id)}
+                onPickFootage={seg => {
+                  // Replace whatever the reel currently holds (upload or link) with the picked segment:
+                  // clear the local video + data, drop the auto-fetch guard so re-picking a previously
+                  // used segment still fetches, then set the URL — the auto-fetch effect does the rest.
+                  onUpdateLocalVideo(selectedEntry.id, '', '');
+                  autoFetched.current.delete(selectedEntry.id);
+                  recordEdit(selectedEntry.id, 'url', seg.url);
+                }}
               />
             ) },
             { id: 'narrate', label: 'Narration', icon: micGlyph, content: (
