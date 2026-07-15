@@ -287,6 +287,21 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
     void deleteOverlayImage(id);
   }, [commitOverlays]);
 
+  // Backspace/Delete removes the selected overlay — matching every canvas editor. Guarded so
+  // typing in an input/textarea (flyout URL fields, captions) never deletes anything.
+  useEffect(() => {
+    if (!selectedOverlayId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Backspace' && e.key !== 'Delete') return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      e.preventDefault();
+      removeOverlayFn(selectedOverlayId);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selectedOverlayId, removeOverlayFn]);
+
   // Crop editing was removed (the video always fills the canvas), so nothing drags any more.
   const isDraggingRef = useRef(false);
 
