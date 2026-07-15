@@ -11,7 +11,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SEGMENTS_DIR="$REPO_ROOT/footage/segments"
+# Override with FOOTAGE_DIR=… — e.g. the 1080p re-encodes in footage/segments-1080 (the bucket serves
+# those; footage/segments holds the untouched 1440p masters).
+SEGMENTS_DIR="${FOOTAGE_DIR:-$REPO_ROOT/footage/segments-1080}"
 set -a; source "$REPO_ROOT/.env.r2"; set +a   # -a exports everything for child processes (rclone, python)
 
 # rclone remote defined entirely via env — no secrets in rclone.conf
