@@ -12,6 +12,7 @@ import {
 import { drawHeaderOnContext, computeSonotradeHeaderHeight } from '../drawing/drawHeader';
 import { drawReelCells, drawFreeElements, reelLayout, reelVideoRect, ensureReelTextFontsLoaded, shiftFreeElementsForReelCrop } from '../drawing/drawReelCell';
 import { drawMarketRow } from '../drawing/drawMarketRow';
+import { trackById, trackStreamSrc, MUSIC_VOLUME } from '@/lib/music';
 import { drawImageOverlays } from '../drawing/drawOverlays';
 import { getOverlayImage } from '@/lib/localVideoStore';
 import { countCaptionLines } from '../drawing/countCaptionLines';
@@ -52,6 +53,8 @@ export interface UseRecordingConfig {
   marketAvatarImgRef?: MutableRefObject<HTMLImageElement | null>;
   marketAvatarUrlRef?: MutableRefObject<string | null>;
   twitterSettings: TwitterTemplateSettings;
+  /** Background-music track id (lib/music.ts) — mixed under the export audio at MUSIC_VOLUME. */
+  musicIdRef?: MutableRefObject<string | null>;
 }
 
 export function useRecording(config: UseRecordingConfig) {
@@ -79,6 +82,7 @@ export function useRecording(config: UseRecordingConfig) {
       overlayCaption, overlayLogoSrc, overlayDisplayName, overlayHandle, overlayVerified,
       marketData, marketAvatarImgRef, marketAvatarUrlRef,
       twitterSettings,
+      musicIdRef,
     } = config;
 
     const canvas = canvasRef.current;
@@ -353,7 +357,8 @@ export function useRecording(config: UseRecordingConfig) {
       // export timeline in an OfflineAudioContext, re-encode AAC. The fast AAC packet-copy path
       // below can't do that, so a narrated reel whose mix fails exports silent (source audio would
       // be desynced anyway once the video is sped up).
-      if (narrated.length > 0 && typeof AudioEncoder !== 'undefined' && typeof OfflineAudioContext !== 'undefined') {
+      const musicTrack = trackById(musicIdRef?.current);
+      if ((narrated.length > 0 || musicTrack) && typeof AudioEncoder !== 'undefined' && typeof OfflineAudioContext !== 'undefined') {
         setRecStatus('Mixing narration...');
         try {
           const MIX_SR = 44100, MIX_CH = 2, AFRAME = 1024;
@@ -366,9 +371,24 @@ export function useRecording(config: UseRecordingConfig) {
               narrBufs.push({ start: (o.audioStart ?? o.start), buf: await tempCtx.decodeAudioData(await rec.blob.arrayBuffer()) });
             } catch { /* skip an undecodable narration */ }
           }
+          // Background music: decoded once, looped across the whole output at a low gain.
+          let musicBuf: AudioBuffer | null = null;
+          if (musicTrack) {
+            try {
+              const res = await fetch(trackStreamSrc(musicTrack));
+              if (res.ok) musicBuf = await tempCtx.decodeAudioData(await res.arrayBuffer());
+            } catch { /* music is optional — export continues without it */ }
+          }
+          // With music but NO narration the source audio must join this mix (the packet-copy path
+          // below can't blend); narration always mutes the source, so it never joins when narrated.
+          let sourceBuf: AudioBuffer | null = null;
+          if (narrated.length === 0 && musicBuf && audioSamples.length > 0) {
+            try { sourceBuf = await tempCtx.decodeAudioData(arrayBuffer.slice(0)); }
+            catch { /* keep music-only rather than dropping the mix */ }
+          }
           await tempCtx.close();
 
-          if (narrBufs.length > 0) {
+          if (narrBufs.length > 0 || musicBuf) {
             const offA = new OfflineAudioContext(MIX_CH, Math.ceil(outputDuration * MIX_SR), MIX_SR);
             for (const n of narrBufs) {
               const src = offA.createBufferSource();
@@ -379,6 +399,22 @@ export function useRecording(config: UseRecordingConfig) {
               const when = (n.start - clipStart) / videoRate;
               if (when >= 0) src.start(when);
               else src.start(0, -when);           // clip starts mid-narration → skip its head
+            }
+            if (musicBuf) {
+              const gain = offA.createGain();
+              gain.gain.value = MUSIC_VOLUME;
+              gain.connect(offA.destination);
+              const src = offA.createBufferSource();
+              src.buffer = musicBuf;
+              src.loop = true;                     // covers any output length
+              src.connect(gain);
+              src.start(0);
+            }
+            if (sourceBuf) {
+              const src = offA.createBufferSource();
+              src.buffer = sourceBuf;
+              src.connect(offA.destination);
+              src.start(0, clipStart);             // videoRate is 1 without narration
             }
             const mixed = await offA.startRendering();
 

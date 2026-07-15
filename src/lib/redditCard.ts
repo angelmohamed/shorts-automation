@@ -359,10 +359,11 @@ export async function renderRedditCard(data: RedditCardData): Promise<RedditCard
     ctx.stroke();
   }
 
-  // post header
+  // post header (timestamps deliberately not drawn — cards read cleaner without "6d ago",
+  // and reels shouldn't look stale; pass data.timeAgo here to bring them back)
   const postAvatar = await loadAvatar(data.user.avatar);
   drawAvatar(ctx, data.user, postAvatar, PAD, PAD, POST.avatar);
-  drawNameRow(ctx, data.user, data.timeAgo, PAD + POST.avatar + 22, PAD + POST.avatar / 2, POST.name, POST.time);
+  drawNameRow(ctx, data.user, undefined, PAD + POST.avatar + 22, PAD + POST.avatar / 2, POST.name, POST.time);
   if (data.showJoin !== false) {
     const jw = 118, jh = 58;
     ctx.fillStyle = C.join;
@@ -397,7 +398,7 @@ export async function renderRedditCard(data: RedditCardData): Promise<RedditCard
   for (const l of layouts) {
     const img = await loadAvatar(l.c.user.avatar);
     drawAvatar(ctx, l.c.user, img, l.x, l.top, CMT.avatar);
-    drawNameRow(ctx, l.c.user, l.c.timeAgo, l.x + CMT.avatar + 18, l.avatarCy, CMT.name, CMT.time, l.c.isOP);
+    drawNameRow(ctx, l.c.user, undefined, l.x + CMT.avatar + 18, l.avatarCy, CMT.name, CMT.time, l.c.isOP);
     drawCommentActions(ctx, l.x + CMT.avatar + 18, l.actionY, l.c.score);
     if (l.hasChild) {
       // ⊖ on the comment's own column at action-row height, with the rail continuing beneath

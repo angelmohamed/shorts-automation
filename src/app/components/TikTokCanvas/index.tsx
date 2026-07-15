@@ -16,6 +16,7 @@ import { resolveTwitterTemplateSettings } from '../twitterTemplateTypes';
 import { VideoOverlays } from './ui/VideoOverlays';
 import { useVideoLoading } from './hooks/useVideoLoading';
 import { useRecording } from './hooks/useRecording';
+import { trackById, trackStreamSrc, MUSIC_VOLUME } from '@/lib/music';
 
 export type { TikTokCanvasRef, MarketData, SparkPoint } from './types';
 
@@ -38,6 +39,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
   onOverlaysChange,
   ocrBrush = null,
   ocrVoiceColors,
+  musicId = null,
 }: TikTokCanvasProps, ref) {
   // Resolved overlay style (defaults reproduce the original look). twKey lets the draw loop restart
   // only when the style actually changes, not on every render.
@@ -206,6 +208,33 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
     overlayAudioElsRef.current.clear();
   }, []);
 
+  // Background music: a quiet loop under playback (position-agnostic ambience — no seek sync).
+  // The export mixes the same track at the same gain, so preview matches the MP4.
+  const musicIdRef = useRef<string | null>(musicId);
+  musicIdRef.current = musicId;
+  useEffect(() => {
+    const track = trackById(musicId);
+    const v = videoRef.current;
+    if (!track || !v) return;
+    const el = new Audio(trackStreamSrc(track));
+    el.loop = true;
+    el.volume = MUSIC_VOLUME;
+    el.preload = 'auto';
+    const sync = () => {
+      if (v.paused) { if (!el.paused) el.pause(); }
+      else if (el.paused) void el.play().catch(() => { /* autoplay policy — user will interact */ });
+    };
+    v.addEventListener('play', sync);
+    v.addEventListener('pause', sync);
+    sync();
+    return () => {
+      v.removeEventListener('play', sync);
+      v.removeEventListener('pause', sync);
+      el.pause();
+      el.removeAttribute('src');
+    };
+  }, [musicId, videoSrc, videoRef]);
+
   // Lazily decode an overlay's image for the draw loops.
   const getOverlayImg = useCallback((o: ImageOverlay): HTMLImageElement | null => {
     if (!o.src) return null;
@@ -314,6 +343,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
     marketData, marketAvatarImgRef, marketAvatarUrlRef,
     twitterSettings: tw,
     overlaysRef, overlayImgsRef,
+    musicIdRef,
   });
 
   // Re-apply a saved framing (crop/pan/zoom/trim). Setters from useState/useVideoLoading are stable.
@@ -465,6 +495,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
         overlays: overlaysRef.current.length
           ? overlaysRef.current.map(({ src: _src, audioSrc: _audioSrc, ...rest }) => rest)
           : undefined,
+        musicId: musicIdRef.current ?? undefined,
       }),
     applyFraming: applyFramingFn,
   }), [isRecording, startRecording, cancelRecording, videoDuration, trimStart, trimEnd, includeEdit, videoScale, zoomIn, zoomOut, resetZoom, applyFramingFn, swapToLocalBlob, commitOverlays, removeOverlayFn]);

@@ -35,6 +35,7 @@ import {
 import { fetchFootageManifest, isFootageUrl, type FootageSegment } from '@/lib/footage';
 import { renderRedditCard, type RedditCardData, type RedditComment } from '@/lib/redditCard';
 import type { MemeLine } from '@/lib/memeOcr';
+import { BACKGROUND_TRACKS } from '@/lib/music';
 
 const CARD_W = CAROUSEL_PREVIEW_W; // 410 — same width as canvas preview
 
@@ -83,6 +84,7 @@ const addImageGlyph = (<svg {...SVG_PROPS}><rect x="3" y="3" width="18" height="
 const micGlyph = (<svg {...SVG_PROPS}><rect x="9" y="2" width="6" height="12" rx="3" /><path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8" /></svg>);
 const shuffleGlyph = (<svg {...SVG_PROPS} width={13} height={13}><path d="M16 3h5v5" /><path d="M4 20 21 3" /><path d="M21 16v5h-5" /><path d="m15 15 6 6" /><path d="M4 4l5 5" /></svg>);
 const redditGlyph = (<svg {...SVG_PROPS}><circle cx="12" cy="14" r="7" /><circle cx="9.5" cy="14" r="0.7" fill="currentColor" stroke="none" /><circle cx="14.5" cy="14" r="0.7" fill="currentColor" stroke="none" /><path d="M12 7c0-2.5 1.5-4 3.5-4" /><circle cx="16.5" cy="3" r="1.2" /></svg>);
+const musicGlyph = (<svg {...SVG_PROPS}><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>);
 
 // Browse the shared background-footage library (R2 bucket) and pick a segment for the reel.
 function FootagePicker({ activeUrl, onPick }: { activeUrl: string; onPick: (seg: FootageSegment) => void }) {
@@ -1618,6 +1620,30 @@ export function CanvasGrid({
                 onAdd={(blob, lines, dims, blockAuthors) => addRedditCard(selectedEntry.id, blob, lines, dims, blockAuthors)}
               />
             ) },
+            { id: 'music', label: 'Background music', icon: musicGlyph, content: (
+              <div className="flex flex-col gap-0.5">
+                {[null, ...BACKGROUND_TRACKS].map(t => {
+                  const active = (framingMap[selectedEntry.id]?.musicId ?? null) === (t?.id ?? null);
+                  return (
+                    <button
+                      key={t?.id ?? 'none'}
+                      type="button"
+                      onClick={() => {
+                        setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], musicId: t?.id } }));
+                        markFramingDirty();
+                      }}
+                      className={`flex items-center gap-2 px-1.5 h-8 rounded-sm text-body text-left transition-colors focus-ring ${
+                        active ? 'bg-active text-fg' : 'text-fg-2 hover:text-fg hover:bg-hover'
+                      }`}
+                    >
+                      <span className="flex-1 truncate">{t?.name ?? 'No music'}</span>
+                      {active && <CheckIcon size={11} className="shrink-0" />}
+                    </button>
+                  );
+                })}
+                <span className="text-caption text-fg-3 pt-1">Loops quietly under the narration — in preview and in the export.</span>
+              </div>
+            ) },
             { id: 'narrate', label: 'Narration', icon: micGlyph, content: (
               <NarrateFlyout
                 overlays={overlaysMap[selectedEntry.id] ?? []}
@@ -1910,6 +1936,7 @@ export function CanvasGrid({
                           overlayCaption={entry.caption}
                           twitterSettings={rowSettings}
                           initialFraming={framingMap[entry.id] ?? null}
+                          musicId={framingMap[entry.id]?.musicId ?? null}
                           onFramingChange={markFramingDirty}
                           onOverlaysChange={list => setOverlaysMap(prev => ({ ...prev, [entry.id]: list }))}
                           ocrBrush={voiceBrush}

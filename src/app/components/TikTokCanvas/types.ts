@@ -69,6 +69,8 @@ export interface Framing {
   segments?: ClipSegment[];
   /** Image layers on top of the video (runtime object URLs stripped — blobs re-hydrate from IndexedDB). */
   overlays?: Omit<ImageOverlay, 'src' | 'audioSrc'>[];
+  /** Background-music track id (lib/music.ts); absent = no music. */
+  musicId?: string;
 }
 
 export interface TikTokCanvasProps {
@@ -97,6 +99,8 @@ export interface TikTokCanvasProps {
   /** Armed narration-voice brush: while set, clicking an OCR line highlight paints that line with
       this voice instead of toggling it in/out of the narration. */
   ocrBrush?: { voiceId: string; color: string } | null;
+  /** Background-music track id (lib/music.ts): loops quietly under playback and mixes into the export. */
+  musicId?: string | null;
   /** voiceId → display color for OCR line highlights (lines with no voice use the accent style). */
   ocrVoiceColors?: Record<string, string>;
 }
