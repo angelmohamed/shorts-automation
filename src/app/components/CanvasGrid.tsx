@@ -430,13 +430,13 @@ const LS_11L_VOICES = 'reels:11labs-voices';
 // Fixed voice cast for Reddit thread cards (ElevenLabs voice IDs). The post always reads as Mark;
 // each distinct commenter draws a random voice from the pool (stable per author on a card, no
 // repeats until the pool is exhausted; an OP reply reuses Mark). Edit here to recast.
-const REDDIT_POST_VOICE = 'UgBBYS2sOqTuMpoF3BR0';   // Mark — Natural Conversations (US)
+const REDDIT_POST_VOICE = { id: 'UgBBYS2sOqTuMpoF3BR0', name: 'Mark' };          // Natural Conversations (US)
 const REDDIT_COMMENT_VOICES = [
-  'Bj9UqZbhQsanLzgalpEG',   // Austin — Deep Raspy and Authentic (US Southern)
-  'NNl6r8mD7vthiJatiJt1',   // Bradford — Expressive and Articulate (British)
-  'EkK5I93UQWFDigLMpZcX',   // James — Husky, Engaging and Bold (US)
-  'Z3R5wn05IrDiVCyEkUrK',   // Arabella — Mysterious and Emotive (US)
-  'aMSt68OGf4xUZAnLpTU8',   // Juniper — Grounded and Professional (US)
+  { id: 'Bj9UqZbhQsanLzgalpEG', name: 'Austin' },     // Deep Raspy and Authentic (US Southern)
+  { id: 'NNl6r8mD7vthiJatiJt1', name: 'Bradford' },   // Expressive and Articulate (British)
+  { id: 'EkK5I93UQWFDigLMpZcX', name: 'James' },      // Husky, Engaging and Bold (US)
+  { id: 'Z3R5wn05IrDiVCyEkUrK', name: 'Arabella' },   // Mysterious and Emotive (US)
+  { id: 'aMSt68OGf4xUZAnLpTU8', name: 'Juniper' },    // Grounded and Professional (US)
 ];
 const DEFAULT_VOICE = 'TX3LPaxmHKxFdv7VOQHJ';   // ElevenLabs "Liam" — energetic social-media narrator, premade so free-tier keys can use it
 const VOICE_COLORS = ['#38bdf8', '#f472b6', '#a3e635', '#fbbf24', '#c084fc', '#fb7185'];
@@ -468,12 +468,13 @@ function loadSavedVoices(): string[] {
   }
 }
 
-function NarrateFlyout({ overlays, voices, onVoicesChange, brushIdx, onBrushChange, onGenerate }: {
+function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChange, voiceColors, onGenerate }: {
   overlays: ImageOverlay[];
   voices: string[];
   onVoicesChange: (v: string[]) => void;
-  brushIdx: number | null;
-  onBrushChange: (i: number | null) => void;
+  brushId: string | null;
+  onBrushChange: (id: string | null) => void;
+  voiceColors: Record<string, string>;
   onGenerate: (overlayId: string, apiKey: string, onStatus: (s: string) => void) => Promise<string | null>;
 }) {
   const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem(LS_11L_KEY) ?? ''; } catch { return ''; } });
@@ -518,51 +519,80 @@ function NarrateFlyout({ overlays, voices, onVoicesChange, brushIdx, onBrushChan
         placeholder="ElevenLabs API key (blank = server key)"
         className="h-8 rounded-md border border-line-strong bg-transparent px-2 text-body text-fg placeholder:text-fg-3 outline-none"
       />
-      {/* Voice palette: row 0 is the default narrator; the colored dot arms that voice as a brush for
-          painting lines on the overlay. */}
-      {voices.map((v, i) => (
-        <div key={i} className="flex items-center gap-1.5">
-          <button
-            type="button"
-            aria-label={brushIdx === i ? 'Disarm voice brush' : `Arm voice ${i + 1} brush`}
-            title={brushIdx === i ? 'Brush armed — click lines on the image; click here to disarm' : 'Arm this voice, then click lines on the image to paint them'}
-            onClick={() => onBrushChange(brushIdx === i ? null : i)}
-            className={`grid size-7 shrink-0 place-items-center rounded-md border transition-colors ${brushIdx === i ? 'border-accent bg-accent/15' : 'border-line-strong hover:border-accent-border'}`}
-          >
-            <span className="size-3 rounded-full" style={{ background: VOICE_COLORS[i % VOICE_COLORS.length] }} />
-          </button>
-          <input
-            type="text"
-            value={v}
-            onChange={e => onVoicesChange(voices.map((x, j) => (j === i ? e.target.value : x)))}
-            placeholder={i === 0 ? 'Default voice ID (Liam)' : 'Voice ID'}
-            className="h-7 min-w-0 flex-1 rounded-md border border-line-strong bg-transparent px-2 text-body text-fg placeholder:text-fg-3 outline-none"
-          />
-          {i > 0 && (
+      {target?.name === 'Reddit thread' ? (
+        <>
+          {/* Reddit cards arrive auto-cast — show the fixed cast; dots arm a repaint brush. */}
+          <p className="text-caption text-fg-3">Cast (auto-assigned) — arm a dot to repaint lines:</p>
+          {[{ ...REDDIT_POST_VOICE, role: 'the post' }, ...REDDIT_COMMENT_VOICES.map(v => ({ ...v, role: 'commenter pool' }))].map(v => (
+            <div key={v.id} className="flex items-center gap-1.5">
+              <button
+                type="button"
+                aria-label={brushId === v.id ? `Disarm ${v.name} brush` : `Arm ${v.name} brush`}
+                title={brushId === v.id ? 'Brush armed — click lines on the card; click here to disarm' : `Arm ${v.name}, then click lines on the card to paint them`}
+                onClick={() => onBrushChange(brushId === v.id ? null : v.id)}
+                className={`grid size-7 shrink-0 place-items-center rounded-md border transition-colors ${brushId === v.id ? 'border-accent bg-accent/15' : 'border-line-strong hover:border-accent-border'}`}
+              >
+                <span className="size-3 rounded-full" style={{ background: voiceColors[v.id] }} />
+              </button>
+              <span className="text-body text-fg">{v.name}</span>
+              <span className="text-caption text-fg-3">· {v.role}</span>
+            </div>
+          ))}
+        </>
+      ) : (
+        <>
+          {/* Voice palette (meme/OCR overlays): row 0 is the default narrator; the colored dot arms
+              that voice as a brush for painting lines on the overlay. */}
+          {voices.map((v, i) => {
+            const id = v.trim();
+            return (
+              <div key={i} className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  aria-label={id && brushId === id ? 'Disarm voice brush' : `Arm voice ${i + 1} brush`}
+                  title={id && brushId === id ? 'Brush armed — click lines on the image; click here to disarm' : 'Arm this voice, then click lines on the image to paint them'}
+                  onClick={() => { if (id) onBrushChange(brushId === id ? null : id); }}
+                  className={`grid size-7 shrink-0 place-items-center rounded-md border transition-colors ${id && brushId === id ? 'border-accent bg-accent/15' : 'border-line-strong hover:border-accent-border'}`}
+                >
+                  <span className="size-3 rounded-full" style={{ background: VOICE_COLORS[i % VOICE_COLORS.length] }} />
+                </button>
+                <input
+                  type="text"
+                  value={v}
+                  onChange={e => onVoicesChange(voices.map((x, j) => (j === i ? e.target.value : x)))}
+                  placeholder={i === 0 ? 'Default voice ID (Liam)' : 'Voice ID'}
+                  className="h-7 min-w-0 flex-1 rounded-md border border-line-strong bg-transparent px-2 text-body text-fg placeholder:text-fg-3 outline-none"
+                />
+                {i > 0 && (
+                  <button
+                    type="button"
+                    aria-label="Remove voice"
+                    onClick={() => { if (id && brushId === id) onBrushChange(null); onVoicesChange(voices.filter((_, j) => j !== i)); }}
+                    className="grid size-7 shrink-0 place-items-center rounded-md text-fg-3 hover:text-danger-text"
+                  >
+                    <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden><path d="M18 6 6 18M6 6l12 12" /></svg>
+                  </button>
+                )}
+              </div>
+            );
+          })}
+          {voices.length < VOICE_COLORS.length && (
             <button
               type="button"
-              aria-label="Remove voice"
-              onClick={() => { if (brushIdx === i) onBrushChange(null); onVoicesChange(voices.filter((_, j) => j !== i)); }}
-              className="grid size-7 shrink-0 place-items-center rounded-md text-fg-3 hover:text-danger-text"
+              onClick={() => onVoicesChange([...voices, ''])}
+              className="self-start text-caption text-fg-3 hover:text-fg underline underline-offset-2"
             >
-              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden><path d="M18 6 6 18M6 6l12 12" /></svg>
+              + Add voice
             </button>
           )}
-        </div>
-      ))}
-      {voices.length < VOICE_COLORS.length && (
-        <button
-          type="button"
-          onClick={() => onVoicesChange([...voices, ''])}
-          className="self-start text-caption text-fg-3 hover:text-fg underline underline-offset-2"
-        >
-          + Add voice
-        </button>
+        </>
       )}
       <p className="text-caption text-fg-3">
-        {brushIdx != null
+        {brushId != null
           ? 'Brush armed — click lines on the image to give them this voice. Same-voice lines read as one paragraph.'
-          : 'Reads the detected text as a hyped take, un-cropping line by line. Click lines on the overlay to skip them, or arm a voice dot to paint paragraphs.'}
+          : target?.name === 'Reddit thread'
+            ? 'The post reads as Mark; each commenter gets a random cast voice, revealing line by line in sync.'
+            : 'Reads the detected text as a hyped take, un-cropping line by line. Click lines on the overlay to skip them, or arm a voice dot to paint paragraphs.'}
       </p>
       <Button variant="primary" size="sm" loading={busy} onClick={generate}>
         Generate narration
@@ -764,7 +794,7 @@ export function CanvasGrid({
   // Narration voice palette (voices[0] = default narrator) + the voice armed as a line-painting
   // brush on the OCR highlights. Persisted so the cast survives reloads.
   const [narrationVoices, setNarrationVoices] = useState<string[]>(loadSavedVoices);
-  const [voiceBrushIdx, setVoiceBrushIdx] = useState<number | null>(null);
+  const [voiceBrushId, setVoiceBrushId] = useState<string | null>(null);
   useEffect(() => {
     try { localStorage.setItem(LS_11L_VOICES, JSON.stringify(narrationVoices)); } catch { /* ignore */ }
   }, [narrationVoices]);
@@ -772,16 +802,15 @@ export function CanvasGrid({
     const m: Record<string, string> = {};
     narrationVoices.forEach((v, i) => { const id = v.trim(); if (id && !(id in m)) m[id] = VOICE_COLORS[i % VOICE_COLORS.length]; });
     // The Reddit cast gets stable tints too, so auto-cast highlights are distinct out of the box.
-    for (const id of [REDDIT_POST_VOICE, ...REDDIT_COMMENT_VOICES]) {
+    for (const { id } of [REDDIT_POST_VOICE, ...REDDIT_COMMENT_VOICES]) {
       if (!(id in m)) m[id] = VOICE_COLORS[Object.keys(m).length % VOICE_COLORS.length];
     }
     return m;
   }, [narrationVoices]);
   const voiceBrush = useMemo(() => {
-    if (voiceBrushIdx == null) return null;
-    const id = narrationVoices[voiceBrushIdx]?.trim();
-    return id ? { voiceId: id, color: VOICE_COLORS[voiceBrushIdx % VOICE_COLORS.length] } : null;
-  }, [voiceBrushIdx, narrationVoices]);
+    if (!voiceBrushId) return null;
+    return { voiceId: voiceBrushId, color: narrationVoiceColors[voiceBrushId] ?? VOICE_COLORS[0] };
+  }, [voiceBrushId, narrationVoiceColors]);
   const [reelTemplateMap, setReelTemplateMap] = useState<Record<string, string | null>>({}); // entryId → template id
   // entryId → user-given reel name (shown/edited in the bottom strip). Kept OUTSIDE VideoEntry — like
   // framing/template above — because entries model the video pipeline (fetch/upload state) while the name
@@ -1145,8 +1174,8 @@ export function CanvasGrid({
     // Auto-cast the thread from the fixed Reddit cast: the post (blocks 0/1) reads as Mark, each
     // distinct commenter draws the next voice from a per-card shuffle of the comment pool (an OP
     // reply matches the post author's name, so it reuses Mark). The brush can repaint any line.
-    const pool = [...REDDIT_COMMENT_VOICES].sort(() => Math.random() - 0.5);
-    const authorVoice = new Map<string, string>([[blockAuthors[0] ?? '', REDDIT_POST_VOICE]]);
+    const pool = REDDIT_COMMENT_VOICES.map(v => v.id).sort(() => Math.random() - 0.5);
+    const authorVoice = new Map<string, string>([[blockAuthors[0] ?? '', REDDIT_POST_VOICE.id]]);
     let commenterCount = 0;
     for (const author of blockAuthors.slice(2)) {
       if (!authorVoice.has(author)) authorVoice.set(author, pool[commenterCount++ % pool.length]);
@@ -1558,8 +1587,9 @@ export function CanvasGrid({
                 overlays={overlaysMap[selectedEntry.id] ?? []}
                 voices={narrationVoices}
                 onVoicesChange={setNarrationVoices}
-                brushIdx={voiceBrushIdx}
-                onBrushChange={setVoiceBrushIdx}
+                brushId={voiceBrushId}
+                onBrushChange={setVoiceBrushId}
+                voiceColors={narrationVoiceColors}
                 onGenerate={(overlayId, apiKey, onStatus) => generateNarration(selectedEntry.id, overlayId, apiKey, onStatus)}
               />
             ) },
