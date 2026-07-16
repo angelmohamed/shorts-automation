@@ -346,7 +346,7 @@ function RedditFlyout({ hasVideo, onAdd }: {
           <div className="text-caption text-fg-2 leading-snug border-l-2 border-line-strong pl-2">
             <span className="text-fg font-medium">{post.user.name}</span> · {post.title.length > 90 ? `${post.title.slice(0, 90)}…` : post.title}
           </div>
-          <div className="max-h-64 overflow-y-auto flex flex-col gap-0.5 pr-1">
+          <div className="max-h-[48vh] overflow-y-auto overscroll-contain flex flex-col gap-0.5 pr-1">
             {paragraphs.length > 0 && (
               <>
                 <span className="text-caption text-fg-3 pt-0.5">Post text — tick the paragraphs to include:</span>
