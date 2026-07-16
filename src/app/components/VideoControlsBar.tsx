@@ -32,6 +32,7 @@ const FPS         = 30;     // reels render at 30fps in the exporter — keep th
 const RULER_H     = 22;
 const STRIP_H     = 58;
 const OV_H        = 22;     // image-overlay lane height (shown only when the reel has overlays)
+const AUD_H       = 16;     // narration audio-channel lane height (shown when a narration exists)
 const MIN_OV      = 0.1;    // minimum overlay duration (seconds, output time)
 const NAMEBAR_H   = 15;
 const SNAP_PX     = 8;
@@ -189,6 +190,9 @@ interface VideoControlsBarProps {
   videoSrc:       string | null;
   /** Image overlays on the current reel — rendered as their own lane above the clips. */
   overlays?:      ImageOverlay[];
+  /** voiceId → color / display name, for the narration audio-channel lane. */
+  voiceColors?:   Record<string, string>;
+  voiceNames?:    Record<string, string>;
   onHistory?:     (api: { undo: () => void; redo: () => void; canUndo: boolean; canRedo: boolean }) => void;
   // Free-tier export quota gate, threaded from the host so its "N left" counter stays the single
   // source of truth (FREE_TIER_PLAN.md). Resolves false (and shows the upgrade prompt) when the
@@ -196,7 +200,7 @@ interface VideoControlsBarProps {
   guardExport?:   (run: () => void | Promise<void>) => Promise<boolean>;
 }
 
-export function VideoControlsBar({ entryId, activeRef, recordingState, videoSrc, overlays, onHistory, guardExport }: VideoControlsBarProps) {
+export function VideoControlsBar({ entryId, activeRef, recordingState, videoSrc, overlays, voiceColors, voiceNames, onHistory, guardExport }: VideoControlsBarProps) {
   const [isPlaying,   setIsPlaying]   = useState(false);
   const [currentTime, setCurrentTime] = useState(0);   // SOURCE time (from the <video>)
   const [duration,    setDuration]    = useState(0);   // SOURCE duration
@@ -885,8 +889,13 @@ export function VideoControlsBar({ entryId, activeRef, recordingState, videoSrc,
   });
 
   const hasOvLane = ovList.length > 0;
-  const laneH     = RULER_H + (hasOvLane ? OV_H + 2 : 0) + STRIP_H;
+  // Narration voices as audio-channel blocks (below the clips, where audio tracks live in editors).
+  const audioTakes = ovList.flatMap(o =>
+    (o.audioTakes ?? []).map(t => ({ ...t, audioStart: o.audioStart ?? o.start, audioRate: o.audioRate ?? 1 })));
+  const hasAudLane = audioTakes.length > 0;
+  const laneH     = RULER_H + (hasOvLane ? OV_H + 2 : 0) + STRIP_H + (hasAudLane ? AUD_H + 2 : 0);
   const clipTop   = RULER_H + (hasOvLane ? OV_H + 2 : 0);
+  const audTop    = clipTop + STRIP_H + 2;
 
   const playOut  = srcToOut(currentTime, committed);
   const trimStart = committed.items[0]?.src0 ?? 0;
@@ -1047,6 +1056,32 @@ export function VideoControlsBar({ entryId, activeRef, recordingState, videoSrc,
                 settling={settling} onBodyDown={onClipBodyDown} onTrimDown={onTrimDown} />
             ))}
           </div>
+
+          {/* Narration audio-channel lane (voices as colored blocks, mapped to source time) */}
+          {hasAudLane && (
+            <div className="absolute left-0 right-0 bg-surface-2/60 border-t border-line/60" style={{ top: audTop, height: AUD_H }}>
+              {audioTakes.map((t, i) => {
+                const s0 = t.audioStart + t.start * t.audioRate;
+                const s1 = s0 + t.duration * t.audioRate;
+                const out0 = srcToOut(s0, committed);
+                const out1 = Math.max(out0 + 0.05, srcToOut(s1, committed));
+                const color = voiceColors?.[t.voiceId] ?? 'var(--blue-400)';
+                const name = voiceNames?.[t.voiceId] ?? 'Voice';
+                return (
+                  <div
+                    key={i}
+                    className="absolute inset-y-[2px] rounded-[3px] overflow-hidden pointer-events-auto"
+                    style={{ left: X(out0), width: Math.max(6, X(out1 - out0)), background: `${color}38`, boxShadow: `inset 0 0 0 1px ${color}` }}
+                    title={`${name} — ${t.duration.toFixed(1)}s`}
+                  >
+                    <span className="absolute inset-x-1.5 top-1/2 -translate-y-1/2 text-[9px] leading-none truncate pointer-events-none" style={{ color }}>
+                      {name}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
           {/* Snap indicator (green) */}
           {snapLineT != null && <div className="absolute top-0 bottom-0 w-px bg-accent pointer-events-none z-40" style={{ left: X(snapLineT) }} />}

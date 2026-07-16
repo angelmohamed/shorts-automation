@@ -52,6 +52,9 @@ export interface ImageOverlay {
   /** Playback rate of the underlying video while this narration plays (baked into the reveal-step
       source times at generation). The video runs this much faster than the voice; absent = 1. */
   audioRate?: number;
+  /** Per-voice narration takes on the stitched audio track (audio-time seconds) — lets the
+      timeline show the voices as colored audio-channel blocks. */
+  audioTakes?: { voiceId: string; start: number; duration: number }[];
   /** Text lines OCR'd off the image right after it's added (auto). Rendered as click-to-toggle
       highlights on the selected overlay; only `enabled` lines are narrated/revealed. */
   ocrLines?: OcrTextLine[];
@@ -140,7 +143,7 @@ export interface TikTokCanvasRef {
   getOverlays: () => ImageOverlay[];
   /** Attach generated narration to an overlay: reveal steps + audio (already persisted to IndexedDB).
       Extends the overlay's end so the narration finishes inside its window. */
-  setOverlayNarration: (id: string, n: { reveals: { t: number; h: number }[]; audioId: string; audioStart: number; audioDuration: number; audioSrc: string; audioRate: number }) => void;
+  setOverlayNarration: (id: string, n: { reveals: { t: number; h: number }[]; audioId: string; audioStart: number; audioDuration: number; audioSrc: string; audioRate: number; audioTakes?: { voiceId: string; start: number; duration: number }[] }) => void;
   /** Snapshot the current framing (crop/pan/zoom/trim) for persistence. Returns null while a saved
    *  reel's video is still loading (framing not yet applied) so callers keep the known-good value. */
   getFraming: () => Framing | null;

@@ -483,6 +483,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
         audioDuration: n.audioDuration,
         audioSrc: n.audioSrc,
         audioRate: n.audioRate,
+        audioTakes: n.audioTakes,
         // The overlay must stay on screen until the narrator finishes, plus a couple seconds of air
         // (source-time: the video runs `audioRate`× faster than the voice).
         end: Math.max(x.end, n.audioStart + (n.audioDuration + 2) * n.audioRate),

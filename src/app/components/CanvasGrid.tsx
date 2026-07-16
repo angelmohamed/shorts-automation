@@ -871,6 +871,12 @@ export function CanvasGrid({
     }
     return m;
   }, [narrationVoices]);
+  const castVoiceNames = useMemo(() => {
+    const m: Record<string, string> = { [REDDIT_POST_VOICE.id]: REDDIT_POST_VOICE.name };
+    for (const v of REDDIT_COMMENT_VOICES) m[v.id] = v.name;
+    narrationVoices.forEach((v, i) => { const id = v.trim(); if (id && !(id in m)) m[id] = `Voice ${i + 1}`; });
+    return m;
+  }, [narrationVoices]);
   const voiceBrush = useMemo(() => {
     if (!voiceBrushId) return null;
     return { voiceId: voiceBrushId, color: narrationVoiceColors[voiceBrushId] ?? VOICE_COLORS[0] };
@@ -1301,7 +1307,7 @@ export function CanvasGrid({
     // per-line beat times = take offset + the line's first-character timestamp.
     const MIX_SR = 44100;
     const GROUP_GAP_S = 0.25;   // breath between voices
-    const segments: { samples: Float32Array; beats: number[] }[] = [];
+    const segments: { samples: Float32Array; beats: number[]; voiceId: string }[] = [];
     const ac = new AudioContext({ sampleRate: MIX_SR });
     try {
       for (let gi = 0; gi < groups.length; gi++) {
@@ -1353,6 +1359,7 @@ export function CanvasGrid({
         segments.push({
           samples,
           beats: offs.map(off => starts[Math.min(off, starts.length - 1)] ?? 0),
+          voiceId: g.voiceId,
         });
       }
     } finally {
@@ -1364,9 +1371,11 @@ export function CanvasGrid({
     const totalSamples = segments.reduce((n, s) => n + s.samples.length, 0) + gapSamples * (segments.length - 1);
     const stitched = new Float32Array(totalSamples);
     const beatStarts: number[] = [];   // audio-time per enabled line, in memeLines order
+    const audioTakes: { voiceId: string; start: number; duration: number }[] = [];   // timeline channel blocks
     let cursor = 0;
     for (const seg of segments) {
       for (const b of seg.beats) beatStarts.push(cursor / MIX_SR + b);
+      audioTakes.push({ voiceId: seg.voiceId, start: cursor / MIX_SR, duration: seg.samples.length / MIX_SR });
       stitched.set(seg.samples, cursor);
       cursor += seg.samples.length + gapSamples;
     }
@@ -1393,7 +1402,7 @@ export function CanvasGrid({
 
     onStatus?.(`Narrating ${memeLines.length} line${memeLines.length === 1 ? '' : 's'} in ${groups.length} voice${groups.length === 1 ? '' : 's'}…`);
 
-    ref.setOverlayNarration(overlayId, { reveals, audioId, audioStart, audioDuration, audioSrc: URL.createObjectURL(blob), audioRate: VIDEO_RATE });
+    ref.setOverlayNarration(overlayId, { reveals, audioId, audioStart, audioDuration, audioSrc: URL.createObjectURL(blob), audioRate: VIDEO_RATE, audioTakes });
 
     // Reddit thread cards snap to the reading layout once narrated: readable width, top-anchored.
     // The teleprompter scroll in drawOverlays keeps the reveal front pinned on screen from there,
@@ -2037,6 +2046,8 @@ export function CanvasGrid({
               recordingState={activeRecordingState}
               videoSrc={activeVideoSrc}
               overlays={overlaysMap[selectedEntry!.id] ?? []}
+              voiceColors={narrationVoiceColors}
+              voiceNames={castVoiceNames}
               onHistory={handleTimelineHistory}
               guardExport={run => exportGuard.guard(`reel:${selectedEntry!.id}`, run)}
             />
