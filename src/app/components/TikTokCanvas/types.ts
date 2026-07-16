@@ -79,6 +79,8 @@ export interface Framing {
   /** Reddit thread import for this reel: the pasted link plus the picked comment/paragraph indices,
       so reopening the flyout (or reloading) can restore the exact selection after re-import. */
   redditThread?: { url: string; comments?: number[]; paras?: number[] };
+  /** Generated YouTube description for this reel (editable; /api/description). */
+  description?: string;
 }
 
 export interface TikTokCanvasProps {

@@ -259,11 +259,13 @@ function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditC
   };
 }
 
-function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
+function RedditFlyout({ hasVideo, saved, onSaveThread, description, onDescriptionChange, onAdd }: {
   hasVideo: boolean;
   /** Persisted thread state for this reel (rides Framing, like music). */
   saved?: { url: string; comments?: number[]; paras?: number[] } | null;
   onSaveThread: (s: { url: string; comments?: number[]; paras?: number[] } | null) => void;
+  description: string;
+  onDescriptionChange: (d: string) => void;
   onAdd: (blob: Blob, lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) => Promise<void>;
 }) {
   const [url, setUrl] = useState(saved?.url ?? '');
@@ -273,6 +275,31 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
   const [comments, setComments] = useState<ImportedRedditComment[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [selectedParas, setSelectedParas] = useState<Set<number>>(new Set());
+  const [descBusy, setDescBusy] = useState(false);
+  const [descError, setDescError] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  // Grounded Gemini writes the YouTube description from the reel's thread link (/api/description).
+  async function generateDescription() {
+    const threadUrl = (saved?.url || url).trim();
+    if (!threadUrl || descBusy) return;
+    setDescBusy(true); setDescError(''); setCopied(false);
+    try {
+      const res = await fetch('/api/description', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: threadUrl }),
+        signal: AbortSignal.timeout(90_000),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? 'Generation failed.');
+      onDescriptionChange(json.description ?? '');
+    } catch (e) {
+      setDescError(e instanceof Error ? e.message : 'Generation failed.');
+    } finally {
+      setDescBusy(false);
+    }
+  }
 
   async function importThread() {
     setBusy('import'); setError(''); setPost(null); setComments([]); setSelected(new Set()); setSelectedParas(new Set());
@@ -429,6 +456,37 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
           </Button>
           {!hasVideo && <span className="text-caption text-fg-3">Add a video to the reel first — the card overlays it.</span>}
         </>
+      )}
+      {(saved?.url || post) && (
+        <div className="flex flex-col gap-1.5 pt-1 border-t border-line">
+          <div className="flex items-center gap-2">
+            <span className="text-caption font-semibold text-fg-3 uppercase tracking-wider flex-1">YouTube description</span>
+            {description && (
+              <button
+                type="button"
+                onClick={() => { void navigator.clipboard.writeText(description).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}
+                className="text-caption text-fg-3 hover:text-fg underline underline-offset-2"
+              >
+                {copied ? 'Copied ✓' : 'Copy'}
+              </button>
+            )}
+          </div>
+          <Button variant="secondary" size="sm" loading={descBusy} onClick={() => void generateDescription()}>
+            {description ? 'Regenerate description' : 'Generate description'}
+          </Button>
+          {description && (
+            <>
+              <textarea
+                value={description}
+                onChange={e => onDescriptionChange(e.target.value)}
+                rows={7}
+                className="w-full rounded-md border border-line-strong bg-transparent p-2 text-caption text-fg leading-snug outline-none resize-y"
+              />
+              <span className={`text-caption ${description.length > 5000 ? 'text-danger-text' : 'text-fg-3'}`}>{description.length} / 5000</span>
+            </>
+          )}
+          {descError && <span className="text-caption text-danger-text">{descError}</span>}
+        </div>
       )}
       {error && <span className="text-caption text-danger-text">{error}</span>}
     </div>
@@ -1005,6 +1063,7 @@ export function CanvasGrid({
           ...(((canvasRefsMap.current.get(e.id)?.getVideoElement()?.readyState ?? 0) >= 2
             ? canvasRefsMap.current.get(e.id)?.getFraming() : null) ?? framingMap[e.id] ?? {}),
           ...(framingMap[e.id]?.redditThread ? { redditThread: framingMap[e.id].redditThread } : {}),
+          ...(framingMap[e.id]?.description ? { description: framingMap[e.id].description } : {}),
         },
       }));
     scheduleSave(rows);
@@ -1684,6 +1743,11 @@ export function CanvasGrid({
                 saved={framingMap[selectedEntry.id]?.redditThread ?? null}
                 onSaveThread={t => {
                   setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], redditThread: t ?? undefined } }));
+                  markFramingDirty();
+                }}
+                description={framingMap[selectedEntry.id]?.description ?? ''}
+                onDescriptionChange={d => {
+                  setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], description: d || undefined } }));
                   markFramingDirty();
                 }}
                 hasVideo={!!(selectedEntry.localVideoSrc || selectedEntry.data || selectedEntry.videoUrl)}
