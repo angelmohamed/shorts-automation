@@ -259,11 +259,13 @@ function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditC
   };
 }
 
-function RedditFlyout({ hasVideo, saved, onSaveThread, description, onDescriptionChange, onAdd }: {
+function RedditFlyout({ hasVideo, saved, onSaveThread, ytTitle, onYtTitleChange, description, onDescriptionChange, onAdd }: {
   hasVideo: boolean;
   /** Persisted thread state for this reel (rides Framing, like music). */
   saved?: { url: string; comments?: number[]; paras?: number[] } | null;
   onSaveThread: (s: { url: string; comments?: number[]; paras?: number[] } | null) => void;
+  ytTitle: string;
+  onYtTitleChange: (t: string) => void;
   description: string;
   onDescriptionChange: (d: string) => void;
   onAdd: (blob: Blob, lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) => Promise<void>;
@@ -275,31 +277,35 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, description, onDescriptio
   const [comments, setComments] = useState<ImportedRedditComment[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [selectedParas, setSelectedParas] = useState<Set<number>>(new Set());
-  const [descBusy, setDescBusy] = useState(false);
+  const [descBusy, setDescBusy] = useState<'title' | 'description' | null>(null);
   const [descError, setDescError] = useState('');
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<'title' | 'description' | null>(null);
 
-  // Grounded Gemini writes the YouTube description from the reel's thread link (/api/description).
-  async function generateDescription() {
+  // Grounded Gemini writes YouTube copy from the reel's thread link (/api/description).
+  async function generateCopy(kind: 'title' | 'description') {
     const threadUrl = (saved?.url || url).trim();
     if (!threadUrl || descBusy) return;
-    setDescBusy(true); setDescError(''); setCopied(false);
+    setDescBusy(kind); setDescError(''); setCopied(null);
     try {
       const res = await fetch('/api/description', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: threadUrl }),
+        body: JSON.stringify({ url: threadUrl, kind }),
         signal: AbortSignal.timeout(90_000),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? 'Generation failed.');
-      onDescriptionChange(json.description ?? '');
+      if (kind === 'title') onYtTitleChange(json.text ?? '');
+      else onDescriptionChange(json.text ?? '');
     } catch (e) {
       setDescError(e instanceof Error ? e.message : 'Generation failed.');
     } finally {
-      setDescBusy(false);
+      setDescBusy(null);
     }
   }
+  const copyText = (kind: 'title' | 'description', text: string) => {
+    void navigator.clipboard.writeText(text).then(() => { setCopied(kind); setTimeout(() => setCopied(null), 1500); });
+  };
 
   async function importThread() {
     setBusy('import'); setError(''); setPost(null); setComments([]); setSelected(new Set()); setSelectedParas(new Set());
@@ -460,18 +466,36 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, description, onDescriptio
       {(saved?.url || post) && (
         <div className="flex flex-col gap-1.5 pt-1 border-t border-line">
           <div className="flex items-center gap-2">
-            <span className="text-caption font-semibold text-fg-3 uppercase tracking-wider flex-1">YouTube description</span>
-            {description && (
-              <button
-                type="button"
-                onClick={() => { void navigator.clipboard.writeText(description).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}
-                className="text-caption text-fg-3 hover:text-fg underline underline-offset-2"
-              >
-                {copied ? 'Copied ✓' : 'Copy'}
+            <span className="text-caption font-semibold text-fg-3 uppercase tracking-wider flex-1">YouTube title</span>
+            {ytTitle && (
+              <button type="button" onClick={() => copyText('title', ytTitle)} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2">
+                {copied === 'title' ? 'Copied ✓' : 'Copy'}
               </button>
             )}
           </div>
-          <Button variant="secondary" size="sm" loading={descBusy} onClick={() => void generateDescription()}>
+          <Button variant="secondary" size="sm" loading={descBusy === 'title'} disabled={descBusy !== null} onClick={() => void generateCopy('title')}>
+            {ytTitle ? 'Regenerate title' : 'Generate title'}
+          </Button>
+          {ytTitle && (
+            <>
+              <input
+                type="text"
+                value={ytTitle}
+                onChange={e => onYtTitleChange(e.target.value)}
+                className="w-full rounded-md border border-line-strong bg-transparent px-2 h-8 text-caption text-fg outline-none"
+              />
+              <span className={`text-caption ${ytTitle.length > 100 ? 'text-danger-text' : 'text-fg-3'}`}>{ytTitle.length} / 100</span>
+            </>
+          )}
+          <div className="flex items-center gap-2 pt-1">
+            <span className="text-caption font-semibold text-fg-3 uppercase tracking-wider flex-1">YouTube description</span>
+            {description && (
+              <button type="button" onClick={() => copyText('description', description)} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2">
+                {copied === 'description' ? 'Copied ✓' : 'Copy'}
+              </button>
+            )}
+          </div>
+          <Button variant="secondary" size="sm" loading={descBusy === 'description'} disabled={descBusy !== null} onClick={() => void generateCopy('description')}>
             {description ? 'Regenerate description' : 'Generate description'}
           </Button>
           {description && (
@@ -1064,6 +1088,7 @@ export function CanvasGrid({
             ? canvasRefsMap.current.get(e.id)?.getFraming() : null) ?? framingMap[e.id] ?? {}),
           ...(framingMap[e.id]?.redditThread ? { redditThread: framingMap[e.id].redditThread } : {}),
           ...(framingMap[e.id]?.description ? { description: framingMap[e.id].description } : {}),
+          ...(framingMap[e.id]?.ytTitle ? { ytTitle: framingMap[e.id].ytTitle } : {}),
         },
       }));
     scheduleSave(rows);
@@ -1743,6 +1768,11 @@ export function CanvasGrid({
                 saved={framingMap[selectedEntry.id]?.redditThread ?? null}
                 onSaveThread={t => {
                   setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], redditThread: t ?? undefined } }));
+                  markFramingDirty();
+                }}
+                ytTitle={framingMap[selectedEntry.id]?.ytTitle ?? ''}
+                onYtTitleChange={t => {
+                  setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], ytTitle: t || undefined } }));
                   markFramingDirty();
                 }}
                 description={framingMap[selectedEntry.id]?.description ?? ''}
