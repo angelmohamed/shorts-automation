@@ -179,7 +179,9 @@ interface OutComment {
   body: string; timeAgo: string; score: string; depth: number; isOP: boolean;
 }
 
-function flattenComments(children: RawComment[], postAuthor: string, depth = 0, out: OutComment[] = []): OutComment[] {
+// maxDepth 0 = top-level comments only (replies-to-replies hidden per product choice; raise to
+// re-enable nested picking — the card renderer and picker rails still support depth).
+function flattenComments(children: RawComment[], postAuthor: string, depth = 0, out: OutComment[] = [], maxDepth = 0): OutComment[] {
   for (const child of children) {
     if (out.length >= MAX_COMMENTS) break;
     if (child.kind !== 't1') continue;
@@ -198,7 +200,7 @@ function flattenComments(children: RawComment[], postAuthor: string, depth = 0, 
       });
     }
     const replies = typeof d.replies === 'object' ? d.replies?.data?.children : undefined;
-    if (replies && !skip) flattenComments(replies, postAuthor, depth + 1, out);
+    if (replies && !skip && depth < maxDepth) flattenComments(replies, postAuthor, depth + 1, out, maxDepth);
   }
   return out;
 }
@@ -283,7 +285,7 @@ async function apifyWithAvatars(threadId: string) {
 
 /** Full-fidelity import over oauth/browser: real comment tree, scores, and avatars. */
 async function nativeImport(threadId: string) {
-  const listing = await redditGet(`/comments/${threadId}`, 'limit=60&depth=4&raw_json=1&sort=top') as
+  const listing = await redditGet(`/comments/${threadId}`, 'limit=60&depth=1&raw_json=1&sort=top') as
       [{ data: { children: [{ data: Record<string, unknown> }] } }, { data: { children: RawComment[] } }];
     const p = listing[0]?.data?.children?.[0]?.data as {
       author?: string; title?: string; selftext?: string; score?: number;

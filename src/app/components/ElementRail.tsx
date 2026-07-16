@@ -22,6 +22,8 @@ export interface RailCategory {
   label: string;
   icon: ReactNode;
   content: ReactNode;
+  /** Flyout panel width in px (default 268) — for content-heavy panels like the Reddit picker. */
+  width?: number;
 }
 
 // One icon button + its hover tooltip (label pill to the right, Miro-style).
@@ -364,9 +366,9 @@ export function ElementRail({
       {active && (
         <div
           ref={flyoutRef}
-          className="absolute pointer-events-auto flex flex-col gap-3 w-[268px] max-h-[80vh] overflow-y-auto scrollbar-none
+          className="absolute pointer-events-auto flex flex-col gap-3 max-h-[80vh] overflow-y-auto scrollbar-none
                      rounded-2xl bg-surface-1 border border-line-strong shadow-3 p-3"
-          style={{ left: EDITOR_RAIL_W + 8, top: flyoutTop ?? 0, visibility: flyoutTop == null ? 'hidden' : undefined }}
+          style={{ width: active.width ?? 268, left: EDITOR_RAIL_W + 8, top: flyoutTop ?? 0, visibility: flyoutTop == null ? 'hidden' : undefined }}
         >
           <div className="flex items-center justify-between shrink-0">
             <span className="text-caption font-semibold text-fg-3 uppercase tracking-wider">{active.label}</span>

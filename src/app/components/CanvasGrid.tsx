@@ -286,7 +286,8 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? 'Import failed.');
       setPost(json.post);
-      setComments(json.comments ?? []);
+      // Top-level replies only (belt & braces — the route already filters depth).
+      setComments((json.comments ?? []).filter((c: ImportedRedditComment) => (c.depth ?? 0) === 0));
       // Persist the link with the reel; re-importing the saved link restores the saved selection.
       if (saved?.url === url.trim()) {
         setSelected(new Set(saved.comments ?? []));
@@ -1677,7 +1678,7 @@ export function CanvasGrid({
                 }}
               />
             ) },
-            { id: 'reddit', label: 'Reddit thread', icon: redditGlyph, content: (
+            { id: 'reddit', label: 'Reddit thread', icon: redditGlyph, width: 420, content: (
               <RedditFlyout
                 key={selectedEntry.id}
                 saved={framingMap[selectedEntry.id]?.redditThread ?? null}
