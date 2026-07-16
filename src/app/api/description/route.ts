@@ -9,7 +9,7 @@ import { z } from 'zod';
 export const runtime = 'nodejs';
 export const maxDuration = 60;
 
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash';
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'deepseek/deepseek-v4-flash';
 const TITLE_MAX = 100;
 const DESC_MAX = 5000;
 const THREAD_TEXT_MAX = 16_000;   // plenty of context, bounded cost
