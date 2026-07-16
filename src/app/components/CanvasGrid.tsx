@@ -1767,6 +1767,11 @@ export function CanvasGrid({
               let name = `${stem}.mp4`;
               for (let n = 2; files[`${folder}/${name}`]; n++) name = `${stem}_${n}.mp4`;
               files[`${folder}/${name}`] = new Uint8Array(await blob.arrayBuffer());
+              // Paired text file: the generated YouTube title + description if present, else blank.
+              const ytTitle = framingMap[entry.id]?.ytTitle ?? '';
+              const ytDesc = framingMap[entry.id]?.description ?? '';
+              const txt = (ytTitle || ytDesc) ? `${ytTitle}\n\n${ytDesc}`.trim() + '\n' : '';
+              files[`${folder}/${name.replace(/\.mp4$/, '.txt')}`] = new TextEncoder().encode(txt);
             } else { omitted++; }   // exportBlob returned null → nothing rendered
           } catch (err) { omitted++; console.error(`Failed to export reel ${entry.id}:`, err); }
         } else { omitted++; }       // canvas never became ready within the timeout
