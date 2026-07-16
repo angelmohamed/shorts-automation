@@ -365,15 +365,16 @@ export async function renderRedditCard(data: RedditCardData): Promise<RedditCard
   drawAvatar(ctx, data.user, postAvatar, PAD, PAD, POST.avatar);
   drawNameRow(ctx, data.user, undefined, PAD + POST.avatar + 22, PAD + POST.avatar / 2, POST.name, POST.time);
   if (data.showJoin !== false) {
-    const jw = 118, jh = 58;
+    const label = 'Follow';
+    ctx.font = font(600, 28);
+    const jw = Math.round(ctx.measureText(label).width + 48), jh = 58;
     ctx.fillStyle = C.join;
     roundRectPath(ctx, W - PAD - jw, PAD + (POST.avatar - jh) / 2, jw, jh, jh / 2);
     ctx.fill();
     ctx.fillStyle = C.joinText;
-    ctx.font = font(600, 28);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('Join', W - PAD - jw / 2, PAD + POST.avatar / 2 + 2);
+    ctx.fillText(label, W - PAD - jw / 2, PAD + POST.avatar / 2 + 2);
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
   }
