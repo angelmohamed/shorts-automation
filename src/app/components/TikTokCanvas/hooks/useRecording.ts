@@ -308,10 +308,10 @@ export function useRecording(config: UseRecordingConfig) {
       let clipEnd = trimEndRef.current > 0 && trimEndRef.current <= fullDuration ? trimEndRef.current : fullDuration;
 
       // Narrated reels: the background video runs `audioRate`× fast (baked into the overlay), and
-      // the clip stops a couple of wall-clock seconds after the narrator finishes — no dead air.
+      // the clip stops one wall-clock second after the narrator finishes — no dead air.
       const narrated = (overlaysRef?.current ?? []).filter(o => o.audioId && (o.audioDuration ?? 0) > 0);
       const videoRate = narrated.length ? Math.max(1, ...narrated.map(o => o.audioRate ?? 1)) : 1;
-      const POST_NARRATION_PAD_S = 2.5;   // wall-clock seconds of video after the voice-over ends
+      const POST_NARRATION_PAD_S = 1;   // wall-clock seconds of video after the voice-over ends
       if (narrated.length > 0) {
         const narrEndSource = Math.max(...narrated.map(o => (o.audioStart ?? o.start) + (o.audioDuration ?? 0) * (o.audioRate ?? 1)));
         clipEnd = Math.max(clipStart + 0.1, Math.min(clipEnd, narrEndSource + POST_NARRATION_PAD_S * videoRate));
