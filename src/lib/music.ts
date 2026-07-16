@@ -18,7 +18,7 @@ export const BACKGROUND_TRACKS: BackgroundTrack[] = [
 ];
 
 /** Default music-bed volume relative to narration (which plays at 1); per-reel override in Framing. */
-export const DEFAULT_MUSIC_VOLUME = 0.12;
+export const DEFAULT_MUSIC_VOLUME = 0.05;
 
 export const trackById = (id?: string | null): BackgroundTrack | null =>
   BACKGROUND_TRACKS.find(t => t.id === id) ?? null;
