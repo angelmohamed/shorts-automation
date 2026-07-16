@@ -35,7 +35,7 @@ import {
 import { fetchFootageManifest, isFootageUrl, type FootageSegment } from '@/lib/footage';
 import { renderRedditCard, type RedditCardData, type RedditComment } from '@/lib/redditCard';
 import type { MemeLine } from '@/lib/memeOcr';
-import { BACKGROUND_TRACKS, DEFAULT_MUSIC_VOLUME } from '@/lib/music';
+import { BACKGROUND_TRACKS, DEFAULT_MUSIC_VOLUME, resolveMusicId } from '@/lib/music';
 
 const CARD_W = CAROUSEL_PREVIEW_W; // 410 — same width as canvas preview
 
@@ -49,7 +49,7 @@ interface CanvasGridProps {
   setEntries?: Dispatch<SetStateAction<VideoEntry[]>>;   // present in the Video Reels workspace (entries are page-owned)
   canvasRefsMap: MutableRefObject<Map<string, TikTokCanvasRef>>;
   brand: BrandProps;
-  onAddRow: () => void;
+  onAddRow: (initialUrl?: string) => void;
   onRemoveRow: (id: string) => void;
   onDuplicateRow: (id: string) => string | null;   // inserts a copy, returns the new id (null if at the reel cap)
   onDeleteAllReels?: () => void;                    // reset the grid to one empty reel + GC stored media
@@ -85,6 +85,19 @@ const micGlyph = (<svg {...SVG_PROPS}><rect x="9" y="2" width="6" height="12" rx
 const shuffleGlyph = (<svg {...SVG_PROPS} width={13} height={13}><path d="M16 3h5v5" /><path d="M4 20 21 3" /><path d="M21 16v5h-5" /><path d="m15 15 6 6" /><path d="M4 4l5 5" /></svg>);
 const redditGlyph = (<svg {...SVG_PROPS}><circle cx="12" cy="14" r="7" /><circle cx="9.5" cy="14" r="0.7" fill="currentColor" stroke="none" /><circle cx="14.5" cy="14" r="0.7" fill="currentColor" stroke="none" /><path d="M12 7c0-2.5 1.5-4 3.5-4" /><circle cx="16.5" cy="3" r="1.2" /></svg>);
 const musicGlyph = (<svg {...SVG_PROPS}><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>);
+const ytCopyGlyph = (<svg {...SVG_PROPS}><rect x="3" y="4" width="18" height="16" rx="3" /><path d="m10 9 5 3-5 3z" fill="currentColor" stroke="none" /></svg>);
+
+// A canvas getFraming() snapshot doesn't carry the flyout-only fields (Reddit thread link, YouTube
+// title/description) — they live only in framingMap. Re-attach them from the existing entry so a
+// snapshot (on reel switch or duplicate) can never silently drop them.
+function withFramingSidecars(snapshot: Framing, prev: Framing | undefined): Framing {
+  if (!prev) return snapshot;
+  const out: Framing = { ...snapshot };
+  if (prev.redditThread) out.redditThread = prev.redditThread;
+  if (prev.ytTitle) out.ytTitle = prev.ytTitle;
+  if (prev.description) out.description = prev.description;
+  return out;
+}
 
 // Browse the shared background-footage library (R2 bucket) and pick a segment for the reel.
 function FootagePicker({ activeUrl, onPick }: { activeUrl: string; onPick: (seg: FootageSegment) => void }) {
@@ -156,12 +169,14 @@ function FootagePicker({ activeUrl, onPick }: { activeUrl: string; onPick: (seg:
 }
 
 // The selected reel's video source — paste a URL / upload a file / pick library footage / fetch.
-function ReelLinkFlyout({ entry, onUpdateField, onUpdateLocalVideo, onFetch, onPickFootage }: {
+function ReelLinkFlyout({ entry, onUpdateField, onUpdateLocalVideo, onFetch, onPickFootage, autoRandom, onAutoRandomChange }: {
   entry: VideoEntry;
   onUpdateField: (field: 'url' | 'caption', value: string) => void;
   onUpdateLocalVideo: (src: string, name: string) => void;
   onFetch: () => void;
   onPickFootage: (seg: FootageSegment) => void;
+  autoRandom: boolean;
+  onAutoRandomChange: (v: boolean) => void;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const hasLocal = !!entry.localVideoSrc;
@@ -211,6 +226,21 @@ function ReelLinkFlyout({ entry, onUpdateField, onUpdateLocalVideo, onFetch, onP
         </>
       )}
       <FootagePicker activeUrl={isFootageUrl(entry.url) ? entry.url : ''} onPick={onPickFootage} />
+      <button
+        type="button"
+        role="switch"
+        aria-checked={autoRandom}
+        onClick={() => onAutoRandomChange(!autoRandom)}
+        className="flex items-center gap-2 pt-1 text-left select-none"
+      >
+        <span
+          className="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
+          style={{ background: autoRandom ? 'var(--color-accent, #46d160)' : 'var(--color-line-strong, #3a3a3a)' }}
+        >
+          <span className={`inline-block size-4 rounded-full bg-white shadow transition-transform ${autoRandom ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+        </span>
+        <span className="text-caption text-fg-2">Auto-add random footage to new reels</span>
+      </button>
       <input ref={fileRef} type="file" accept="video/*" className="hidden" onChange={handleFile} />
       {entry.error && !hasLocal && <span className="text-caption text-danger-text">{entry.error}</span>}
     </div>
@@ -259,38 +289,27 @@ function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditC
   };
 }
 
-function RedditFlyout({ hasVideo, saved, onSaveThread, ytTitle, onYtTitleChange, description, onDescriptionChange, onAdd }: {
-  hasVideo: boolean;
-  /** Persisted thread state for this reel (rides Framing, like music). */
-  saved?: { url: string; comments?: number[]; paras?: number[] } | null;
-  onSaveThread: (s: { url: string; comments?: number[]; paras?: number[] } | null) => void;
+// YouTube copy generator — its own rail flyout. Reads the reel's saved Reddit thread link, imports
+// the thread (cached for the mount), and generates title + description in one model call, or
+// regenerates either individually. Fields persist per reel via Framing (ytTitle / description).
+function YtCopyFlyout({ threadUrl, ytTitle, onYtTitleChange, description, onDescriptionChange }: {
+  threadUrl: string | null;
   ytTitle: string;
   onYtTitleChange: (t: string) => void;
   description: string;
   onDescriptionChange: (d: string) => void;
-  onAdd: (blob: Blob, lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) => Promise<void>;
 }) {
-  const [url, setUrl] = useState(saved?.url ?? '');
-  const [busy, setBusy] = useState<'import' | 'add' | null>(null);
-  const [error, setError] = useState('');
-  const [post, setPost] = useState<ImportedRedditPost | null>(null);
-  const [comments, setComments] = useState<ImportedRedditComment[]>([]);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [selectedParas, setSelectedParas] = useState<Set<number>>(new Set());
-  const [descBusy, setDescBusy] = useState(false);
+  const [descBusy, setDescBusy] = useState<'both' | 'title' | 'description' | null>(null);
   const [descError, setDescError] = useState('');
   const [copied, setCopied] = useState<'title' | 'description' | null>(null);
+  const threadCache = useRef<{ post: unknown; comments: unknown[] } | null>(null);
 
-  // ONE Gemini call fills both YouTube fields, fed the actual scraped thread (no web search).
-  // If the flyout doesn't have the thread loaded (e.g. after a reload, only the saved link), it
-  // re-imports first — same route the picker uses, so the data is identical.
-  async function generateCopy() {
-    const threadUrl = (saved?.url || url).trim();
+  async function generateCopy(only?: 'title' | 'description') {
     if (!threadUrl || descBusy) return;
-    setDescBusy(true); setDescError(''); setCopied(null);
+    setDescBusy(only ?? 'both'); setDescError(''); setCopied(null);
     try {
-      let thread: { post: unknown; comments: unknown[] } | null =
-        post ? { post, comments } : null;
+      // Import the thread once per mount (cached), then reuse across regenerations.
+      let thread = threadCache.current;
       if (!thread) {
         const imp = await fetch('/api/reddit', {
           method: 'POST',
@@ -301,28 +320,100 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, ytTitle, onYtTitleChange,
         const impJson = await imp.json();
         if (!imp.ok) throw new Error(impJson.error ?? 'Couldn’t load the thread.');
         thread = { post: impJson.post, comments: impJson.comments ?? [] };
-        setPost(impJson.post);
-        setComments(impJson.comments ?? []);
+        threadCache.current = thread;
       }
       const res = await fetch('/api/description', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: threadUrl, thread }),
+        body: JSON.stringify({ url: threadUrl, thread, only }),
         signal: AbortSignal.timeout(90_000),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? 'Generation failed.');
-      onYtTitleChange(json.title ?? '');
-      onDescriptionChange(json.description ?? '');
+      if (json.title !== undefined) onYtTitleChange(json.title);
+      if (json.description !== undefined) onDescriptionChange(json.description);
     } catch (e) {
       setDescError(e instanceof Error ? e.message : 'Generation failed.');
     } finally {
-      setDescBusy(false);
+      setDescBusy(null);
     }
   }
   const copyText = (kind: 'title' | 'description', text: string) => {
     void navigator.clipboard.writeText(text).then(() => { setCopied(kind); setTimeout(() => setCopied(null), 1500); });
   };
+
+  if (!threadUrl) {
+    return <p className="text-caption text-fg-3">Import a Reddit thread for this reel first (Reddit thread panel), then generate its YouTube title and description here.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Button variant="secondary" size="sm" loading={descBusy === 'both'} disabled={descBusy !== null} onClick={() => void generateCopy()}>
+        {ytTitle || description ? 'Regenerate both' : 'Generate title & description'}
+      </Button>
+      {ytTitle && (
+        <div className="flex items-center gap-2 pt-1">
+          <span className="text-caption text-fg-3 flex-1">Title</span>
+          <button type="button" disabled={descBusy !== null} onClick={() => void generateCopy('title')} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2 disabled:opacity-40">
+            {descBusy === 'title' ? 'Regenerating…' : 'Regenerate'}
+          </button>
+          <button type="button" onClick={() => copyText('title', ytTitle)} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2">
+            {copied === 'title' ? 'Copied ✓' : 'Copy'}
+          </button>
+        </div>
+      )}
+      {ytTitle && (
+        <>
+          <input
+            type="text"
+            value={ytTitle}
+            onChange={e => onYtTitleChange(e.target.value)}
+            className="w-full rounded-md border border-line-strong bg-transparent px-2 h-8 text-caption text-fg outline-none"
+          />
+          <span className={`text-caption ${ytTitle.length > 100 ? 'text-danger-text' : 'text-fg-3'}`}>{ytTitle.length} / 100</span>
+        </>
+      )}
+      {description && (
+        <div className="flex items-center gap-2 pt-1">
+          <span className="text-caption text-fg-3 flex-1">Description</span>
+          <button type="button" disabled={descBusy !== null} onClick={() => void generateCopy('description')} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2 disabled:opacity-40">
+            {descBusy === 'description' ? 'Regenerating…' : 'Regenerate'}
+          </button>
+          <button type="button" onClick={() => copyText('description', description)} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2">
+            {copied === 'description' ? 'Copied ✓' : 'Copy'}
+          </button>
+        </div>
+      )}
+      {description && (
+        <>
+          <textarea
+            value={description}
+            onChange={e => onDescriptionChange(e.target.value)}
+            rows={7}
+            className="w-full rounded-md border border-line-strong bg-transparent p-2 text-caption text-fg leading-snug outline-none resize-y"
+          />
+          <span className={`text-caption ${description.length > 5000 ? 'text-danger-text' : 'text-fg-3'}`}>{description.length} / 5000</span>
+        </>
+      )}
+      {descError && <span className="text-caption text-danger-text">{descError}</span>}
+    </div>
+  );
+}
+
+function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
+  hasVideo: boolean;
+  /** Persisted thread state for this reel (rides Framing, like music). */
+  saved?: { url: string; comments?: number[]; paras?: number[] } | null;
+  onSaveThread: (s: { url: string; comments?: number[]; paras?: number[] } | null) => void;
+  onAdd: (blob: Blob, lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) => Promise<void>;
+}) {
+  const [url, setUrl] = useState(saved?.url ?? '');
+  const [busy, setBusy] = useState<'import' | 'add' | null>(null);
+  const [error, setError] = useState('');
+  const [post, setPost] = useState<ImportedRedditPost | null>(null);
+  const [comments, setComments] = useState<ImportedRedditComment[]>([]);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [selectedParas, setSelectedParas] = useState<Set<number>>(new Set());
 
   async function importThread() {
     setBusy('import'); setError(''); setPost(null); setComments([]); setSelected(new Set()); setSelectedParas(new Set());
@@ -480,55 +571,6 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, ytTitle, onYtTitleChange,
           {!hasVideo && <span className="text-caption text-fg-3">Add a video to the reel first — the card overlays it.</span>}
         </>
       )}
-      {(saved?.url || post) && (
-        <div className="flex flex-col gap-1.5 pt-1 border-t border-line">
-          <div className="flex items-center gap-2">
-            <span className="text-caption font-semibold text-fg-3 uppercase tracking-wider flex-1">YouTube title & description</span>
-          </div>
-          <Button variant="secondary" size="sm" loading={descBusy} onClick={() => void generateCopy()}>
-            {ytTitle || description ? 'Regenerate both' : 'Generate title & description'}
-          </Button>
-          {ytTitle && (
-            <div className="flex items-center gap-2 pt-1">
-              <span className="text-caption text-fg-3 flex-1">Title</span>
-              <button type="button" onClick={() => copyText('title', ytTitle)} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2">
-                {copied === 'title' ? 'Copied ✓' : 'Copy'}
-              </button>
-            </div>
-          )}
-          {ytTitle && (
-            <>
-              <input
-                type="text"
-                value={ytTitle}
-                onChange={e => onYtTitleChange(e.target.value)}
-                className="w-full rounded-md border border-line-strong bg-transparent px-2 h-8 text-caption text-fg outline-none"
-              />
-              <span className={`text-caption ${ytTitle.length > 100 ? 'text-danger-text' : 'text-fg-3'}`}>{ytTitle.length} / 100</span>
-            </>
-          )}
-          {description && (
-            <div className="flex items-center gap-2 pt-1">
-              <span className="text-caption text-fg-3 flex-1">Description</span>
-              <button type="button" onClick={() => copyText('description', description)} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2">
-                {copied === 'description' ? 'Copied ✓' : 'Copy'}
-              </button>
-            </div>
-          )}
-          {description && (
-            <>
-              <textarea
-                value={description}
-                onChange={e => onDescriptionChange(e.target.value)}
-                rows={7}
-                className="w-full rounded-md border border-line-strong bg-transparent p-2 text-caption text-fg leading-snug outline-none resize-y"
-              />
-              <span className={`text-caption ${description.length > 5000 ? 'text-danger-text' : 'text-fg-3'}`}>{description.length} / 5000</span>
-            </>
-          )}
-          {descError && <span className="text-caption text-danger-text">{descError}</span>}
-        </div>
-      )}
       {error && <span className="text-caption text-danger-text">{error}</span>}
     </div>
   );
@@ -558,13 +600,47 @@ const DEFAULT_NARRATION_SPEED = 1.15;
 
 const REDDIT_POST_VOICE = { id: 'UgBBYS2sOqTuMpoF3BR0', name: 'Mark' };          // Natural Conversations (US)
 const REDDIT_COMMENT_VOICES = [
-  { id: 'Bj9UqZbhQsanLzgalpEG', name: 'Austin' },     // Deep Raspy and Authentic (US Southern)
   { id: 'NNl6r8mD7vthiJatiJt1', name: 'Bradford' },   // Expressive and Articulate (British)
   { id: 'EkK5I93UQWFDigLMpZcX', name: 'James' },      // Husky, Engaging and Bold (US)
-  { id: 'Z3R5wn05IrDiVCyEkUrK', name: 'Arabella' },   // Mysterious and Emotive (US)
   { id: 'aMSt68OGf4xUZAnLpTU8', name: 'Juniper' },    // Grounded and Professional (US)
 ];
+// Known but disabled voices: excluded from the auto-cast pool AND substituted out at narration time,
+// so a persisted assignment from an old card never actually voices them. Kept here only so the
+// timeline still shows their name for a not-yet-regenerated take.
+const DISABLED_VOICES = [
+  { id: 'Z3R5wn05IrDiVCyEkUrK', name: 'Arabella' },   // Mysterious and Emotive (US) — disabled for now
+  { id: 'Bj9UqZbhQsanLzgalpEG', name: 'Austin' },     // Deep Raspy and Authentic (US Southern) — disabled for now
+];
+const DISABLED_VOICE_IDS = new Set(DISABLED_VOICES.map(v => v.id));
 const DEFAULT_VOICE = 'TX3LPaxmHKxFdv7VOQHJ';   // ElevenLabs "Liam" — energetic social-media narrator, premade so free-tier keys can use it
+
+// Cast a voice per narration block (indexed like blockAuthors / MemeLine.blockIdx). Fresh shuffle
+// each call. Post + OP replies read as Mark; other commenters draw from the shuffled pool with the
+// guarantee that no two consecutive blocks by DIFFERENT speakers share a voice (same speaker in a
+// row keeps it; a voice may recur non-adjacently).
+function castRedditVoices(blockAuthors: string[]): string[] {
+  const pool = REDDIT_COMMENT_VOICES.map(v => v.id).sort(() => Math.random() - 0.5);
+  const postAuthor = blockAuthors[0] ?? '';
+  const authorVoice = new Map<string, string>();
+  let poolIdx = 0;
+  const nextPoolVoice = (avoid: string | null): string => {
+    let v = pool[poolIdx % pool.length];
+    if (v === avoid && pool.length > 1) { poolIdx++; v = pool[poolIdx % pool.length]; }
+    poolIdx++;
+    return v;
+  };
+  const blockVoice: string[] = [];
+  let prev: string | null = null;
+  for (let b = 0; b < blockAuthors.length; b++) {
+    const author = blockAuthors[b] ?? '';
+    let v: string;
+    if (b > 0 && author === (blockAuthors[b - 1] ?? '')) v = blockVoice[b - 1];
+    else if (author === postAuthor) v = REDDIT_POST_VOICE.id;
+    else { const known = authorVoice.get(author); v = known && known !== prev ? known : nextPoolVoice(prev); authorVoice.set(author, v); }
+    blockVoice[b] = v; prev = v;
+  }
+  return blockVoice;
+}
 const VOICE_COLORS = ['#38bdf8', '#f472b6', '#a3e635', '#fbbf24', '#c084fc', '#fb7185'];
 
 /** Mono 16-bit PCM WAV — used to stitch multiple ElevenLabs takes into one narration track that both
@@ -594,7 +670,7 @@ function loadSavedVoices(): string[] {
   }
 }
 
-function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChange, voiceColors, speed, onSpeedChange, voiceGains, onVoiceGainsChange, onGenerate }: {
+function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChange, voiceColors, speed, onSpeedChange, voiceGains, onVoiceGainsChange, onGenerate, onClearNarration, onShuffleVoices }: {
   overlays: ImageOverlay[];
   voices: string[];
   onVoicesChange: (v: string[]) => void;
@@ -606,6 +682,8 @@ function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChang
   voiceGains: Record<string, number>;
   onVoiceGainsChange: (g: Record<string, number>) => void;
   onGenerate: (overlayId: string, apiKey: string, onStatus: (s: string) => void) => Promise<string | null>;
+  onClearNarration: (overlayId: string) => void;
+  onShuffleVoices: (overlayId: string) => void;
 }) {
   const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem(LS_11L_KEY) ?? ''; } catch { return ''; } });
   const [targetId, setTargetId] = useState<string>('');
@@ -758,9 +836,29 @@ function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChang
           </button>
         ))}
       </div>
+      {target?.name === 'Reddit thread' && target.blockAuthors && (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => { if (target) { onShuffleVoices(target.id); setMsg('Voices reshuffled — generate to hear them.'); } }}
+          className="self-start text-caption text-fg-2 hover:text-fg underline underline-offset-2 disabled:opacity-40"
+        >
+          ⇄ Shuffle voices
+        </button>
+      )}
       <Button variant="primary" size="sm" loading={busy} onClick={generate}>
-        Generate narration
+        {target?.audioId ? 'Regenerate narration' : 'Generate narration'}
       </Button>
+      {target?.audioId && (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => { if (target) { onClearNarration(target.id); setMsg('Narration removed.'); } }}
+          className="self-start text-caption text-danger-text hover:underline underline-offset-2 disabled:opacity-40"
+        >
+          Remove narration
+        </button>
+      )}
       {msg && <span className="text-caption text-fg-3">{msg}</span>}
     </div>
   );
@@ -988,7 +1086,7 @@ export function CanvasGrid({
   }, [narrationVoices]);
   const castVoiceNames = useMemo(() => {
     const m: Record<string, string> = { [REDDIT_POST_VOICE.id]: REDDIT_POST_VOICE.name };
-    for (const v of REDDIT_COMMENT_VOICES) m[v.id] = v.name;
+    for (const v of [...REDDIT_COMMENT_VOICES, ...DISABLED_VOICES]) m[v.id] = v.name;
     narrationVoices.forEach((v, i) => { const id = v.trim(); if (id && !(id in m)) m[id] = `Voice ${i + 1}`; });
     return m;
   }, [narrationVoices]);
@@ -1002,6 +1100,13 @@ export function CanvasGrid({
   // is pure saved-grid metadata; it rides the same autosave rows. '' / absent = unnamed (number only).
   const [reelNameMap, setReelNameMap] = useState<Record<string, string>>({});
   const [framingDirty, setFramingDirty] = useState(0);   // bumped when a reel's crop/pan/zoom/trim changes
+  // When on, "Add reel" seeds the new reel with a random footage segment. Persisted per browser.
+  const [autoRandomFootage, setAutoRandomFootage] = useState(() => {
+    try { return localStorage.getItem('reels:auto-random-footage') === '1'; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('reels:auto-random-footage', autoRandomFootage ? '1' : '0'); } catch { /* ignore */ }
+  }, [autoRandomFootage]);
   const markFramingDirty = useCallback(() => setFramingDirty(n => n + 1), []);
   const reelsApplied = useRef(false);
   const autoFetched = useRef<Map<string, string>>(new Map());   // entryId → last URL we auto-fetched (no repeats)
@@ -1245,7 +1350,8 @@ export function CanvasGrid({
         // trigger an autosave (a whole-array upsert) on every switch.
         if (f) setFramingMap(prev => {
           const cur = prev[outgoing];
-          return cur && JSON.stringify(cur) === JSON.stringify(f) ? prev : { ...prev, [outgoing]: f };
+          const merged = withFramingSidecars(f, cur);
+          return cur && JSON.stringify(cur) === JSON.stringify(merged) ? prev : { ...prev, [outgoing]: merged };
         });
       }
     }
@@ -1332,7 +1438,10 @@ export function CanvasGrid({
     carry(setVideoZoomMap);
     carry(setReelNameMap);   // the copy keeps the source's name (rename it apart afterwards)
     setReelTemplateMap(prev => ({ ...prev, [newId]: prev[id] ?? activeTwitterId ?? null }));
-    setFramingMap(prev => ({ ...prev, [newId]: canvasRefsMap.current.get(id)?.getFraming() ?? prev[id] ?? {} }));
+    setFramingMap(prev => {
+      const snap = canvasRefsMap.current.get(id)?.getFraming();
+      return { ...prev, [newId]: snap ? withFramingSidecars(snap, prev[id]) : (prev[id] ?? {}) };
+    });
     setSelectedId(newId);
   }, [onDuplicateRow, activeTwitterId]);
 
@@ -1359,20 +1468,20 @@ export function CanvasGrid({
   // commits the overlay inside img.onload, so the lines attach via a short retry loop; if they
   // somehow miss, generateNarration's OCR fallback still reads the card.
   const addRedditCard = useCallback(async (id: string, blob: Blob, lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) => {
+    const ref = canvasRefsMap.current.get(id);
+    // Replace any existing Reddit card on this reel — re-adding updates the thread, never stacks a
+    // second card (removeOverlay also GCs its stored image + narration audio).
+    for (const o of ref?.getOverlays() ?? []) {
+      if (o.name === 'Reddit thread') ref?.removeOverlay(o.id);
+    }
     const overlayId = `ov-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     await saveOverlayImage(overlayId, blob, 'reddit-card.png');
     const url = URL.createObjectURL(blob);
-    canvasRefsMap.current.get(id)?.addImageOverlay(overlayId, url, 'Reddit thread');
-    // Auto-cast the thread from the fixed Reddit cast: the post (blocks 0/1) reads as Mark, each
-    // distinct commenter draws the next voice from a per-card shuffle of the comment pool (an OP
-    // reply matches the post author's name, so it reuses Mark). The brush can repaint any line.
-    const pool = REDDIT_COMMENT_VOICES.map(v => v.id).sort(() => Math.random() - 0.5);
-    const authorVoice = new Map<string, string>([[blockAuthors[0] ?? '', REDDIT_POST_VOICE.id]]);
-    let commenterCount = 0;
-    for (const author of blockAuthors.slice(2)) {
-      if (!authorVoice.has(author)) authorVoice.set(author, pool[commenterCount++ % pool.length]);
-    }
-    const ocrLines = lines.map(l => ({ ...l, enabled: true, voiceId: authorVoice.get(blockAuthors[l.blockIdx] ?? '') }));
+    ref?.addImageOverlay(overlayId, url, 'Reddit thread');
+    // Auto-cast a fresh random voice per block; blockAuthors is stored on the overlay so the cast
+    // can be reshuffled later (Shuffle voices) without re-importing.
+    const blockVoice = castRedditVoices(blockAuthors);
+    const ocrLines = lines.map(l => ({ ...l, enabled: true, voiceId: blockVoice[l.blockIdx] }));
     // Pre-narration the whole card must be on screen (voice painting needs every line clickable),
     // so fit it inside the 1080x1920 frame however long the thread is. Narrating snaps it to the
     // readable top-anchored layout and the teleprompter scroll takes over.
@@ -1381,8 +1490,18 @@ export function CanvasGrid({
     const rect = { w, h, x: Math.round((1080 - w) / 2), y: Math.round((1920 - h) / 2) };
     for (let attempt = 0; attempt < 10; attempt++) {
       await new Promise(r => setTimeout(r, 150));
-      canvasRefsMap.current.get(id)?.updateOverlay(overlayId, { ocrLines, ...rect });
+      canvasRefsMap.current.get(id)?.updateOverlay(overlayId, { ocrLines, blockAuthors, ...rect });
     }
+  }, [canvasRefsMap]);
+
+  // Reshuffle a Reddit card's voice cast on demand (uses the stored blockAuthors). Recolors the line
+  // highlights immediately; the user then regenerates narration to hear the new cast.
+  const shuffleRedditVoices = useCallback((entryId: string, overlayId: string) => {
+    const ref = canvasRefsMap.current.get(entryId);
+    const o = ref?.getOverlays().find(x => x.id === overlayId);
+    if (!o?.ocrLines || !o.blockAuthors) return;
+    const blockVoice = castRedditVoices(o.blockAuthors);
+    ref?.updateOverlay(overlayId, { ocrLines: o.ocrLines.map(l => ({ ...l, voiceId: blockVoice[l.blockIdx] })) });
   }, [canvasRefsMap]);
 
   // Generate ElevenLabs narration for an overlay and attach it. The meme's text is read straight off
@@ -1415,9 +1534,13 @@ export function CanvasGrid({
 
     // Consecutive same-voice lines form one spoken paragraph (one TTS take with that voice).
     const defaultVoice = (narrationVoices[0] ?? '').trim() || DEFAULT_VOICE;
+    // A disabled voice (e.g. persisted on an old card) is revoiced to the first active pool voice,
+    // so it's never actually spoken even after regeneration.
+    const subst = REDDIT_COMMENT_VOICES[0]?.id ?? defaultVoice;
     const groups: { voiceId: string; lines: typeof memeLines }[] = [];
     for (const line of memeLines) {
-      const vid = (line.voiceId ?? '').trim() || defaultVoice;
+      let vid = (line.voiceId ?? '').trim() || defaultVoice;
+      if (DISABLED_VOICE_IDS.has(vid)) vid = subst;
       const g = groups[groups.length - 1];
       if (g && g.voiceId === vid) g.lines.push(line);
       else groups.push({ voiceId: vid, lines: [line] });
@@ -1554,6 +1677,21 @@ export function CanvasGrid({
   // Shown when an add/duplicate is blocked by the MAX_REELS cap.
   const [reelCapNotice, setReelCapNotice] = useState<string | null>(null);
   const atReelCap = entries.length >= MAX_REELS;
+
+  // "Add reel": with the auto-random toggle on, seed the new reel with a random footage segment
+  // (and pre-warm its blob); otherwise add a blank reel. Manifest load falls back to blank on error.
+  const handleAddRow = useCallback(async () => {
+    if (atReelCap) { setReelCapNotice(`You’ve hit the ${MAX_REELS}-reel limit — remove one to add another.`); return; }
+    if (!autoRandomFootage) { onAddRow(); return; }
+    try {
+      const segs = await fetchFootageManifest();
+      const seg = segs.length ? segs[Math.floor(Math.random() * segs.length)] : null;
+      onAddRow(seg?.url);
+      if (seg) void getVideoBlob(proxyStreamUrl(seg.url));
+    } catch {
+      onAddRow();
+    }
+  }, [atReelCap, autoRandomFootage, onAddRow]);
   // "Delete all reels" confirm. Only offered when there's actually something to clear (more than one
   // reel, or a single reel that isn't blank).
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
@@ -1620,7 +1758,9 @@ export function CanvasGrid({
             const blob = await ref.exportBlob();
             if (blob) {
               const reelNo = entries.findIndex(x => x.id === entry.id) + 1;
-              const cap = (entry.caption || '').replace(/[/\\:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+              // Name from the generated YouTube title if present, else the caption.
+              const rawName = framingMap[entry.id]?.ytTitle || entry.caption || '';
+              const cap = rawName.replace(/[/\\:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
               const stem = `${String(reelNo).padStart(2, '0')}_${cap || 'reel'}`;
               // Numbering is unique by construction, but a filename map silently drops an entry on a key
               // clash — so never let one reel overwrite another: suffix _2, _3, … if the name is taken.
@@ -1777,6 +1917,8 @@ export function CanvasGrid({
                   // bestVideoUrl(footageVideoData(url)) resolves to proxyStreamUrl(url).
                   void getVideoBlob(proxyStreamUrl(seg.url));
                 }}
+                autoRandom={autoRandomFootage}
+                onAutoRandomChange={setAutoRandomFootage}
               />
             ) },
             { id: 'reddit', label: 'Reddit thread', icon: redditGlyph, width: 420, content: (
@@ -1787,6 +1929,14 @@ export function CanvasGrid({
                   setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], redditThread: t ?? undefined } }));
                   markFramingDirty();
                 }}
+                hasVideo={!!(selectedEntry.localVideoSrc || selectedEntry.data || selectedEntry.videoUrl)}
+                onAdd={(blob, lines, dims, blockAuthors) => addRedditCard(selectedEntry.id, blob, lines, dims, blockAuthors)}
+              />
+            ) },
+            { id: 'yt-copy', label: 'YouTube copy', icon: ytCopyGlyph, width: 340, content: (
+              <YtCopyFlyout
+                key={selectedEntry.id}
+                threadUrl={framingMap[selectedEntry.id]?.redditThread?.url ?? null}
                 ytTitle={framingMap[selectedEntry.id]?.ytTitle ?? ''}
                 onYtTitleChange={t => {
                   setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], ytTitle: t || undefined } }));
@@ -1797,20 +1947,19 @@ export function CanvasGrid({
                   setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], description: d || undefined } }));
                   markFramingDirty();
                 }}
-                hasVideo={!!(selectedEntry.localVideoSrc || selectedEntry.data || selectedEntry.videoUrl)}
-                onAdd={(blob, lines, dims, blockAuthors) => addRedditCard(selectedEntry.id, blob, lines, dims, blockAuthors)}
               />
             ) },
             { id: 'music', label: 'Background music', icon: musicGlyph, content: (
               <div className="flex flex-col gap-0.5">
                 {[null, ...BACKGROUND_TRACKS].map(t => {
-                  const active = (framingMap[selectedEntry.id]?.musicId ?? null) === (t?.id ?? null);
+                  const active = resolveMusicId(framingMap[selectedEntry.id]?.musicId) === (t?.id ?? null);
                   return (
                     <button
                       key={t?.id ?? 'none'}
                       type="button"
                       onClick={() => {
-                        setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], musicId: t?.id } }));
+                        // '' is the explicit "No music" choice (distinct from unset, which defaults to a track).
+                        setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], musicId: t?.id ?? '' } }));
                         markFramingDirty();
                       }}
                       className={`flex items-center gap-2 px-1.5 h-8 rounded-sm text-body text-left transition-colors focus-ring ${
@@ -1822,7 +1971,7 @@ export function CanvasGrid({
                     </button>
                   );
                 })}
-                {framingMap[selectedEntry.id]?.musicId && (
+                {resolveMusicId(framingMap[selectedEntry.id]?.musicId) && (
                   <label className="flex items-center gap-2 pt-1.5">
                     <span className="text-caption text-fg-3 shrink-0">Volume</span>
                     <input
@@ -1856,6 +2005,8 @@ export function CanvasGrid({
                 voiceGains={voiceGains}
                 onVoiceGainsChange={setVoiceGains}
                 onGenerate={(overlayId, apiKey, onStatus) => generateNarration(selectedEntry.id, overlayId, apiKey, onStatus)}
+                onClearNarration={overlayId => canvasRefsMap.current.get(selectedEntry.id)?.clearOverlayNarration(overlayId)}
+                onShuffleVoices={overlayId => shuffleRedditVoices(selectedEntry.id, overlayId)}
               />
             ) },
           ]}
@@ -2137,7 +2288,8 @@ export function CanvasGrid({
                           overlayCaption={entry.caption}
                           twitterSettings={rowSettings}
                           initialFraming={framingMap[entry.id] ?? null}
-                          musicId={framingMap[entry.id]?.musicId ?? null}
+                          exportTitle={framingMap[entry.id]?.ytTitle}
+                          musicId={resolveMusicId(framingMap[entry.id]?.musicId)}
                           musicVolume={framingMap[entry.id]?.musicVolume ?? null}
                           onFramingChange={markFramingDirty}
                           onOverlaysChange={list => setOverlaysMap(prev => ({ ...prev, [entry.id]: list }))}
@@ -2210,7 +2362,7 @@ export function CanvasGrid({
             })}
             activeSlideId={selectedId}
             onSelect={setSelectedId}
-            onAdd={() => { if (atReelCap) { setReelCapNotice(`You’ve hit the ${MAX_REELS}-reel limit — remove one to add another.`); return; } onAddRow(); }}
+            onAdd={() => void handleAddRow()}
             // Renames land in the name map, which is an autosave-effect dep — so they persist onto the
             // reel's saved-grid row through the normal debounced save, no extra write path.
             onRename={(id, name) => setReelNameMap(prev => ({ ...prev, [id]: name }))}

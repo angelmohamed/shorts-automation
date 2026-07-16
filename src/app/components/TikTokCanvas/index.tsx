@@ -24,6 +24,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
   videoSrc,
   videoId,
   rowNumber = 0,
+  exportTitle = '',
   onVideoError,
   brand = 'sonotrade',
   overlayLogoSrc = '/templatelogo.png',
@@ -349,7 +350,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
     boxRef, videoOffsetRef, videoScaleRef,
     trimStartRef, trimEndRef, includeEditRef,
     logoImgRef, verifiedImgRef,
-    overlayCaption, overlayLogoSrc, overlayDisplayName, overlayHandle, overlayVerified,
+    overlayCaption, exportTitle, overlayLogoSrc, overlayDisplayName, overlayHandle, overlayVerified,
     marketData, marketAvatarImgRef, marketAvatarUrlRef,
     twitterSettings: tw,
     overlaysRef, overlayImgsRef,
@@ -487,6 +488,23 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
         // The overlay must stay on screen until the narrator finishes, plus a couple seconds of air
         // (source-time: the video runs `audioRate`× faster than the voice).
         end: Math.max(x.end, n.audioStart + (n.audioDuration + 2) * n.audioRate),
+      } : x)));
+    },
+    clearOverlayNarration: (id) => {
+      // Strip the narration (audio + reveals) but keep the overlay image and its ocrLines, so the
+      // card goes back to a static full-view state and can be re-narrated. GC the stored audio blob.
+      const o = overlaysRef.current.find(x => x.id === id);
+      if (!o) return;
+      if (o.audioSrc) URL.revokeObjectURL(o.audioSrc);
+      if (o.audioId) void deleteOverlayImage(o.audioId);
+      const el = overlayAudioElsRef.current.get(id);
+      if (el) { el.pause(); el.removeAttribute('src'); overlayAudioElsRef.current.delete(id); }
+      const v = videoRef.current;
+      if (v && !overlaysRef.current.some(x => x.id !== id && x.audioId)) { v.muted = false; v.playbackRate = 1; }
+      commitOverlays(overlaysRef.current.map(x => (x.id === id ? {
+        ...x,
+        reveals: undefined, audioId: undefined, audioStart: undefined,
+        audioDuration: undefined, audioSrc: undefined, audioRate: undefined, audioTakes: undefined,
       } : x)));
     },
     getFraming: (): Framing | null =>

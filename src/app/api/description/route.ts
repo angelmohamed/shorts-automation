@@ -11,11 +11,14 @@ export const maxDuration = 60;
 
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'deepseek/deepseek-v4-flash';
 const TITLE_MAX = 100;
+const DESC_MIN = 4000;   // prompt floor so the model fills the band, not just stays under the cap
 const DESC_MAX = 5000;
 const THREAD_TEXT_MAX = 16_000;   // plenty of context, bounded cost
 
 const Schema = z.object({
   url: z.string().min(8).max(2000),
+  // Omit for both (default); 'title' or 'description' regenerates just that field.
+  only: z.enum(['title', 'description']).optional(),
   thread: z.object({
     post: z.object({
       user: z.object({ name: z.string() }).passthrough(),
@@ -29,27 +32,48 @@ const Schema = z.object({
   }),
 });
 
+// Anonymized so the model never even sees a username — only generic labels — keeping any Reddit
+// handle out of the generated copy.
 function threadToText(t: z.infer<typeof Schema>['thread']): string {
   const lines = [
-    `POST by ${t.post.user.name}: ${t.post.title}`,
+    `Original post: ${t.post.title}`,
     ...(t.post.body ? [t.post.body] : []),
     '',
-    'COMMENTS:',
-    ...t.comments.map(c => `${c.user.name}: ${c.body}`),
+    'Replies:',
+    ...t.comments.map((c, i) => `Reply ${i + 1}: ${c.body}`),
   ];
   const text = lines.join('\n');
   return text.length > THREAD_TEXT_MAX ? `${text.slice(0, THREAD_TEXT_MAX)}…` : text;
 }
 
-const buildPrompt = (url: string, threadText: string) =>
-  `My youtube short is about this reddit thread: ${url}\n\n` +
-  `Here is the full thread content:\n\n${threadText}\n\n` +
-  'Based only on the thread above, generate BOTH of the following:\n' +
-  `1. "title" — a viral hook to use as the youtube short's title. No more than ${TITLE_MAX} characters ` +
-  '(including spaces), no emojis, no hashtags, no quotation marks around it.\n' +
-  `2. "description" — a youtube description, no emojis, in exactly 2 paragraphs. Hard requirement: at most ` +
-  `${DESC_MAX} characters (including spaces) — do not exceed this under any circumstances. Aim for roughly 4500 characters.\n` +
-  'Return only JSON with the keys "title" and "description".';
+const TITLE_INSTR =
+  `"title" — a viral hook to use as the youtube short's title. No more than ${TITLE_MAX} characters ` +
+  '(including spaces), no emojis, no hashtags, no quotation marks around it.';
+const DESC_INSTR =
+  `"description" — a detailed, in-depth youtube description about this discussion, no emojis, no hashtags. ` +
+  `Write between ${DESC_MIN} and ${DESC_MAX} characters including spaces, aiming for about 4500. ` +
+  `${DESC_MIN} characters is a strict minimum — keep writing until you reach it, do not stop early. ` +
+  'To fill that length, thoroughly summarize the original question or story, walk through the main ' +
+  'competing viewpoints raised, paraphrase a few standout points, and close with a takeaway. ' +
+  `Use several paragraphs separated by blank lines. Never exceed ${DESC_MAX} characters.`;
+
+const buildPrompt = (threadText: string, only?: 'title' | 'description') => {
+  const wantTitle = only !== 'description';
+  const wantDesc = only !== 'title';
+  const items = [wantTitle && TITLE_INSTR, wantDesc && DESC_INSTR].filter(Boolean);
+  const keys = [wantTitle && '"title"', wantDesc && '"description"'].filter(Boolean).join(' and ');
+  return (
+    'My youtube short is about the online conversation below.\n\n' +
+    `Here is the full conversation:\n\n${threadText}\n\n` +
+    'IMPORTANT: Never mention Reddit, subreddits, or any usernames anywhere in the title or ' +
+    'description. Refer to the source only as "a conversation", "an online discussion", "a debate", ' +
+    'or similar, and refer to participants generically (e.g. "one person", "another commenter", ' +
+    '"someone", "many people"). Do not name or quote any username.\n\n' +
+    `Based only on the conversation above, generate ${items.length > 1 ? 'BOTH of the following' : 'the following'}:\n` +
+    items.map((t, i) => `${i + 1}. ${t}`).join('\n') + '\n' +
+    `Return only JSON with the key${wantTitle && wantDesc ? 's' : ''} ${keys}.`
+  );
+};
 
 type ModelResult =
   | { ok: true; title: string; description: string }
@@ -108,7 +132,8 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const prompt = buildPrompt(parsed.data.url.trim(), threadToText(parsed.data.thread));
+  const only = parsed.data.only;
+  const prompt = buildPrompt(threadToText(parsed.data.thread), only);
   // One retry on transient failures (rate limit / overload / unparseable output).
   let lastFailure: Extract<ModelResult, { ok: false }> | null = null;
   for (let attemptN = 0; attemptN < 2; attemptN++) {
@@ -116,10 +141,12 @@ export async function POST(request: NextRequest) {
       { ok: false, rateLimited: false, status: 0, detail: String(e) }
     ));
     if (attempt.ok) {
-      const title = capText(attempt.title.replace(/^["'“”]+|["'“”]+$/g, '').trim(), TITLE_MAX);
-      const description = capText(attempt.description, DESC_MAX);
-      if (!title && !description) return NextResponse.json({ error: 'The model returned an empty result.' }, { status: 502 });
-      return NextResponse.json({ title, description, model: OPENROUTER_MODEL });
+      // Return only the requested field(s), so a title-only regen never blanks the description.
+      const out: { title?: string; description?: string; model: string } = { model: OPENROUTER_MODEL };
+      if (only !== 'description') out.title = capText(attempt.title.replace(/^["'“”]+|["'“”]+$/g, '').trim(), TITLE_MAX);
+      if (only !== 'title') out.description = capText(attempt.description, DESC_MAX);
+      if (!out.title && !out.description) return NextResponse.json({ error: 'The model returned an empty result.' }, { status: 502 });
+      return NextResponse.json(out);
     }
     lastFailure = attempt;
     console.warn(`[yt-copy] ${OPENROUTER_MODEL} attempt ${attemptN + 1} failed (${attempt.status})`);

@@ -20,6 +20,16 @@ export const BACKGROUND_TRACKS: BackgroundTrack[] = [
 /** Default music-bed volume relative to narration (which plays at 1); per-reel override in Framing. */
 export const DEFAULT_MUSIC_VOLUME = 0.05;
 
+/** Track new reels start with (first library entry). */
+export const DEFAULT_MUSIC_ID: string | null = BACKGROUND_TRACKS[0]?.id ?? null;
+
+/** Resolve a reel's stored Framing.musicId to the effective track id, or null for none.
+    undefined = never set → the default track; '' = the user explicitly chose "No music". */
+export function resolveMusicId(stored: string | undefined): string | null {
+  if (stored === undefined) return DEFAULT_MUSIC_ID;
+  return stored || null;
+}
+
 export const trackById = (id?: string | null): BackgroundTrack | null =>
   BACKGROUND_TRACKS.find(t => t.id === id) ?? null;
 

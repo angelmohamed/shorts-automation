@@ -55,6 +55,9 @@ export interface ImageOverlay {
   /** Per-voice narration takes on the stitched audio track (audio-time seconds) — lets the
       timeline show the voices as colored audio-channel blocks. */
   audioTakes?: { voiceId: string; start: number; duration: number }[];
+  /** Speaker (author) per narration block, indexed like MemeLine.blockIdx — kept for a Reddit card
+      so its voice cast can be reshuffled later without re-importing. */
+  blockAuthors?: string[];
   /** Text lines OCR'd off the image right after it's added (auto). Rendered as click-to-toggle
       highlights on the selected overlay; only `enabled` lines are narrated/revealed. */
   ocrLines?: OcrTextLine[];
@@ -88,6 +91,8 @@ export interface TikTokCanvasProps {
   videoSrc: string;
   videoId?: string;
   rowNumber?: number;
+  /** Generated YouTube title — used as the export filename when present (falls back to caption). */
+  exportTitle?: string;
   onVideoError?: () => void;
   /** 'sonotrade' = Twitter/X header template, 'clean' = caption-only template */
   brand?: 'sonotrade' | 'clean';
@@ -150,6 +155,8 @@ export interface TikTokCanvasRef {
   /** Attach generated narration to an overlay: reveal steps + audio (already persisted to IndexedDB).
       Extends the overlay's end so the narration finishes inside its window. */
   setOverlayNarration: (id: string, n: { reveals: { t: number; h: number }[]; audioId: string; audioStart: number; audioDuration: number; audioSrc: string; audioRate: number; audioTakes?: { voiceId: string; start: number; duration: number }[] }) => void;
+  /** Remove an overlay's narration (audio + reveals) but keep the image + ocrLines. */
+  clearOverlayNarration: (id: string) => void;
   /** Snapshot the current framing (crop/pan/zoom/trim) for persistence. Returns null while a saved
    *  reel's video is still loading (framing not yet applied) so callers keep the known-good value. */
   getFraming: () => Framing | null;

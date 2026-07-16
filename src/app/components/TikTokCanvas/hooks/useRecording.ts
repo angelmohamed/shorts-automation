@@ -42,6 +42,8 @@ export interface UseRecordingConfig {
   logoImgRef: MutableRefObject<HTMLImageElement | null>;
   verifiedImgRef: MutableRefObject<HTMLImageElement | null>;
   overlayCaption: string;
+  /** Generated YouTube title — used as the export filename when present (falls back to caption). */
+  exportTitle?: string;
   overlayLogoSrc: string;
   overlayDisplayName: string;
   overlayHandle: string;
@@ -81,7 +83,7 @@ export function useRecording(config: UseRecordingConfig) {
       trimStartRef, trimEndRef, includeEditRef,
       logoImgRef, verifiedImgRef,
       overlaysRef, overlayImgsRef,
-      overlayCaption, overlayLogoSrc, overlayDisplayName, overlayHandle, overlayVerified,
+      overlayCaption, exportTitle, overlayLogoSrc, overlayDisplayName, overlayHandle, overlayVerified,
       marketData, marketAvatarImgRef, marketAvatarUrlRef,
       twitterSettings,
       musicIdRef, musicVolumeRef,
@@ -857,14 +859,14 @@ export function useRecording(config: UseRecordingConfig) {
       // saving/downloading it — they upload it and post it to Instagram.
       if (opts?.returnBlob) { setRecProgress(1); return blob; }
 
-      // Filename = short, readable version of the on-card caption (word-boundary
-      // truncated). Falls back to the old row/id naming when there's no caption.
-      const captionBase = (overlayCaption || '').replace(/\s+/g, ' ').trim();
-      let nameBase = captionBase;
-      if (nameBase.length > 60) {
-        const cut = nameBase.slice(0, 60);
+      // Filename = the generated YouTube title if present, else the on-card caption; sanitized of
+      // filesystem-unsafe characters and word-boundary truncated. Falls back to row/id naming.
+      const sanitize = (s: string) => s.replace(/[/\\:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim();
+      let nameBase = sanitize(exportTitle || '') || sanitize(overlayCaption || '');
+      if (nameBase.length > 80) {
+        const cut = nameBase.slice(0, 80);
         const lastSpace = cut.lastIndexOf(' ');
-        nameBase = (lastSpace > 30 ? cut.slice(0, lastSpace) : cut).trim();
+        nameBase = (lastSpace > 40 ? cut.slice(0, lastSpace) : cut).trim();
       }
       if (!nameBase) nameBase = videoId ?? 'export';
       // Prefix the reel number (its card position) so every export is numbered and sorts in order —

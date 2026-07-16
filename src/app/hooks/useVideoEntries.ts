@@ -44,8 +44,15 @@ export function useVideoEntries() {
   // Add a blank reel, capped at MAX_REELS. Guarded inside the updater too so no path can ever push the
   // grid past the cap (which the server trigger would reject, breaking the save). The UI disables the
   // add affordance at the cap; this is the safety net.
-  function addRow() {
-    setEntries(prev => (prev.length >= MAX_REELS ? prev : [...prev, makeEmptyEntry(Date.now().toString(), prev[0]?.mode ?? 'twitter')]));
+  // initialUrl seeds the new reel's link (e.g. auto-assigned random footage); the auto-fetch
+  // effect loads it just like a pasted link.
+  function addRow(initialUrl?: string) {
+    setEntries(prev => {
+      if (prev.length >= MAX_REELS) return prev;
+      const e = makeEmptyEntry(Date.now().toString(), prev[0]?.mode ?? 'twitter');
+      if (initialUrl) e.url = initialUrl;
+      return [...prev, e];
+    });
   }
 
   function removeRow(id: string) {
