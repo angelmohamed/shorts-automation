@@ -428,6 +428,9 @@ function RedditFlyout({ hasVideo, onAdd }: {
 const LS_11L_KEY = 'reels:11labs-key';
 const LS_11L_VOICE = 'reels:11labs-voice';       // legacy single-voice key, migrated into the list
 const LS_11L_VOICES = 'reels:11labs-voices';
+// Per-voice channel gain (0..1.5, 1 = as generated) — a mixer for the cast, since ElevenLabs
+// voices vary in loudness. Applied when the takes are stitched, so changes need a regenerate.
+const LS_VOICE_GAINS = 'reels:voice-gains';
 
 // Fixed voice cast for Reddit thread cards (ElevenLabs voice IDs). The post always reads as Mark;
 // each distinct commenter draws a random voice from the pool (stable per author on a card, no
@@ -476,7 +479,7 @@ function loadSavedVoices(): string[] {
   }
 }
 
-function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChange, voiceColors, speed, onSpeedChange, onGenerate }: {
+function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChange, voiceColors, speed, onSpeedChange, voiceGains, onVoiceGainsChange, onGenerate }: {
   overlays: ImageOverlay[];
   voices: string[];
   onVoicesChange: (v: string[]) => void;
@@ -485,6 +488,8 @@ function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChang
   voiceColors: Record<string, string>;
   speed: number;
   onSpeedChange: (s: number) => void;
+  voiceGains: Record<string, number>;
+  onVoiceGainsChange: (g: Record<string, number>) => void;
   onGenerate: (overlayId: string, apiKey: string, onStatus: (s: string) => void) => Promise<string | null>;
 }) {
   const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem(LS_11L_KEY) ?? ''; } catch { return ''; } });
@@ -544,8 +549,16 @@ function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChang
               >
                 <span className="size-3 rounded-full" style={{ background: voiceColors[v.id] }} />
               </button>
-              <span className="text-body text-fg">{v.name}</span>
-              <span className="text-caption text-fg-3">· {v.role}</span>
+              <span className="text-body text-fg truncate" title={`${v.name} — ${v.role}`}>{v.name}</span>
+              {v.role === 'the post' && <span className="text-caption text-fg-3 shrink-0">post</span>}
+              <input
+                type="range" min={0} max={1.5} step={0.05}
+                value={voiceGains[v.id] ?? 1}
+                title={`Channel volume: ${Math.round((voiceGains[v.id] ?? 1) * 100)}% (applies on next Generate)`}
+                onChange={e => onVoiceGainsChange({ ...voiceGains, [v.id]: Number(e.target.value) })}
+                className="w-16 shrink-0 ml-auto"
+              />
+              <span className="text-caption text-fg-3 w-8 text-right shrink-0">{Math.round((voiceGains[v.id] ?? 1) * 100)}%</span>
             </div>
           ))}
         </>
@@ -573,6 +586,15 @@ function NarrateFlyout({ overlays, voices, onVoicesChange, brushId, onBrushChang
                   placeholder={i === 0 ? 'Default voice ID (Liam)' : 'Voice ID'}
                   className="h-7 min-w-0 flex-1 rounded-md border border-line-strong bg-transparent px-2 text-body text-fg placeholder:text-fg-3 outline-none"
                 />
+                {id && (
+                  <input
+                    type="range" min={0} max={1.5} step={0.05}
+                    value={voiceGains[id] ?? 1}
+                    title={`Channel volume: ${Math.round((voiceGains[id] ?? 1) * 100)}% (applies on next Generate)`}
+                    onChange={e => onVoiceGainsChange({ ...voiceGains, [id]: Number(e.target.value) })}
+                    className="w-12 shrink-0"
+                  />
+                )}
                 {i > 0 && (
                   <button
                     type="button"
@@ -822,6 +844,12 @@ export function CanvasGrid({
   // brush on the OCR highlights. Persisted so the cast survives reloads.
   const [narrationVoices, setNarrationVoices] = useState<string[]>(loadSavedVoices);
   const [voiceBrushId, setVoiceBrushId] = useState<string | null>(null);
+  const [voiceGains, setVoiceGains] = useState<Record<string, number>>(() => {
+    try { return JSON.parse(localStorage.getItem(LS_VOICE_GAINS) ?? '{}') as Record<string, number>; } catch { return {}; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(LS_VOICE_GAINS, JSON.stringify(voiceGains)); } catch { /* ignore */ }
+  }, [voiceGains]);
   const [narrationSpeed, setNarrationSpeed] = useState<number>(() => {
     try {
       const saved = Number(localStorage.getItem(LS_NARRATION_SPEED));
@@ -1316,8 +1344,14 @@ export function CanvasGrid({
           return 'Couldn’t decode the narration audio.';
         }
         const starts = alignment.character_start_times_seconds;
+        const samples = Float32Array.from(decoded.getChannelData(0));   // ElevenLabs is mono
+        // Channel gain: balance this voice against the rest of the cast (soft-clipped at ±1).
+        const gain = voiceGains[g.voiceId] ?? 1;
+        if (gain !== 1) {
+          for (let i = 0; i < samples.length; i++) samples[i] = Math.max(-1, Math.min(1, samples[i] * gain));
+        }
         segments.push({
-          samples: Float32Array.from(decoded.getChannelData(0)),   // ElevenLabs is mono
+          samples,
           beats: offs.map(off => starts[Math.min(off, starts.length - 1)] ?? 0),
         });
       }
@@ -1369,7 +1403,7 @@ export function CanvasGrid({
       ref.updateOverlay(overlayId, { x: Math.round((1080 - w) / 2), y: 110, w, h: Math.round(w * (overlay.h / overlay.w)) });
     }
     return null;
-  }, [canvasRefsMap, narrationVoices, narrationSpeed]);
+  }, [canvasRefsMap, narrationVoices, narrationSpeed, voiceGains]);
 
   const applyVideoZoom = useCallback((id: string, s: number) => {
     const clamped = Math.max(0.5, Math.min(3, s));
@@ -1672,6 +1706,8 @@ export function CanvasGrid({
                 voiceColors={narrationVoiceColors}
                 speed={narrationSpeed}
                 onSpeedChange={setNarrationSpeed}
+                voiceGains={voiceGains}
+                onVoiceGainsChange={setVoiceGains}
                 onGenerate={(overlayId, apiKey, onStatus) => generateNarration(selectedEntry.id, overlayId, apiKey, onStatus)}
               />
             ) },

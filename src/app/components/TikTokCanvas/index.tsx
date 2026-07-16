@@ -11,7 +11,7 @@ import { getOverlayImage, deleteOverlayImage } from '@/lib/localVideoStore';
 import { drawHeaderOnContext, computeSonotradeHeaderHeight } from './drawing/drawHeader';
 import { drawReelCells, drawFreeElements, reelLayout, reelVideoRect, ensureReelTextFontsLoaded, shiftFreeElementsForReelCrop, reelFreeElementDrawnRect } from './drawing/drawReelCell';
 import { drawMarketRow } from './drawing/drawMarketRow';
-import { drawImageOverlays } from './drawing/drawOverlays';
+import { drawImageOverlays, overlayRevealFraction } from './drawing/drawOverlays';
 import { resolveTwitterTemplateSettings } from '../twitterTemplateTypes';
 import { VideoOverlays } from './ui/VideoOverlays';
 import { useVideoLoading } from './hooks/useVideoLoading';
@@ -832,6 +832,9 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
       {overlays.map(o => {
         if (!o.src || currentTime < o.start || currentTime > o.end) return null;
         const sel = selectedOverlayId === o.id;
+        // Narrated cards draw center-pinned (reveal front at the canvas midline) — the editing
+        // chrome tracks that drawn position so highlights always sit on the card's pixels.
+        const chromeTop = o.reveals?.length ? 960 - o.h * overlayRevealFraction(o, currentTime) : o.y;
         return (
           <div
             key={o.id}
@@ -840,7 +843,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
             onPointerDown={e => startOverlayDrag(e, o.id, 'move')}
             className={`absolute ${sel ? 'ring-2 ring-accent' : 'ring-1 ring-transparent hover:ring-accent-border'} cursor-move`}
             style={{
-              left: o.x * DISPLAY_SCALE, top: o.y * DISPLAY_SCALE,
+              left: o.x * DISPLAY_SCALE, top: chromeTop * DISPLAY_SCALE,
               width: o.w * DISPLAY_SCALE, height: o.h * DISPLAY_SCALE,
               touchAction: 'none',
             }}

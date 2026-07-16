@@ -143,10 +143,10 @@ export default function RedditCardDev() {
       {img && (
         <div style={{ display: 'flex', gap: 32, alignItems: 'flex-start' }}>
           {/* reveal-cropped view with the teleprompter reading window, as the reel will show it:
-              on-canvas the card is 886px wide with the reveal front pinned 1150px below its top —
-              scaled to this preview, the window is 1150 * (display/886) px tall. */}
+              on-canvas the card is 886px wide with the reveal front pinned to the frame midline
+              (960px) — scaled to this preview, the window is 960 * (display/886) px tall. */}
           {(() => {
-            const windowH = 1150 * (display / 886);
+            const windowH = 960 * (display / 886);
             const cropH = dims.h * scale * visibleFrac;
             const shift = Math.max(0, cropH - windowH);
             return (
