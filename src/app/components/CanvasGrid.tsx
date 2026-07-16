@@ -259,11 +259,14 @@ function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditC
   };
 }
 
-function RedditFlyout({ hasVideo, onAdd }: {
+function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
   hasVideo: boolean;
+  /** Persisted thread state for this reel (rides Framing, like music). */
+  saved?: { url: string; comments?: number[]; paras?: number[] } | null;
+  onSaveThread: (s: { url: string; comments?: number[]; paras?: number[] } | null) => void;
   onAdd: (blob: Blob, lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) => Promise<void>;
 }) {
-  const [url, setUrl] = useState('');
+  const [url, setUrl] = useState(saved?.url ?? '');
   const [busy, setBusy] = useState<'import' | 'add' | null>(null);
   const [error, setError] = useState('');
   const [post, setPost] = useState<ImportedRedditPost | null>(null);
@@ -284,6 +287,13 @@ function RedditFlyout({ hasVideo, onAdd }: {
       if (!res.ok) throw new Error(json.error ?? 'Import failed.');
       setPost(json.post);
       setComments(json.comments ?? []);
+      // Persist the link with the reel; re-importing the saved link restores the saved selection.
+      if (saved?.url === url.trim()) {
+        setSelected(new Set(saved.comments ?? []));
+        setSelectedParas(new Set(saved.paras ?? []));
+      } else {
+        onSaveThread({ url: url.trim() });
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Import failed.');
     } finally {
@@ -299,6 +309,11 @@ function RedditFlyout({ hasVideo, onAdd }: {
     });
   const toggle = toggleIn(setSelected);
   const togglePara = toggleIn(setSelectedParas);
+  // Selection edits persist alongside the link (debounced by the framing autosave itself).
+  useEffect(() => {
+    if (post && url.trim()) onSaveThread({ url: url.trim(), comments: [...selected], paras: [...selectedParas] });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, selectedParas]);
 
   const paragraphs = post ? splitParagraphs(post.body) : [];
   const totalSelected = selected.size + selectedParas.size;
@@ -983,8 +998,13 @@ export function CanvasGrid({
         // mounted-but-not-loaded canvas (still buffering, or a failed/timed-out video) holds the
         // full-canvas placeholder box, not the band — persisting it made sheet-sent reels reload
         // full-canvas. getFraming() already nulls while loading; this also covers the errored case.
-        framing: ((canvasRefsMap.current.get(e.id)?.getVideoElement()?.readyState ?? 0) >= 2
-          ? canvasRefsMap.current.get(e.id)?.getFraming() : null) ?? framingMap[e.id] ?? {},
+        // Live canvas framing wins when loaded, but redditThread lives only in framingMap
+        // (the canvas doesn't know about it) — merge it so autosave never drops the thread link.
+        framing: {
+          ...(((canvasRefsMap.current.get(e.id)?.getVideoElement()?.readyState ?? 0) >= 2
+            ? canvasRefsMap.current.get(e.id)?.getFraming() : null) ?? framingMap[e.id] ?? {}),
+          ...(framingMap[e.id]?.redditThread ? { redditThread: framingMap[e.id].redditThread } : {}),
+        },
       }));
     scheduleSave(rows);
   }, [entries, reelTemplateMap, reelNameMap, activeTwitterId, framingDirty, setEntries, reelsLoaded, scheduleSave, framingMap, canvasRefsMap]);
@@ -1659,6 +1679,12 @@ export function CanvasGrid({
             ) },
             { id: 'reddit', label: 'Reddit thread', icon: redditGlyph, content: (
               <RedditFlyout
+                key={selectedEntry.id}
+                saved={framingMap[selectedEntry.id]?.redditThread ?? null}
+                onSaveThread={t => {
+                  setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], redditThread: t ?? undefined } }));
+                  markFramingDirty();
+                }}
                 hasVideo={!!(selectedEntry.localVideoSrc || selectedEntry.data || selectedEntry.videoUrl)}
                 onAdd={(blob, lines, dims, blockAuthors) => addRedditCard(selectedEntry.id, blob, lines, dims, blockAuthors)}
               />

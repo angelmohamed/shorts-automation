@@ -76,6 +76,9 @@ export interface Framing {
   musicId?: string;
   /** Music bed volume 0..1 (absent = DEFAULT_MUSIC_VOLUME). */
   musicVolume?: number;
+  /** Reddit thread import for this reel: the pasted link plus the picked comment/paragraph indices,
+      so reopening the flyout (or reloading) can restore the exact selection after re-import. */
+  redditThread?: { url: string; comments?: number[]; paras?: number[] };
 }
 
 export interface TikTokCanvasProps {
