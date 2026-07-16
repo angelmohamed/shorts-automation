@@ -277,30 +277,47 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, ytTitle, onYtTitleChange,
   const [comments, setComments] = useState<ImportedRedditComment[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [selectedParas, setSelectedParas] = useState<Set<number>>(new Set());
-  const [descBusy, setDescBusy] = useState<'title' | 'description' | null>(null);
+  const [descBusy, setDescBusy] = useState(false);
   const [descError, setDescError] = useState('');
   const [copied, setCopied] = useState<'title' | 'description' | null>(null);
 
-  // Grounded Gemini writes YouTube copy from the reel's thread link (/api/description).
-  async function generateCopy(kind: 'title' | 'description') {
+  // ONE Gemini call fills both YouTube fields, fed the actual scraped thread (no web search).
+  // If the flyout doesn't have the thread loaded (e.g. after a reload, only the saved link), it
+  // re-imports first — same route the picker uses, so the data is identical.
+  async function generateCopy() {
     const threadUrl = (saved?.url || url).trim();
     if (!threadUrl || descBusy) return;
-    setDescBusy(kind); setDescError(''); setCopied(null);
+    setDescBusy(true); setDescError(''); setCopied(null);
     try {
+      let thread: { post: unknown; comments: unknown[] } | null =
+        post ? { post, comments } : null;
+      if (!thread) {
+        const imp = await fetch('/api/reddit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: threadUrl }),
+          signal: AbortSignal.timeout(240_000),
+        });
+        const impJson = await imp.json();
+        if (!imp.ok) throw new Error(impJson.error ?? 'Couldn’t load the thread.');
+        thread = { post: impJson.post, comments: impJson.comments ?? [] };
+        setPost(impJson.post);
+        setComments(impJson.comments ?? []);
+      }
       const res = await fetch('/api/description', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: threadUrl, kind }),
+        body: JSON.stringify({ url: threadUrl, thread }),
         signal: AbortSignal.timeout(90_000),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? 'Generation failed.');
-      if (kind === 'title') onYtTitleChange(json.text ?? '');
-      else onDescriptionChange(json.text ?? '');
+      onYtTitleChange(json.title ?? '');
+      onDescriptionChange(json.description ?? '');
     } catch (e) {
       setDescError(e instanceof Error ? e.message : 'Generation failed.');
     } finally {
-      setDescBusy(null);
+      setDescBusy(false);
     }
   }
   const copyText = (kind: 'title' | 'description', text: string) => {
@@ -466,16 +483,19 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, ytTitle, onYtTitleChange,
       {(saved?.url || post) && (
         <div className="flex flex-col gap-1.5 pt-1 border-t border-line">
           <div className="flex items-center gap-2">
-            <span className="text-caption font-semibold text-fg-3 uppercase tracking-wider flex-1">YouTube title</span>
-            {ytTitle && (
+            <span className="text-caption font-semibold text-fg-3 uppercase tracking-wider flex-1">YouTube title & description</span>
+          </div>
+          <Button variant="secondary" size="sm" loading={descBusy} onClick={() => void generateCopy()}>
+            {ytTitle || description ? 'Regenerate both' : 'Generate title & description'}
+          </Button>
+          {ytTitle && (
+            <div className="flex items-center gap-2 pt-1">
+              <span className="text-caption text-fg-3 flex-1">Title</span>
               <button type="button" onClick={() => copyText('title', ytTitle)} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2">
                 {copied === 'title' ? 'Copied ✓' : 'Copy'}
               </button>
-            )}
-          </div>
-          <Button variant="secondary" size="sm" loading={descBusy === 'title'} disabled={descBusy !== null} onClick={() => void generateCopy('title')}>
-            {ytTitle ? 'Regenerate title' : 'Generate title'}
-          </Button>
+            </div>
+          )}
           {ytTitle && (
             <>
               <input
@@ -487,17 +507,14 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, ytTitle, onYtTitleChange,
               <span className={`text-caption ${ytTitle.length > 100 ? 'text-danger-text' : 'text-fg-3'}`}>{ytTitle.length} / 100</span>
             </>
           )}
-          <div className="flex items-center gap-2 pt-1">
-            <span className="text-caption font-semibold text-fg-3 uppercase tracking-wider flex-1">YouTube description</span>
-            {description && (
+          {description && (
+            <div className="flex items-center gap-2 pt-1">
+              <span className="text-caption text-fg-3 flex-1">Description</span>
               <button type="button" onClick={() => copyText('description', description)} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2">
                 {copied === 'description' ? 'Copied ✓' : 'Copy'}
               </button>
-            )}
-          </div>
-          <Button variant="secondary" size="sm" loading={descBusy === 'description'} disabled={descBusy !== null} onClick={() => void generateCopy('description')}>
-            {description ? 'Regenerate description' : 'Generate description'}
-          </Button>
+            </div>
+          )}
           {description && (
             <>
               <textarea

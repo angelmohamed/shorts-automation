@@ -1,48 +1,57 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 
-// Generate YouTube copy for a reel from its Reddit thread link — kind: 'description' (2-paragraph,
-// <=5000 chars: YouTube's description limit) or 'title' (viral hook, <=100 chars: YouTube's title
-// limit). Ported from sonotool's sheet caption engine: Gemini with Google Search grounding (the
-// model must look the thread up, not answer from prior knowledge), a rotating key pool for
-// free-tier quota, and a boundary-aware hard cap.
+// Generate the YouTube title + description for a reel in ONE Gemini call, fed the actual scraped
+// thread (post + comments) instead of asking the model to search for it — no grounding dependency,
+// no ungrounded-answer risk, half the quota of separate calls. Structured JSON output (no tools in
+// play) returns { title, description } directly. Key pool + boundary-aware caps kept from the
+// sonotool engine. Limits: title 100 chars, description 5000 chars (YouTube's hard limits).
 
 export const runtime = 'nodejs';
-export const maxDuration = 60;   // a grounded call can take tens of seconds
+export const maxDuration = 60;
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const TITLE_MAX = 100;
+const DESC_MAX = 5000;
+const THREAD_TEXT_MAX = 16_000;   // plenty of context, bounded cost
 
 const Schema = z.object({
   url: z.string().min(8).max(2000),
-  kind: z.enum(['description', 'title']).default('description'),
+  thread: z.object({
+    post: z.object({
+      user: z.object({ name: z.string() }).passthrough(),
+      title: z.string(),
+      body: z.string().optional(),
+    }).passthrough(),
+    comments: z.array(z.object({
+      user: z.object({ name: z.string() }).passthrough(),
+      body: z.string(),
+    }).passthrough()).max(60),
+  }),
 });
 
-const KINDS = {
-  description: {
-    max: 5000,
-    prompt: (url: string) =>
-      `My youtube short is about this reddit thread: ${url}\n\n` +
-      'Generate me a youtube description, no emojis, in exactly 2 paragraphs, on this thread. ' +
-      'Before writing, you must use Google Search to look up that thread. ' +
-      'Hard requirement: the entire caption must be at most 5000 characters (including spaces) ' +
-      'do not exceed this under any circumstances. Aim for roughly 4500 characters. ' +
-      'Output only the caption text, nothing else.',
-  },
-  title: {
-    max: 100,
-    prompt: (url: string) =>
-      `My youtube short is about this reddit thread: ${url}\n\n` +
-      'Generate me a viral hook as a title for the youtube short, based on this thread. ' +
-      'Before writing, you must use Google Search to look up that thread. ' +
-      'Hard requirement: the title must be no more than 100 characters (including spaces) — ' +
-      'do not exceed this under any circumstances. No emojis, no quotation marks around it, no hashtags. ' +
-      'Output only the title text, nothing else.',
-  },
-} as const;
+function threadToText(t: z.infer<typeof Schema>['thread']): string {
+  const lines = [
+    `POST by ${t.post.user.name}: ${t.post.title}`,
+    ...(t.post.body ? [t.post.body] : []),
+    '',
+    'COMMENTS:',
+    ...t.comments.map(c => `${c.user.name}: ${c.body}`),
+  ];
+  const text = lines.join('\n');
+  return text.length > THREAD_TEXT_MAX ? `${text.slice(0, THREAD_TEXT_MAX)}…` : text;
+}
 
-// Pool of Gemini API keys tried in rotation. GEMINI_API_KEYS = comma-separated (primary first);
-// falls back to the single GEMINI_API_KEY. Keys from separate Google Cloud projects multiply the
-// free-tier quota, which is scoped per project.
+const buildPrompt = (url: string, threadText: string) =>
+  `My youtube short is about this reddit thread: ${url}\n\n` +
+  `Here is the full thread content:\n\n${threadText}\n\n` +
+  'Based only on the thread above, generate BOTH of the following:\n' +
+  `1. "title" — a viral hook to use as the youtube short's title. No more than ${TITLE_MAX} characters ` +
+  '(including spaces), no emojis, no hashtags, no quotation marks around it.\n' +
+  `2. "description" — a youtube description, no emojis, in exactly 2 paragraphs. Hard requirement: at most ` +
+  `${DESC_MAX} characters (including spaces) — do not exceed this under any circumstances. Aim for roughly 4500 characters.\n` +
+  'Return only JSON with the keys "title" and "description".';
+
 function getGeminiKeys(): string[] {
   const pool = (process.env.GEMINI_API_KEYS || '').split(',').map(k => k.trim()).filter(Boolean);
   if (pool.length) return pool;
@@ -51,7 +60,7 @@ function getGeminiKeys(): string[] {
 }
 
 type GeminiResult =
-  | { ok: true; text: string; searchQueries: string[] }
+  | { ok: true; title: string; description: string }
   | { ok: false; rateLimited: boolean; status: number; detail: string };
 
 async function generateWithGemini(prompt: string, apiKey: string): Promise<GeminiResult> {
@@ -62,7 +71,14 @@ async function generateWithGemini(prompt: string, apiKey: string): Promise<Gemin
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        tools: [{ google_search: {} }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: 'OBJECT',
+            properties: { title: { type: 'STRING' }, description: { type: 'STRING' } },
+            required: ['title', 'description'],
+          },
+        },
       }),
       signal: AbortSignal.timeout(55_000),
     },
@@ -72,12 +88,16 @@ async function generateWithGemini(prompt: string, apiKey: string): Promise<Gemin
     return { ok: false, rateLimited: res.status === 429 || res.status === 503, status: res.status, detail };
   }
   const data = await res.json();
-  const searchQueries: string[] = data.candidates?.[0]?.groundingMetadata?.webSearchQueries ?? [];
-  const text = (data.candidates?.[0]?.content?.parts || [])
+  const raw = (data.candidates?.[0]?.content?.parts || [])
     .map((p: { text?: string }) => p.text || '')
     .join('')
     .trim();
-  return { ok: true, text, searchQueries };
+  try {
+    const parsed = JSON.parse(raw) as { title?: string; description?: string };
+    return { ok: true, title: (parsed.title ?? '').trim(), description: (parsed.description ?? '').trim() };
+  } catch {
+    return { ok: false, rateLimited: false, status: 200, detail: `unparseable model output: ${raw.slice(0, 200)}` };
+  }
 }
 
 /** Trim to the limit without cutting mid-sentence/word (model character counts are unreliable). */
@@ -92,18 +112,17 @@ function capText(text: string, max: number): string {
 
 export async function POST(request: NextRequest) {
   const parsed = Schema.safeParse(await request.json().catch(() => ({})));
-  if (!parsed.success) return NextResponse.json({ error: 'url is required' }, { status: 400 });
+  if (!parsed.success) return NextResponse.json({ error: 'url and thread are required' }, { status: 400 });
 
   const keys = getGeminiKeys();
   if (!keys.length) {
     return NextResponse.json(
-      { error: 'Description generation isn’t configured — add GEMINI_API_KEY (or GEMINI_API_KEYS) to .env.local. Free keys: aistudio.google.com/apikey.' },
+      { error: 'Copy generation isn’t configured — add GEMINI_API_KEY (or GEMINI_API_KEYS) to .env.local. Free keys: aistudio.google.com/apikey.' },
       { status: 501 },
     );
   }
 
-  const kind = KINDS[parsed.data.kind];
-  const prompt = kind.prompt(parsed.data.url.trim());
+  const prompt = buildPrompt(parsed.data.url.trim(), threadToText(parsed.data.thread));
   let lastFailure: Extract<GeminiResult, { ok: false }> | null = null;
 
   for (let i = 0; i < keys.length; i++) {
@@ -111,16 +130,10 @@ export async function POST(request: NextRequest) {
       { ok: false, rateLimited: false, status: 0, detail: String(e) }
     ));
     if (attempt.ok) {
-      if (attempt.searchQueries.length) {
-        console.log('[yt-copy] 🔎 searched:', attempt.searchQueries.join(' | '));
-      } else {
-        console.warn('[yt-copy] ⚠️ no web search performed — description is ungrounded');
-      }
-      // Titles sometimes come back wrapped in quotes despite instructions — strip them.
-      const cleaned = parsed.data.kind === 'title' ? attempt.text.replace(/^["'“”]+|["'“”]+$/g, '').trim() : attempt.text;
-      const text = capText(cleaned, kind.max);
-      if (!text) return NextResponse.json({ error: 'Gemini returned an empty result.' }, { status: 502 });
-      return NextResponse.json({ text, grounded: attempt.searchQueries.length > 0 });
+      const title = capText(attempt.title.replace(/^["'“”]+|["'“”]+$/g, '').trim(), TITLE_MAX);
+      const description = capText(attempt.description, DESC_MAX);
+      if (!title && !description) return NextResponse.json({ error: 'Gemini returned an empty result.' }, { status: 502 });
+      return NextResponse.json({ title, description });
     }
     lastFailure = attempt;
     console.warn(`[yt-copy] Gemini key #${i + 1}/${keys.length} failed (${attempt.status})${i < keys.length - 1 ? ' — trying next key' : ''}`);
