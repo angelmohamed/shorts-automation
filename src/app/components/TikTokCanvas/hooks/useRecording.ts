@@ -266,10 +266,18 @@ export function useRecording(config: UseRecordingConfig) {
       let audioTrackId: number | null = null;
       let videoTimescale = 90000;
       let audioTimescale = 44100;
+      // Source video dimensions read from the demuxed track — the <video> element is preload="none" and
+      // may never have loaded, so we can't rely on video.videoWidth/Height here.
+      let srcW = 0, srcH = 0;
 
       MP4BoxFile.onReady = (info: { tracks?: Array<{ id: number; type: string; timescale?: number }> }) => {
         for (const track of info.tracks || []) {
-          if (track.type === 'video' && !videoTrackId) { videoTrackId = track.id; videoTimescale = track.timescale || 90000; }
+          if (track.type === 'video' && !videoTrackId) {
+            videoTrackId = track.id; videoTimescale = track.timescale || 90000;
+            const vt = track as { video?: { width?: number; height?: number }; track_width?: number; track_height?: number };
+            srcW = vt.video?.width || vt.track_width || 0;
+            srcH = vt.video?.height || vt.track_height || 0;
+          }
           if (track.type === 'audio' && !audioTrackId) { audioTrackId = track.id; audioTimescale = track.timescale || 44100; }
         }
         if (videoTrackId) MP4BoxFile.setExtractionOptions(videoTrackId, null, { nbSamples: Infinity });
@@ -722,8 +730,8 @@ export function useRecording(config: UseRecordingConfig) {
               }
             }
 
-            const vw = video?.videoWidth || 1080;
-            const vh = video?.videoHeight || 1920;
+            const vw = srcW || video?.videoWidth || 1080;
+            const vh = srcH || video?.videoHeight || 1920;
             const scale = (CANVAS_W / vw) * videoScaleRef.current;
             const dx = (CANVAS_W - vw * scale) / 2 + ox;
             const dy = (CANVAS_H - vh * scale) / 2 + oy;
@@ -741,8 +749,8 @@ export function useRecording(config: UseRecordingConfig) {
             offCtx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 
             const { x: ox, y: oy } = videoOffsetRef.current;
-            const vw = video?.videoWidth || 1080;
-            const vh = video?.videoHeight || 1920;
+            const vw = srcW || video?.videoWidth || 1080;
+            const vh = srcH || video?.videoHeight || 1920;
 
             if (cellMode) {
               // ── Reel cell layout: [top · top2] · centred video band · [bottom · bottom2] ──

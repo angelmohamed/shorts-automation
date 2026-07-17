@@ -43,11 +43,14 @@ interface UseVideoLoadingParams {
   // Set true while the <video> is being swapped to a local blob so the draw loop freezes
   // on the last frame (no flash) and the metadata handler skips its framing/trim reset.
   blobSwapRef: MutableRefObject<boolean>;
+  // The src whose saved framing has already been restored. When it matches videoSrc, a (deferred) load's
+  // loadedmetadata must NOT reset the user's pan/zoom/trim — restore happened before the video ever loaded.
+  framingAppliedSrcRef?: MutableRefObject<string | null>;
 }
 
 export function useVideoLoading({
   videoRef, videoSrc, brand, rowNumber, videoId, videoTargetW, videoBandHeight, cellMode,
-  boxRef, setBox, videoOffsetRef, videoScaleRef, setVideoScale, onVideoError, blobSwapRef,
+  boxRef, setBox, videoOffsetRef, videoScaleRef, setVideoScale, onVideoError, blobSwapRef, framingAppliedSrcRef,
 }: UseVideoLoadingParams) {
   const ownedBlobUrlRef = useRef<string | null>(null);   // this canvas's blob: URL, revoked on src change
   const [isVideoLoading, setIsVideoLoading] = useState(false);
@@ -77,22 +80,31 @@ export function useVideoLoading({
     if (!video) return;
     const handleLoadedMetadata = () => {
       if (blobSwapRef.current) return;   // same-file blob swap → keep the user's crop/zoom/trim
+      // A deferred (preload="none") reel restores its saved framing on mount, BEFORE the clip ever loads;
+      // when the user later plays it, this loadedmetadata fires — it must NOT reset the user's pan/zoom/trim
+      // (that would clobber the restored framing and get autosaved). Recompute the band box + duration, but
+      // skip the offset/scale/trim reset when framing is already applied for this source.
+      const framingApplied = !!framingAppliedSrcRef?.current && framingAppliedSrcRef.current === videoSrc;
       const vw = video.videoWidth;
       const vh = video.videoHeight;
       if (vw && vh) {
         const b = calcVideoBox(vw, vh, brand, videoTargetW, videoBandHeight, cellMode);
         boxRef.current = b;
         setBox(b);
-        videoOffsetRef.current = { x: 0, y: 0 };
-        videoScaleRef.current = 1;
-        setVideoScale(1);
+        if (!framingApplied) {
+          videoOffsetRef.current = { x: 0, y: 0 };
+          videoScaleRef.current = 1;
+          setVideoScale(1);
+        }
       }
       const dur = isFinite(video.duration) ? video.duration : 0;
       setVideoDuration(dur);
-      setTrimStart(0);
-      setTrimEnd(dur);
-      trimStartRef.current = 0;
-      trimEndRef.current = dur;
+      if (!framingApplied) {
+        setTrimStart(0);
+        setTrimEnd(dur);
+        trimStartRef.current = 0;
+        trimEndRef.current = dur;
+      }
       setCurrentTime(0);
     };
     video.addEventListener('loadedmetadata', handleLoadedMetadata);
@@ -128,7 +140,10 @@ export function useVideoLoading({
   if (videoSrc !== prevSrc) {
     setPrevSrc(videoSrc);
     if (srcValid) setVideoError(null);
-    setIsVideoLoading(srcValid);
+    // Deferred loading: the <video> is preload="none", so a new src downloads nothing until play/export.
+    // Never show the "Loading video…" spinner for it — the reel is usable immediately (card renders over a
+    // black video band). It only becomes "loading" if the user actually plays it (handled in the effect).
+    setIsVideoLoading(false);
   }
 
   // Load new video src
@@ -146,24 +161,20 @@ export function useVideoLoading({
     video.load();
     video.src = videoSrc;
 
-    const handleLoadedData = () => { if (video.readyState >= 2) setIsVideoLoading(false); };
+    // Clear any residual spinner once data actually arrives (only happens if the user plays the deferred
+    // clip). No eager-load timeout/error: with preload="none" the element intentionally never downloads
+    // until played or exported, so a "failed to load" timeout would be a false alarm — a genuinely bad
+    // URL surfaces at export instead.
+    const clearLoading = () => { if (video.readyState >= 1) setIsVideoLoading(false); };
     const handleError = () => setIsVideoLoading(false);
 
-    video.addEventListener('loadeddata', handleLoadedData);
+    video.addEventListener('loadedmetadata', clearLoading);
+    video.addEventListener('loadeddata', clearLoading);
     video.addEventListener('error', handleError);
 
-    const timeoutId = setTimeout(() => {
-      if (video.readyState < 2) {
-        console.error('[Row ' + (rowNumber + 1) + '] Video timeout:', videoId);
-        setVideoError('Video failed to load. The video URL may be invalid.');
-        setIsVideoLoading(false);
-        onVideoError?.();
-      }
-    }, 120000);
-
     return () => {
-      clearTimeout(timeoutId);
-      video.removeEventListener('loadeddata', handleLoadedData);
+      video.removeEventListener('loadedmetadata', clearLoading);
+      video.removeEventListener('loadeddata', clearLoading);
       video.removeEventListener('error', handleError);
     };
   }, [videoSrc, srcValid]);

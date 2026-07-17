@@ -13,10 +13,19 @@ import { redditBrowserJson } from '@/lib/redditBrowser';
 export const runtime = 'nodejs';
 
 const UA = 'web:reels-studio:v1.0 (footage importer)';
-const MAX_COMMENTS = 30;      // returned to the client for selection
+const MAX_COMMENTS = 50;      // returned to the client for selection (top-level + one reply each)
 const MAX_AVATARS = 12;       // unique authors whose avatar images we inline
 
-const Schema = z.object({ url: z.string().min(8).max(2000) });
+// skipAvatars: don't fetch per-author profile pictures. Avatar enrichment fires ~12 profile
+// lookups + image downloads per thread, which throttles Reddit and jams the shared browser page
+// under bulk import — bulk callers set this and cards fall back to colored initial discs.
+// preferApify: use the Apify transport first (separate HTTP call — reliable and non-blocking) rather
+// than the headless-browser transport, which is slow and stalls the server under bulk load.
+const Schema = z.object({
+  url: z.string().min(8).max(2000),
+  skipAvatars: z.boolean().optional(),
+  preferApify: z.boolean().optional(),
+});
 
 // ── token cache (module scope survives across requests in one server process) ───────────────────
 let token: { value: string; expiresAt: number } | null = null;
@@ -179,28 +188,38 @@ interface OutComment {
   body: string; timeAgo: string; score: string; depth: number; isOP: boolean;
 }
 
-// maxDepth 0 = top-level comments only (replies-to-replies hidden per product choice; raise to
-// re-enable nested picking — the card renderer and picker rails still support depth).
-function flattenComments(children: RawComment[], postAuthor: string, depth = 0, out: OutComment[] = [], maxDepth = 0): OutComment[] {
-  for (const child of children) {
-    if (out.length >= MAX_COMMENTS) break;
-    if (child.kind !== 't1') continue;
-    const d = child.data;
+// Flatten a reddit comment listing to top-level comments, each followed by AT MOST ONE reply (depth 1)
+// — the picker groups a comment with a single reply, and the card renderer nests by depth. The listing
+// is fetched with depth=2 so one reply level is available; deeper replies are intentionally dropped.
+function flattenComments(children: RawComment[], postAuthor: string): OutComment[] {
+  const out: OutComment[] = [];
+  const push = (d: RawComment['data'], depth: number): boolean => {
     const body = plainText(d.body ?? '');
     const skip = !d.author || d.author === '[deleted]' || d.author === 'AutoModerator'
       || d.stickied || !body || body === '[removed]' || body === '[deleted]';
-    if (!skip) {
-      out.push({
-        user: { name: d.author! },
-        body,
-        timeAgo: timeAgo(d.created_utc ?? Date.now() / 1000),
-        score: fmtScore(d.score ?? 0),
-        depth,
-        isOP: d.author === postAuthor,
-      });
+    if (skip) return false;
+    out.push({
+      user: { name: d.author! },
+      body,
+      timeAgo: timeAgo(d.created_utc ?? Date.now() / 1000),
+      score: fmtScore(d.score ?? 0),
+      depth,
+      isOP: d.author === postAuthor,
+    });
+    return true;
+  };
+  for (const child of children) {
+    if (out.length >= MAX_COMMENTS) break;
+    if (child.kind !== 't1') continue;
+    if (!push(child.data, 0)) continue;
+    // Attach the first usable reply (if any) right after its parent, then move on — one reply per comment.
+    const replies = typeof child.data.replies === 'object' ? child.data.replies?.data?.children : undefined;
+    if (replies) {
+      for (const rc of replies) {
+        if (out.length >= MAX_COMMENTS) break;
+        if (rc.kind === 't1' && push(rc.data, 1)) break;
+      }
     }
-    const replies = typeof d.replies === 'object' ? d.replies?.data?.children : undefined;
-    if (replies && !skip && depth < maxDepth) flattenComments(replies, postAuthor, depth + 1, out, maxDepth);
   }
   return out;
 }
@@ -236,18 +255,20 @@ export async function POST(request: NextRequest) {
     // Transport order: native (oauth/browser) first — it carries the real comment TREE, scores and
     // avatars, while the Apify actor flattens every comment to depth 0 and hides votes. Apify is
     // the fallback for environments without Chrome, or the primary with REDDIT_TRANSPORT=apify.
-    const nativeFirst = process.env.REDDIT_TRANSPORT !== 'apify';
-    if (!nativeFirst && process.env.APIFY_TOKEN) {
-      try { return NextResponse.json(await apifyWithAvatars(threadId)); }
+    const skipAvatars = parsed.data.skipAvatars === true;
+    // Apify first when the caller prefers it (bulk) or REDDIT_TRANSPORT=apify; else native first.
+    const apifyFirst = (parsed.data.preferApify === true || process.env.REDDIT_TRANSPORT === 'apify') && !!process.env.APIFY_TOKEN;
+    if (apifyFirst) {
+      try { return NextResponse.json(await apifyWithAvatars(threadId, skipAvatars)); }
       catch (e) { console.error('[reddit] apify transport failed, trying native:', e); }
     }
     try {
-      return NextResponse.json(await nativeImport(threadId));
+      return NextResponse.json(await nativeImport(threadId, skipAvatars));
     } catch (e) {
       if (e instanceof ConfigError) throw e;
-      if (nativeFirst && process.env.APIFY_TOKEN) {
+      if (!apifyFirst && process.env.APIFY_TOKEN) {
         console.error('[reddit] native transport failed, falling back to apify:', e);
-        return NextResponse.json(await apifyWithAvatars(threadId));
+        return NextResponse.json(await apifyWithAvatars(threadId, skipAvatars));
       }
       throw e;
     }
@@ -266,8 +287,9 @@ export async function POST(request: NextRequest) {
 
 /** Apify thread import + best-effort avatar enrichment over the native transport (the actor
     doesn't scrape user profiles). Enrichment failure just leaves the initial discs. */
-async function apifyWithAvatars(threadId: string) {
+async function apifyWithAvatars(threadId: string, skipAvatars = false) {
   const data = await apifyImport(`https://www.reddit.com/comments/${threadId}/`);
+  if (skipAvatars) return data;
   try {
     const names = [...new Set([
       data.post.user.name.replace(/^u\//, ''),
@@ -284,8 +306,8 @@ async function apifyWithAvatars(threadId: string) {
 }
 
 /** Full-fidelity import over oauth/browser: real comment tree, scores, and avatars. */
-async function nativeImport(threadId: string) {
-  const listing = await redditGet(`/comments/${threadId}`, 'limit=60&depth=1&raw_json=1&sort=top') as
+async function nativeImport(threadId: string, skipAvatars = false) {
+  const listing = await redditGet(`/comments/${threadId}`, 'limit=60&depth=2&raw_json=1&sort=top') as
       [{ data: { children: [{ data: Record<string, unknown> }] } }, { data: { children: RawComment[] } }];
     const p = listing[0]?.data?.children?.[0]?.data as {
       author?: string; title?: string; selftext?: string; score?: number;
@@ -295,10 +317,14 @@ async function nativeImport(threadId: string) {
 
     const comments = flattenComments(listing[1]?.data?.children ?? [], p.author ?? '');
 
-    // avatars: post author first, then commenters in order, capped
-    const names = [...new Set([p.author, ...comments.map(c => c.user.name)])].filter((n): n is string => !!n && n !== '[deleted]').slice(0, MAX_AVATARS);
-    const avatars = new Map(await Promise.all(names.map(async n => [n, await fetchAvatar(n)] as const)));
-    for (const c of comments) c.user.avatar = avatars.get(c.user.name) ?? undefined;
+    // avatars: post author first, then commenters in order, capped (skipped for bulk — the
+    // per-author lookups are what throttle Reddit and jam the shared browser page under load).
+    const avatars = new Map<string, string | undefined>();
+    if (!skipAvatars) {
+      const names = [...new Set([p.author, ...comments.map(c => c.user.name)])].filter((n): n is string => !!n && n !== '[deleted]').slice(0, MAX_AVATARS);
+      for (const [n, a] of await Promise.all(names.map(async n => [n, await fetchAvatar(n)] as const))) avatars.set(n, a);
+      for (const c of comments) c.user.avatar = avatars.get(c.user.name) ?? undefined;
+    }
 
     return {
       post: {

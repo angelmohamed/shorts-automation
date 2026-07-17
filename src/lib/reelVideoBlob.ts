@@ -15,6 +15,19 @@ const TOTAL_MAX_BYTES = 768 * 1024 * 1024;
 const cache    = new Map<string, Blob>();              // src URL → Blob (insertion order = LRU)
 const inflight = new Map<string, Promise<Blob | null>>();
 
+// Cap concurrent full-file downloads. Each holds a browser connection for its whole duration, and
+// the browser allows only ~6 per host — so an unbounded burst (e.g. adding many auto-footage reels
+// at once) would saturate the pool and starve the on-screen reel's own video stream. 2 keeps the
+// working reel warming without monopolising connections.
+const MAX_CONCURRENT = 2;
+let active = 0;
+const waiters: Array<() => void> = [];
+function acquire(): Promise<void> {
+  if (active < MAX_CONCURRENT) { active++; return Promise.resolve(); }
+  return new Promise<void>(resolve => waiters.push(() => { active++; resolve(); }));
+}
+function release(): void { active--; waiters.shift()?.(); }
+
 /** Synchronous: the cached Blob if `src` has already been fully downloaded, else undefined. */
 export function getCachedBlob(src: string): Blob | undefined {
   const hit = cache.get(src);
@@ -30,6 +43,7 @@ export function getVideoBlob(src: string): Promise<Blob | null> {
   if (inf) return inf;
 
   const p = (async () => {
+    await acquire();   // wait for a download slot (bounded concurrency, see MAX_CONCURRENT)
     // IDLE (stall) timeout, not a total one: abort only if NO bytes arrive for IDLE_MS. This keeps a long
     // but steadily-downloading video alive (the timer resets on every chunk) while still recovering from a
     // genuinely stalled stream — which otherwise hangs forever, stays pinned in `inflight`, and makes every
@@ -70,6 +84,7 @@ export function getVideoBlob(src: string): Promise<Blob | null> {
     } finally {
       if (idle) clearTimeout(idle);
       inflight.delete(src);
+      release();
     }
   })();
 

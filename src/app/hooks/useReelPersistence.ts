@@ -109,6 +109,61 @@ function normalizeReel(r: unknown): SavedReel | null {
     posterUrl: typeof o.posterUrl === 'string' ? o.posterUrl : '',
     caption: typeof o.caption === 'string' ? o.caption : '',
     templateId: typeof o.templateId === 'string' ? o.templateId : null,
-    framing: (o.framing && typeof o.framing === 'object' ? o.framing : {}) as Framing,
+    framing: normalizeFraming(o.framing),
   };
+}
+
+// Coerce a persisted `framing` blob into a shape the draw loop / effects can consume without throwing.
+// The reel row itself is validated (normalizeReel), but framing was previously cast through with only a
+// `typeof === 'object'` check — so a legacy/corrupt blob could feed a non-array `overlays`/`reveals`/
+// `ocrLines` into `.map`, a NaN `musicVolume` into `<audio>.volume` (RangeError), or a wrong-typed
+// `redditThread` into the flyout. This drops/repairs each internal so restore is total for any shape.
+// Recognised fields are copied through unchanged when valid — a well-formed framing round-trips intact.
+function num(v: unknown): number | undefined { return typeof v === 'number' && Number.isFinite(v) ? v : undefined; }
+function normalizeFraming(f: unknown): Framing {
+  if (!f || typeof f !== 'object') return {};
+  const o = f as Record<string, unknown>;
+  const out: Framing = {};
+  if (o.box && typeof o.box === 'object') out.box = o.box as Framing['box'];
+  if (o.videoOffset && typeof o.videoOffset === 'object') out.videoOffset = o.videoOffset as Framing['videoOffset'];
+  const vs = num(o.videoScale); if (vs !== undefined) out.videoScale = vs;
+  const ts = num(o.trimStart);  if (ts !== undefined) out.trimStart = ts;
+  const te = num(o.trimEnd);    if (te !== undefined) out.trimEnd = te;
+  if (typeof o.includeEdit === 'boolean') out.includeEdit = o.includeEdit;
+  if (Array.isArray(o.segments)) {
+    out.segments = (o.segments as unknown[]).filter((s): s is { start: number; end: number } =>
+      !!s && typeof s === 'object' && Number.isFinite((s as { start?: unknown }).start) && Number.isFinite((s as { end?: unknown }).end));
+  }
+  if (Array.isArray(o.overlays)) {
+    out.overlays = (o.overlays as unknown[])
+      .filter((ov): ov is Record<string, unknown> => !!ov && typeof ov === 'object')
+      .map(ov => {
+        const n: Record<string, unknown> = { ...ov };   // keep id/name/geometry/audio fields as-is
+        // Only the array-typed internals the draw loop / narration iterate are sanitised, so a
+        // non-array (or array-with-holes) can never reach `.map`/index access at draw time.
+        n.reveals = Array.isArray(ov.reveals)
+          ? (ov.reveals as unknown[]).filter((r): r is { t: number; h: number } =>
+              !!r && typeof r === 'object' && Number.isFinite((r as { t?: unknown }).t) && Number.isFinite((r as { h?: unknown }).h))
+          : undefined;
+        n.ocrLines    = Array.isArray(ov.ocrLines)    ? (ov.ocrLines as unknown[]).filter(l => !!l && typeof l === 'object') : undefined;
+        n.blockAuthors= Array.isArray(ov.blockAuthors)? (ov.blockAuthors as unknown[]).filter(a => typeof a === 'string')     : undefined;
+        n.audioTakes  = Array.isArray(ov.audioTakes)  ? (ov.audioTakes as unknown[]).filter(t => !!t && typeof t === 'object'): undefined;
+        return n;
+      }) as Framing['overlays'];
+  }
+  if (typeof o.musicId === 'string') out.musicId = o.musicId;
+  const mv = num(o.musicVolume); if (mv !== undefined) out.musicVolume = Math.min(1, Math.max(0, mv));
+  if (typeof o.ytTitle === 'string') out.ytTitle = o.ytTitle;
+  if (typeof o.description === 'string') out.description = o.description;
+  if (o.redditThread && typeof o.redditThread === 'object') {
+    const rt = o.redditThread as Record<string, unknown>;
+    if (typeof rt.url === 'string') {
+      out.redditThread = {
+        url: rt.url,
+        comments: Array.isArray(rt.comments) ? (rt.comments as unknown[]).filter((n): n is number => Number.isFinite(n)) : undefined,
+        paras:    Array.isArray(rt.paras)    ? (rt.paras as unknown[]).filter((n): n is number => Number.isFinite(n))    : undefined,
+      };
+    }
+  }
+  return out;
 }

@@ -81,6 +81,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
   // ── Image overlays — layers drawn on top of the video, visible inside their [start,end] window ──
   const [overlays, setOverlays] = useState<ImageOverlay[]>([]);
   const overlaysRef = useRef<ImageOverlay[]>([]);
+  const overlaysSeededRef = useRef(false);   // overlays restored from initialFraming exactly once (mount-seed OR applyFraming)
   const overlayImgsRef = useRef<Map<string, HTMLImageElement>>(new Map());   // id → decoded image
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
 
@@ -94,13 +95,17 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
 
   // ── Hooks ────────────────────────────────────────────────────────────────────
 
+  // Latches the src whose saved framing has been restored (set by the restore effect below). Declared
+  // above useVideoLoading so the metadata handler can tell "already restored" from "fresh reel" and NOT
+  // reset the user's crop/pan/trim when a deferred clip finally loads (on play). See H1 regression fix.
+  const framingAppliedSrcRef = useRef<string | null>(null);
   const {
     isVideoLoading, videoError, setVideoError,
     videoDuration, trimStart, trimEnd, setTrimStart, setTrimEnd,
     currentTime, setCurrentTime, trimStartRef, trimEndRef, swapToLocalBlob,
   } = useVideoLoading({
     videoRef, videoSrc, brand, rowNumber, videoId, videoTargetW, videoBandHeight, cellMode,
-    boxRef, setBox, videoOffsetRef, videoScaleRef, setVideoScale, onVideoError, blobSwapRef,
+    boxRef, setBox, videoOffsetRef, videoScaleRef, setVideoScale, onVideoError, blobSwapRef, framingAppliedSrcRef,
   });
 
   // Video zoom is controlled ONLY by the Adjust flyout's Zoom slider (TikTokCanvasRef.setZoom). The old
@@ -134,7 +139,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
           const src = URL.createObjectURL(hit.blob);
           if (!overlaysRef.current.some(x => x.id === o.id && !x.src)) { URL.revokeObjectURL(src); return; }
           commitOverlays(overlaysRef.current.map(x => (x.id === o.id && !x.src ? { ...x, src } : x)), { silent: true });
-        });
+        }).catch(() => {});
       }
       if (o.audioId && !o.audioSrc) {
         const audioId = o.audioId;
@@ -143,7 +148,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
           const audioSrc = URL.createObjectURL(hit.blob);
           if (!overlaysRef.current.some(x => x.id === o.id && !x.audioSrc)) { URL.revokeObjectURL(audioSrc); return; }
           commitOverlays(overlaysRef.current.map(x => (x.id === o.id && !x.audioSrc ? { ...x, audioSrc } : x)), { silent: true });
-        });
+        }).catch(() => {});
       }
     }
   }, [overlays, commitOverlays]);
@@ -208,6 +213,13 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
   useEffect(() => () => {
     for (const el of overlayAudioElsRef.current.values()) { el.pause(); el.removeAttribute('src'); }
     overlayAudioElsRef.current.clear();
+    // Revoke the overlay object URLs this canvas minted (image + narration WAV) so cycling selection
+    // through many reels (batch narration) doesn't pin tens of MB of blobs until reload. The underlying
+    // blobs live in IndexedDB and re-mint fresh URLs on the next mount — so do NOT delete them here.
+    for (const o of overlaysRef.current) {
+      if (o.src) URL.revokeObjectURL(o.src);
+      if (o.audioSrc) URL.revokeObjectURL(o.audioSrc);
+    }
   }, []);
 
   // Background music: a quiet loop under playback (position-agnostic ambience — no seek sync).
@@ -372,15 +384,31 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
     timelineSegmentsRef.current = Array.isArray(f.segments) && f.segments.length
       ? f.segments.map(s => ({ start: s.start, end: s.end }))
       : null;
-    if (Array.isArray(f.overlays)) {
+    // Overlays are seeded once — usually by the mount effect below (which runs BEFORE the video loads, so
+    // batch narration can reach the card image immediately). Guarded so this late apply (fired after the
+    // video finally loads) can't re-commit the saved overlays and WIPE a narration generated in between.
+    if (Array.isArray(f.overlays) && !overlaysSeededRef.current) {
+      overlaysSeededRef.current = true;
       commitOverlays(f.overlays.map(o => ({ ...o })), { silent: true });   // src re-hydrates from IndexedDB
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Seed overlays from saved framing on mount, INDEPENDENT of video readiness: narration reads only the
+  // card image (re-hydrated from IndexedDB via overlay.src) + ocrLines, never the background video — so a
+  // slow/large clip must not gate (or falsely fail) narration. Runs once; the guarded apply above is then
+  // a no-op for overlays. A reel whose initialFraming gains overlays later still seeds on that change.
+  useEffect(() => {
+    if (overlaysSeededRef.current) return;
+    const ov = initialFraming?.overlays;
+    if (!Array.isArray(ov) || ov.length === 0) return;
+    overlaysSeededRef.current = true;
+    commitOverlays(ov.map(o => ({ ...o })), { silent: true });
+  }, [initialFraming, commitOverlays]);
+
   // useVideoLoading resets framing whenever a video (re)loads. So restore a saved reel's framing only
-  // AFTER loading finishes, once per source — otherwise the reset would clobber it.
-  const framingAppliedSrcRef = useRef<string | null>(null);
+  // AFTER loading finishes, once per source — otherwise the reset would clobber it. (framingAppliedSrcRef
+  // is declared above, next to the useVideoLoading call, so the metadata handler can read it.)
   // Current source + saved-framing prop, readable from getFraming() without a stale imperative closure.
   const videoSrcRef = useRef(videoSrc); videoSrcRef.current = videoSrc;
   const initialFramingRef = useRef(initialFraming); initialFramingRef.current = initialFraming;
@@ -405,7 +433,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
     startDownload: () => (!isRecording ? startRecording().then(() => undefined) : Promise.resolve()),
     exportBlob: async () => (!isRecording ? ((await startRecording({ returnBlob: true })) ?? null) : null),
     cancelExport: cancelRecording,
-    play: () => { const v = videoRef.current; if (v) v.play(); },
+    play: () => { const v = videoRef.current; if (v) v.play()?.catch(() => {}); },
     pause: () => { const v = videoRef.current; if (v) v.pause(); },
     // Coalesce rapid scrub seeks: only one seek in flight, always re-target to the
     // latest position when it completes (drops intermediate targets) — see onSeeked.
@@ -476,6 +504,11 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
     removeOverlay: removeOverlayFn,
     getOverlays: () => overlaysRef.current,
     setOverlayNarration: (id, n) => {
+      // Regenerating over an existing narration: release the old WAV url + its IndexedDB blob that this
+      // replaces (mirrors clearOverlayNarration), so repeated regenerates don't leak URLs / orphan blobs.
+      const prevOv = overlaysRef.current.find(x => x.id === id);
+      if (prevOv?.audioSrc && prevOv.audioSrc !== n.audioSrc) URL.revokeObjectURL(prevOv.audioSrc);
+      if (prevOv?.audioId && prevOv.audioId !== n.audioId) void deleteOverlayImage(prevOv.audioId);
       commitOverlays(overlaysRef.current.map(x => (x.id === id ? {
         ...x,
         reveals: n.reveals,
@@ -822,7 +855,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
   function togglePlay() {
     const v = videoRef.current;
     if (!v) return;
-    if (v.paused) { v.play(); setIsPlaying(true); }
+    if (v.paused) { v.play()?.catch(() => {}); setIsPlaying(true); }
     else { v.pause(); setIsPlaying(false); }
   }
 
@@ -918,7 +951,12 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
       <video
         ref={videoRef}
         crossOrigin="anonymous"
-        preload="auto"
+        // Defer ONLY remote clips (footage/links): preload="none" so building/narrating/copying never
+        // downloads the ~100MB footage — the draw loop guards on readyState>=2 (black until loaded),
+        // narration reads the card overlay, and export fetches the bytes + reads dimensions from the demux
+        // itself. Local uploads (blob:/data:) are free to read, so preload="metadata" gives them a real
+        // first-frame preview (no black editing surface). The remote clip is fetched in full only at export.
+        preload={/^(blob:|data:)/.test(videoSrc || '') ? 'metadata' : 'none'}
         loop playsInline
         onPlay={() => {
           setIsPlaying(true);

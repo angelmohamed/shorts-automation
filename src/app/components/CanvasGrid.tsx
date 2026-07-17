@@ -50,6 +50,7 @@ interface CanvasGridProps {
   canvasRefsMap: MutableRefObject<Map<string, TikTokCanvasRef>>;
   brand: BrandProps;
   onAddRow: (initialUrl?: string) => void;
+  onAddReels?: (urls: (string | undefined)[]) => string[];
   onRemoveRow: (id: string) => void;
   onDuplicateRow: (id: string) => string | null;   // inserts a copy, returns the new id (null if at the reel cap)
   onDeleteAllReels?: () => void;                    // reset the grid to one empty reel + GC stored media
@@ -614,6 +615,16 @@ const DISABLED_VOICES = [
 const DISABLED_VOICE_IDS = new Set(DISABLED_VOICES.map(v => v.id));
 const DEFAULT_VOICE = 'TX3LPaxmHKxFdv7VOQHJ';   // ElevenLabs "Liam" — energetic social-media narrator, premade so free-tier keys can use it
 
+// Fit a rendered Reddit card into the 1080x1920 frame (whole card visible pre-narration) and cast
+// its lines. Shared by the single-add path and the bulk builder.
+function redditOverlayLayout(lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) {
+  const blockVoice = castRedditVoices(blockAuthors);
+  const ocrLines = lines.map(l => ({ ...l, enabled: true, voiceId: blockVoice[l.blockIdx] }));
+  const w = Math.round(Math.min(0.8 * 1080, 1632 * (dims.w / dims.h)));
+  const h = Math.round(w * (dims.h / dims.w));
+  return { ocrLines, rect: { w, h, x: Math.round((1080 - w) / 2), y: Math.round((1920 - h) / 2) } };
+}
+
 // Cast a voice per narration block (indexed like blockAuthors / MemeLine.blockIdx). Fresh shuffle
 // each call. Post + OP replies read as Mark; other commenters draw from the shuffled pool with the
 // guarantee that no two consecutive blocks by DIFFERENT speakers share a voice (same speaker in a
@@ -979,6 +990,346 @@ function useReelEditHistory(
   return { recordEdit, undo, redo, canUndo: flags.canUndo, canRedo: flags.canRedo };
 }
 
+// ── Bulk builder ──────────────────────────────────────────────────────────────
+// Paste many Reddit thread links, import them all, tick comments/paragraphs per thread on one page,
+// then build a reel per thread (random footage + card). Keeps the human step (choosing comments)
+// while automating the rest.
+interface BulkThread {
+  url: string;
+  post: ImportedRedditPost;
+  comments: ImportedRedditComment[];
+  paragraphs: string[];
+  selectedComments: Set<number>;
+  selectedParas: Set<number>;
+}
+
+function BulkBuilder({ open, onClose, onBuild }: {
+  open: boolean;
+  onClose: () => void;
+  onBuild: (threads: Array<{ url: string; post: ImportedRedditPost; comments: ImportedRedditComment[]; selectedComments: number[]; selectedParas: number[] }>) => Promise<void>;
+}) {
+  const [linksText, setLinksText] = useState('');
+  const [threads, setThreads] = useState<BulkThread[]>([]);
+  const [phase, setPhase] = useState<'input' | 'importing' | 'select' | 'building'>('input');
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [error, setError] = useState('');
+  const [activeThread, setActiveThread] = useState(0);              // which thread's tab is open
+  const [visible, setVisible] = useState<Record<number, number>>({}); // per-thread # of comment groups shown (load-more)
+  const [addOpen, setAddOpen] = useState(false);                   // "add more threads" input visible (select phase)
+  const [addText, setAddText] = useState('');
+  const [adding, setAdding] = useState(false);                     // importing appended threads
+  const [reading, setReading] = useState<{ kind: 'c' | 'p'; idx: number } | null>(null);  // comment/para shown full-text in the reading pane
+  const COMMENTS_PER_PAGE = 8;
+  // Reset the reading pane when the active thread changes, so a stale index from another thread never shows.
+  useEffect(() => { setReading(null); }, [activeThread]);
+
+  // Import pasted links. append=false replaces the grid (initial import); append=true keeps the existing
+  // threads and adds the new ones (dedup by URL) so more threads can be pulled in after the first fetch.
+  async function runImport(rawText: string, append: boolean) {
+    // Dedup on a canonical thread key (mirrors the server's resolveThreadId) so www / trailing-slash /
+    // ?utm_source variants of the same thread don't import twice (and build duplicate reels). The raw URL
+    // is still what gets imported — only the dedup key is canonical.
+    const canonKey = (u: string): string => {
+      try {
+        const url = new URL(u);
+        const host = url.hostname.replace(/^(www|old|new|np)\./, '');
+        const parts = url.pathname.split('/').filter(Boolean);
+        const ci = parts.indexOf('comments');
+        if (ci >= 0 && parts[ci + 1]) return parts[ci + 1].toLowerCase();
+        if (host === 'redd.it') return (parts[0] ?? u).toLowerCase();
+        return (host + url.pathname.replace(/\/$/, '')).toLowerCase();
+      } catch { return u.trim().toLowerCase(); }
+    };
+    const have = new Set(threads.map(t => canonKey(t.url)));
+    const seen = new Set<string>();
+    const urls = rawText.split(/\s+/).map(u => u.trim()).filter(u => /reddit\.com|redd\.it/.test(u))
+      .filter(u => { const k = canonKey(u); if (seen.has(k) || (append && have.has(k))) return false; seen.add(k); return true; });
+    if (!urls.length) { setError(append ? 'No new links to add (already imported, or none pasted).' : 'Paste at least one Reddit thread link.'); return; }
+    setError('');
+    setProgress({ done: 0, total: urls.length });
+    if (append) setAdding(true); else setPhase('importing');
+    // Native transport (skipping avatars) is fast AND carries the real comment tree incl. one reply
+    // per comment; the avatar storm was the only thing that made it block, so skipAvatars keeps it
+    // snappy. The route falls back to Apify automatically if native fails. Import a few at a time.
+    const importOne = async (url: string): Promise<BulkThread | null> => {
+      try {
+        const res = await fetch('/api/reddit', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, skipAvatars: true }), signal: AbortSignal.timeout(180_000),
+        });
+        const json = await res.json();
+        if (res.ok && json.post) {
+          // Keep the full tree (top-level + replies) so the picker can group each comment with its reply.
+          return { url, post: json.post, comments: json.comments ?? [], paragraphs: splitParagraphs(json.post.body), selectedComments: new Set(), selectedParas: new Set() };
+        }
+      } catch { /* skip a failed thread */ }
+      return null;
+    };
+    const CONCURRENCY = 3;
+    const results: (BulkThread | null)[] = new Array(urls.length).fill(null);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, urls.length) }, async () => {
+      for (let i = next++; i < urls.length; i = next++) {
+        results[i] = await importOne(urls[i]);
+        setProgress(p => ({ ...p, done: p.done + 1 }));
+      }
+    }));
+    const out = results.filter((t): t is BulkThread => !!t);
+    if (append) {
+      setAdding(false);
+      if (!out.length) { setError('None of those links could be added.'); return; }
+      const firstNew = threads.length;
+      setThreads(prev => [...prev, ...out]);
+      setActiveThread(firstNew);   // jump to the first newly-added thread
+      setAddText(''); setAddOpen(false);
+    } else if (out.length) {
+      setThreads(out);
+      setActiveThread(0);
+      setVisible({});
+      setPhase('select');
+    } else {
+      // Every link failed — return to the paste screen (phase is 'importing' right now) so the textarea +
+      // "Import all" stay visible with the error, instead of stranding the user on a blank select screen.
+      setPhase('input');
+      setError('None of those links could be imported.');
+    }
+  }
+
+  // Discard everything and return to the paste screen (persistence keeps state across close, so this is
+  // the explicit way to start a fresh batch).
+  function reset() {
+    setThreads([]); setLinksText(''); setPhase('input');
+    setActiveThread(0); setVisible({}); setError(''); setAddOpen(false); setAddText('');
+  }
+
+  const toggle = (ti: number, kind: 'c' | 'p', idx: number) => setThreads(prev => prev.map((t, i) => {
+    if (i !== ti) return t;
+    const set = new Set(kind === 'c' ? t.selectedComments : t.selectedParas);
+    if (set.has(idx)) set.delete(idx); else set.add(idx);
+    return kind === 'c' ? { ...t, selectedComments: set } : { ...t, selectedParas: set };
+  }));
+
+  const ready = threads.filter(t => t.selectedComments.size + t.selectedParas.size > 0);
+
+  async function build() {
+    if (!ready.length) return;
+    setPhase('building'); setError('');
+    try {
+      await onBuild(ready.map(t => ({ url: t.url, post: t.post, comments: t.comments, selectedComments: [...t.selectedComments], selectedParas: [...t.selectedParas] })));
+      // Keep the imported threads (persistence) but clear their selections so reopening the panel can't
+      // accidentally rebuild the same reels; drop back to 'select' so it's not stuck on "Building…".
+      setThreads(prev => prev.map(t => ({ ...t, selectedComments: new Set(), selectedParas: new Set() })));
+      setPhase('select');
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Build failed.');
+      setPhase('select');
+    }
+  }
+
+  // Stay mounted while closed (parent always renders us) so the pasted links, imported threads, and
+  // selections survive closing and reopening the panel — just render nothing until reopened.
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-modal flex items-center justify-center bg-black/50 p-4" onPointerDown={onClose}>
+      <div className="flex flex-col w-full max-w-6xl max-h-[85vh] rounded-2xl bg-surface-1 border border-line-strong shadow-3" onPointerDown={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-4 py-3 border-b border-line shrink-0">
+          <span className="text-subheading font-semibold text-fg">Bulk build reels from Reddit threads</span>
+          <IconButton icon={<CloseIcon size={14} />} label="Close" variant="secondary" onClick={onClose} />
+        </div>
+
+        {phase === 'input' && (
+          <div className="flex flex-col gap-2 p-4">
+            <span className="text-caption text-fg-3">Paste Reddit thread links — one per line.</span>
+            <textarea
+              value={linksText}
+              onChange={e => setLinksText(e.target.value)}
+              rows={8}
+              placeholder={'https://www.reddit.com/r/AskReddit/comments/…\nhttps://www.reddit.com/r/…'}
+              className="w-full rounded-md border border-line-strong bg-transparent p-2 text-body text-fg placeholder:text-fg-3 outline-none resize-y"
+            />
+            <Button variant="primary" size="sm" onClick={() => void runImport(linksText, false)} disabled={!linksText.trim()}>Import all</Button>
+            {error && <span className="text-caption text-danger-text">{error}</span>}
+          </div>
+        )}
+
+        {phase === 'importing' && (
+          <div className="p-6 text-center text-body text-fg-2">Importing threads… {progress.done}/{progress.total}</div>
+        )}
+
+        {(phase === 'select' || phase === 'building') && (
+          <>
+            {/* Thread tabs: one per imported thread (badge = items ticked in it), plus a "+ Add threads"
+                tab that reveals an inline paste box to import & append more threads mid-session. */}
+            {threads.length >= 1 && (
+              <div className="shrink-0 border-b border-line">
+                <div className="flex gap-1 px-3 pt-2 pb-2 overflow-x-auto">
+                  {threads.map((t, ti) => {
+                    const picks = t.selectedComments.size + t.selectedParas.size;
+                    return (
+                      <button key={ti} type="button" onClick={() => setActiveThread(ti)}
+                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-caption whitespace-nowrap shrink-0 ${ti === activeThread ? 'bg-active text-fg font-medium' : 'text-fg-3 hover:bg-hover'}`}>
+                        <span className="opacity-60">{ti + 1}</span>
+                        <span className="max-w-[150px] truncate">{t.post.title}</span>
+                        {picks > 0 && <span className="flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-action text-action-fg text-[10px] leading-none">{picks}</span>}
+                      </button>
+                    );
+                  })}
+                  <button type="button" onClick={() => setAddOpen(o => !o)}
+                    className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-caption whitespace-nowrap shrink-0 border border-dashed ${addOpen ? 'border-action text-fg' : 'border-line-strong text-fg-3 hover:bg-hover'}`}>
+                    + Add threads
+                  </button>
+                </div>
+                {addOpen && (
+                  <div className="flex flex-col gap-2 px-3 pb-3">
+                    <textarea value={addText} onChange={e => setAddText(e.target.value)} rows={2}
+                      placeholder={'Paste more Reddit thread links to add to this batch…'}
+                      className="w-full rounded-md border border-line-strong bg-transparent p-2 text-caption text-fg placeholder:text-fg-3 outline-none resize-y" />
+                    <div className="flex items-center gap-2">
+                      <Button variant="primary" size="sm" loading={adding} disabled={!addText.trim()} onClick={() => void runImport(addText, true)}>
+                        {adding ? `Adding… ${progress.done}/${progress.total}` : 'Import & add'}
+                      </Button>
+                      <Button variant="secondary" size="sm" onClick={() => { setAddOpen(false); setAddText(''); }}>Cancel</Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex-1 min-h-0 flex">
+              {/* LEFT — comment list. Rows stay tick-to-select; hovering/focusing (or clicking) a row also
+                  streams its full text into the reading pane on the right. Bodies clamp to 2 lines here. */}
+              <div className="w-2/5 min-h-0 overflow-y-auto px-3 py-2 flex flex-col gap-1 border-r border-line">
+                {(() => {
+                  const t = threads[activeThread];
+                  if (!t) return null;
+                  // Group comments so each top-level comment shows AT MOST one reply (the first). The
+                  // importer usually returns top-level comments only (no reply chains), in which case
+                  // every comment is its own group; when replies ARE present (depth > 0) they nest here.
+                  type Row = { c: ImportedRedditComment; idx: number };
+                  const groups: { top: Row; reply: Row | null }[] = [];
+                  t.comments.forEach((c, idx) => {
+                    if ((c.depth ?? 0) === 0) groups.push({ top: { c, idx }, reply: null });
+                    else {
+                      const last = groups[groups.length - 1];
+                      if (last) { if (!last.reply) last.reply = { c, idx }; /* extra replies hidden */ }
+                      else groups.push({ top: { c, idx }, reply: null });   // orphan reply → treat as top-level
+                    }
+                  });
+                  const shown = visible[activeThread] ?? COMMENTS_PER_PAGE;
+                  const remaining = groups.length - shown;
+                  const isReading = (kind: 'c' | 'p', idx: number) => reading?.kind === kind && reading.idx === idx;
+
+                  const commentRow = (c: ImportedRedditComment, idx: number, isReply: boolean) => (
+                    <button key={`c${idx}`} type="button"
+                      onClick={() => { toggle(activeThread, 'c', idx); setReading({ kind: 'c', idx }); }}
+                      onMouseEnter={() => setReading({ kind: 'c', idx })} onFocus={() => setReading({ kind: 'c', idx })}
+                      className={`flex items-start gap-2 px-1.5 py-1 rounded-sm text-left w-full ${isReply ? 'ml-5' : ''} ${t.selectedComments.has(idx) ? 'bg-active' : isReading('c', idx) ? 'bg-hover' : 'hover:bg-hover'}`}>
+                      <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${t.selectedComments.has(idx) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'}`}><CheckIcon size={9} /></span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-caption text-fg truncate">
+                          {isReply && <span aria-hidden className="text-fg-3 mr-1">↳</span>}
+                          {c.user.name}{c.isOP ? ' · OP' : ''}{isReply ? ' · reply' : ''}
+                        </span>
+                        <span className="text-caption text-fg-3 line-clamp-2">{c.body}</span>
+                      </span>
+                    </button>
+                  );
+
+                  return (
+                    <>
+                      <div className="text-caption text-fg font-medium leading-snug pb-1">
+                        {t.post.user.name} · {t.post.title}
+                      </div>
+                      {t.paragraphs.map((p, pi) => (
+                        <button key={`p${pi}`} type="button"
+                          onClick={() => { toggle(activeThread, 'p', pi); setReading({ kind: 'p', idx: pi }); }}
+                          onMouseEnter={() => setReading({ kind: 'p', idx: pi })} onFocus={() => setReading({ kind: 'p', idx: pi })}
+                          className={`flex items-start gap-2 px-1.5 py-1 rounded-sm text-left ${t.selectedParas.has(pi) ? 'bg-active' : isReading('p', pi) ? 'bg-hover' : 'hover:bg-hover'}`}>
+                          <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${t.selectedParas.has(pi) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'}`}><CheckIcon size={9} /></span>
+                          <span className="min-w-0 flex-1 text-caption text-fg-3 line-clamp-2">Post: {p}</span>
+                        </button>
+                      ))}
+                      {groups.slice(0, shown).map(g => (
+                        <div key={g.top.idx} className="flex flex-col">
+                          {commentRow(g.top.c, g.top.idx, false)}
+                          {g.reply && commentRow(g.reply.c, g.reply.idx, true)}
+                        </div>
+                      ))}
+                      {remaining > 0 && (
+                        <button type="button" onClick={() => setVisible(v => ({ ...v, [activeThread]: shown + COMMENTS_PER_PAGE }))}
+                          className="mt-1 self-center px-3 py-1.5 rounded-md text-caption text-fg-2 hover:bg-hover border border-line">
+                          Load {Math.min(COMMENTS_PER_PAGE, remaining)} more comment{remaining === 1 ? '' : 's'} · {remaining} left
+                        </button>
+                      )}
+                    </>
+                  );
+                })()}
+              </div>
+
+              {/* RIGHT — reading pane: full text of the hovered/focused (or first) comment, scrolls on its own. */}
+              <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3">
+                {(() => {
+                  const t = threads[activeThread];
+                  if (!t) return null;
+                  const target = reading
+                    ?? (t.comments.length ? { kind: 'c' as const, idx: 0 } : t.paragraphs.length ? { kind: 'p' as const, idx: 0 } : null);
+                  if (!target) return <p className="text-caption text-fg-3">This thread has no comments to read.</p>;
+                  if (target.kind === 'p') {
+                    const p = t.paragraphs[target.idx];
+                    if (p == null) return null;
+                    const selected = t.selectedParas.has(target.idx);
+                    return (
+                      <div className="flex flex-col gap-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-caption text-fg font-medium">Post body</span>
+                          <button type="button" onClick={() => toggle(activeThread, 'p', target.idx)}
+                            className={`shrink-0 px-2.5 py-1 rounded-md text-caption ${selected ? 'bg-action text-action-fg' : 'border border-line-strong text-fg-2 hover:bg-hover'}`}>
+                            {selected ? 'Added ✓' : 'Add to reel'}
+                          </button>
+                        </div>
+                        <p className="text-body text-fg-2 whitespace-pre-wrap break-words leading-relaxed">{p}</p>
+                      </div>
+                    );
+                  }
+                  const c = t.comments[target.idx];
+                  if (!c) return null;
+                  const isReply = (c.depth ?? 0) > 0;
+                  const selected = t.selectedComments.has(target.idx);
+                  return (
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-caption text-fg font-medium min-w-0 truncate">
+                          {isReply && <span aria-hidden className="text-fg-3 mr-1">↳</span>}
+                          {c.user.name}{c.isOP ? ' · OP' : ''}{isReply ? ' · reply' : ''}{c.score ? ` · ${c.score}` : ''}{c.timeAgo ? ` · ${c.timeAgo}` : ''}
+                        </span>
+                        <button type="button" onClick={() => toggle(activeThread, 'c', target.idx)}
+                          className={`shrink-0 px-2.5 py-1 rounded-md text-caption ${selected ? 'bg-action text-action-fg' : 'border border-line-strong text-fg-2 hover:bg-hover'}`}>
+                          {selected ? 'Added ✓' : 'Add to reel'}
+                        </button>
+                      </div>
+                      <p className="text-body text-fg-2 whitespace-pre-wrap break-words leading-relaxed">{c.body}</p>
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 px-4 py-3 border-t border-line shrink-0">
+              <Button variant="primary" size="sm" loading={phase === 'building'} disabled={!ready.length} onClick={() => void build()}>
+                {phase === 'building' ? 'Building…' : `Build ${ready.length} reel${ready.length === 1 ? '' : 's'}`}
+              </Button>
+              <span className="text-caption text-fg-3">Ticked threads become reels with a card + random footage.</span>
+              {error && <span className="text-caption text-danger-text">{error}</span>}
+              <button type="button" onClick={reset} className="ml-auto text-caption text-fg-3 hover:text-fg underline underline-offset-2 shrink-0">Start over</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── CanvasGrid ────────────────────────────────────────────────────────────────
 
 // Remember the last-selected reel template per user so the Reels posting page reopens it instead of
@@ -989,7 +1340,7 @@ const reelSelectionKey = (userId: string) => `de:reeltpl:${userId}`;
 
 export function CanvasGrid({
   entries, setEntries, canvasRefsMap, brand,
-  onAddRow, onRemoveRow, onDuplicateRow, onDeleteAllReels, onHandleVideoError,
+  onAddRow, onAddReels, onRemoveRow, onDuplicateRow, onDeleteAllReels, onHandleVideoError,
   onUpdateEntry, onUpdateLocalVideo,
   onFetchVideo, userId,
   videoMode, onGoToTemplateEditor, viewToggle, active = true, onRestored, restored,
@@ -1051,6 +1402,11 @@ export function CanvasGrid({
   // workspace (where setEntries is provided).
   const { loaded: reelsLoaded, loadError: reelsLoadError, retryLoad: retryReelsLoad, initialRows, saveState: reelSaveState, scheduleSave } = useReelPersistence(setEntries ? userId : null);
   const [framingMap, setFramingMap] = useState<Record<string, Framing>>({});
+  // Live mirror of framingMap for callbacks that run across a chain of setState updates (Run all: the copy
+  // phase writes ytTitle/description, then downloadAllReels — invoked from a closure captured BEFORE that
+  // write — must still read the fresh values for the export filenames + .txt sidecars). Mirrors isDownloadingAllRef.
+  const framingMapRef = useRef(framingMap);
+  useEffect(() => { framingMapRef.current = framingMap; }, [framingMap]);
   // entryId → live image-overlay list, reported by each canvas — feeds the timeline's overlay lane.
   const [overlaysMap, setOverlaysMap] = useState<Record<string, ImageOverlay[]>>({});
   // Narration voice palette (voices[0] = default narrator) + the voice armed as a line-painting
@@ -1164,7 +1520,7 @@ export function CanvasGrid({
           uploadedBlob.current.set(r.id, src);
           setEntries(prev => prev.map(e => (e.id === r.id && !e.localVideoSrc && !e.url.trim()
             ? { ...e, localVideoSrc: src, localVideoName: hit.name } : e)));
-        });
+        }).catch(() => {});
       }
     }
   }, [setEntries, reelsLoaded, initialRows, onRestored, restored]);
@@ -1478,16 +1834,8 @@ export function CanvasGrid({
     await saveOverlayImage(overlayId, blob, 'reddit-card.png');
     const url = URL.createObjectURL(blob);
     ref?.addImageOverlay(overlayId, url, 'Reddit thread');
-    // Auto-cast a fresh random voice per block; blockAuthors is stored on the overlay so the cast
-    // can be reshuffled later (Shuffle voices) without re-importing.
-    const blockVoice = castRedditVoices(blockAuthors);
-    const ocrLines = lines.map(l => ({ ...l, enabled: true, voiceId: blockVoice[l.blockIdx] }));
-    // Pre-narration the whole card must be on screen (voice painting needs every line clickable),
-    // so fit it inside the 1080x1920 frame however long the thread is. Narrating snaps it to the
-    // readable top-anchored layout and the teleprompter scroll takes over.
-    const w = Math.round(Math.min(0.8 * 1080, 1632 * (dims.w / dims.h)));
-    const h = Math.round(w * (dims.h / dims.w));
-    const rect = { w, h, x: Math.round((1080 - w) / 2), y: Math.round((1920 - h) / 2) };
+    // Cast + fit the card (blockAuthors stored so Shuffle voices can re-cast later without re-import).
+    const { ocrLines, rect } = redditOverlayLayout(lines, dims, blockAuthors);
     for (let attempt = 0; attempt < 10; attempt++) {
       await new Promise(r => setTimeout(r, 150));
       canvasRefsMap.current.get(id)?.updateOverlay(overlayId, { ocrLines, blockAuthors, ...rect });
@@ -1674,12 +2022,21 @@ export function CanvasGrid({
   // Post-batch summary when a "download all" didn't produce every reel — otherwise the zip silently
   // omits failed/never-ready reels and the user thinks they got everything.
   const [downloadNotice, setDownloadNotice] = useState<string | null>(null);
+  // Batch generation across every reel — narration (cycles each reel on-screen) or YouTube copy (pure
+  // API). Live progress + a cancel flag, since narrating many reels can take several minutes.
+  const [batchOp, setBatchOp] = useState<null | 'narration' | 'copy'>(null);
+  const [batchProgress, setBatchProgress] = useState({ done: 0, total: 0, status: '' });
+  const [batchNotice, setBatchNotice] = useState<string | null>(null);
+  const batchCancelRef = useRef(false);
   // Shown when an add/duplicate is blocked by the MAX_REELS cap.
   const [reelCapNotice, setReelCapNotice] = useState<string | null>(null);
   const atReelCap = entries.length >= MAX_REELS;
 
-  // "Add reel": with the auto-random toggle on, seed the new reel with a random footage segment
-  // (and pre-warm its blob); otherwise add a blank reel. Manifest load falls back to blank on error.
+  // "Add reel": with the auto-random toggle on, seed the new reel with a random footage segment;
+  // otherwise add a blank reel. Manifest load falls back to blank on error. NOTE: no blob pre-warm
+  // here — firing a full-file download per add saturated the browser's ~6-connection-per-host limit
+  // when several reels were added quickly, starving the on-screen reel's video stream. The selected
+  // reel is pre-warmed instead (one at a time), and the timeline warms itself when opened.
   const handleAddRow = useCallback(async () => {
     if (atReelCap) { setReelCapNotice(`You’ve hit the ${MAX_REELS}-reel limit — remove one to add another.`); return; }
     if (!autoRandomFootage) { onAddRow(); return; }
@@ -1687,11 +2044,47 @@ export function CanvasGrid({
       const segs = await fetchFootageManifest();
       const seg = segs.length ? segs[Math.floor(Math.random() * segs.length)] : null;
       onAddRow(seg?.url);
-      if (seg) void getVideoBlob(proxyStreamUrl(seg.url));
     } catch {
       onAddRow();
     }
   }, [atReelCap, autoRandomFootage, onAddRow]);
+
+  // NOTE: no selected-reel video pre-warm. It existed to warm the timeline's scrub blob, but eagerly
+  // full-downloading each selected reel's ~100MB clip (incl. every reel a batch narration cycles through)
+  // stalled the build/narrate/copy flow. The clip now loads lazily (preload="metadata") and is fetched in
+  // full only at export — see TikTokCanvas <video>. Re-add a size-gated warm here if the timeline returns.
+
+  const [bulkOpen, setBulkOpen] = useState(false);
+
+  // Bulk build: turn a set of imported threads (each with its picked comments/paragraphs) into reels.
+  // Each reel gets random footage + its Reddit card written straight into the saved framing +
+  // IndexedDB — no canvas mount needed, so it scales to many reels at once. The card appears when
+  // the reel is selected (or Download All cycles it); narration stays a per-reel/batch step.
+  const buildReelsFromThreads = useCallback(async (threads: Array<{
+    url: string; post: ImportedRedditPost; comments: ImportedRedditComment[];
+    selectedComments: number[]; selectedParas: number[];
+  }>) => {
+    if (!onAddReels || !threads.length) return;
+    const segs = await fetchFootageManifest().catch(() => [] as FootageSegment[]);
+    const rand = () => (segs.length ? segs[Math.floor(Math.random() * segs.length)].url : undefined);
+    const ids = onAddReels(threads.map(() => rand()));
+    await Promise.all(ids.map(async (reelId, i) => {
+      const t = threads[i];
+      if (!t) return;
+      const data = buildRedditCardData(t.post, t.comments, new Set(t.selectedComments), new Set(t.selectedParas));
+      const card = await renderRedditCard(data);
+      const postAuthor = data.user.name.replace(/^u\//, '');
+      const blockAuthors = [postAuthor, postAuthor, ...data.comments.map(c => c.user.name.replace(/^u\//, ''))];
+      const { ocrLines, rect } = redditOverlayLayout(card.lines, { w: card.width, h: card.height }, blockAuthors);
+      const overlayId = `ov-${Date.now().toString(36)}-${i}-${Math.random().toString(36).slice(2, 6)}`;
+      await saveOverlayImage(overlayId, card.blob, 'reddit-card.png');
+      const overlay: Omit<ImageOverlay, 'src' | 'audioSrc'> = { id: overlayId, name: 'Reddit thread', ...rect, start: 0, end: 3600, ocrLines, blockAuthors };
+      setFramingMap(prev => ({ ...prev, [reelId]: { ...prev[reelId], overlays: [overlay], redditThread: { url: t.url, comments: t.selectedComments, paras: t.selectedParas } } }));
+    }));
+    markFramingDirty();
+    if (ids[0]) setSelectedId(ids[0]);
+  }, [onAddReels, setFramingMap, markFramingDirty]);
+
   // "Delete all reels" confirm. Only offered when there's actually something to clear (more than one
   // reel, or a single reel that isn't blank).
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
@@ -1699,7 +2092,11 @@ export function CanvasGrid({
     || (!!entries[0] && !!(entries[0].url?.trim() || entries[0].videoUrl || entries[0].localVideoSrc || entries[0].caption?.trim()));
   // Any export in flight — every export button disables while one runs, since they share the reel
   // canvases and only one recording can run at a time.
-  const exportBusy = downloadingOne || isDownloadingAll;
+  // Includes batchOp so a batch generate (which cycles selectedId + mutates each canvas) disables every
+  // export/delete control — otherwise a single-reel Download recorded mid-batch yields a broken MP4, and
+  // Delete-all mid-batch wipes the grid while the batch is still writing framing. (At batch entry batchOp
+  // is still null, so this never self-locks the batch functions' own guards.)
+  const exportBusy = downloadingOne || isDownloadingAll || !!batchOp;
 
   // Wait until reel `id`'s canvas has mounted (after the swap fade) and its video is ready enough to export.
   const waitForReelReady = useCallback(async (id: string, timeoutMs = 15000): Promise<TikTokCanvasRef | null> => {
@@ -1707,8 +2104,23 @@ export function CanvasGrid({
     while (Date.now() - start < timeoutMs) {
       const ref = canvasRefsMap.current.get(id);
       const video = ref?.getVideoElement();
-      if (ref && video && video.readyState >= 2) return ref;
+      // Export-ready = the canvas is mounted and its <video> has a src. The element is preload="none" so it
+      // never loads on its own (readyState stays 0); export fetches the file bytes + reads dimensions from
+      // the demux itself, so it doesn't need the element loaded — only its src (the URL) resolved.
+      if (ref && video && (video.src || video.currentSrc)) return ref;
       await new Promise(r => setTimeout(r, 80));
+    }
+    return canvasRefsMap.current.get(id) ?? null;
+  }, [canvasRefsMap]);
+
+  // Wait until reel `id`'s canvas has mounted AND its overlay `overlayId` has re-hydrated its image blob
+  // (object URL) from IndexedDB — narration reads the overlay's pixels, so it can't run before then.
+  const waitForOverlay = useCallback(async (id: string, overlayId: string, timeoutMs = 15000): Promise<TikTokCanvasRef | null> => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const ref = canvasRefsMap.current.get(id);
+      if (ref && ref.getOverlays().find(o => o.id === overlayId)?.src) return ref;
+      await new Promise(r => setTimeout(r, 100));
     }
     return canvasRefsMap.current.get(id) ?? null;
   }, [canvasRefsMap]);
@@ -1759,7 +2171,7 @@ export function CanvasGrid({
             if (blob) {
               const reelNo = entries.findIndex(x => x.id === entry.id) + 1;
               // Name from the generated YouTube title if present, else the caption.
-              const rawName = framingMap[entry.id]?.ytTitle || entry.caption || '';
+              const rawName = framingMapRef.current[entry.id]?.ytTitle || entry.caption || '';
               const cap = rawName.replace(/[/\\:*?"<>|\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
               const stem = `${String(reelNo).padStart(2, '0')}_${cap || 'reel'}`;
               // Numbering is unique by construction, but a filename map silently drops an entry on a key
@@ -1768,8 +2180,8 @@ export function CanvasGrid({
               for (let n = 2; files[`${folder}/${name}`]; n++) name = `${stem}_${n}.mp4`;
               files[`${folder}/${name}`] = new Uint8Array(await blob.arrayBuffer());
               // Paired text file: the generated YouTube title + description if present, else blank.
-              const ytTitle = framingMap[entry.id]?.ytTitle ?? '';
-              const ytDesc = framingMap[entry.id]?.description ?? '';
+              const ytTitle = framingMapRef.current[entry.id]?.ytTitle ?? '';
+              const ytDesc = framingMapRef.current[entry.id]?.description ?? '';
               const txt = (ytTitle || ytDesc) ? `${ytTitle}\n\n${ytDesc}`.trim() + '\n' : '';
               files[`${folder}/${name.replace(/\.mp4$/, '.txt')}`] = new TextEncoder().encode(txt);
             } else { omitted++; }   // exportBlob returned null → nothing rendered
@@ -1801,6 +2213,161 @@ export function CanvasGrid({
       setIsDownloadingAll(false);
     }
   }, [isDownloadingAll, downloadingOne, entries, selectedId, canvasRefsMap, waitForReelReady, exportGuard]);
+
+  // ── Batch generate (narration / YouTube copy for every reel) ─────────────────────────────────────
+  // Narrate every un-narrated Reddit reel. Narration needs the reel's canvas mounted (it reads the card
+  // pixels + ocrLines off the ref), so — like Download All — we flip each reel on-screen, wait for its
+  // overlay image to hydrate, generate, then snapshot the result into framingMap so it survives cycling
+  // away and reload. Serial (ElevenLabs is the bottleneck) with live per-reel status and cancel.
+  const batchGenerateNarration = useCallback(async () => {
+    if (batchOp || exportBusy) return;
+    // Client key is optional: /api/tts falls back to the server's ELEVENLABS_API_KEY. If neither exists,
+    // generateNarration surfaces a clear per-reel error and the run reports how many failed.
+    let apiKey = '';
+    try { apiKey = (localStorage.getItem(LS_11L_KEY) ?? '').trim(); } catch { /* ignore */ }
+    const targets = entries.flatMap(e => {
+      const ov = framingMap[e.id]?.overlays?.find(o => o.name === 'Reddit thread');
+      if (!ov) return [];
+      // Prefer the LIVE canvas audioId for the mounted reel — framingMap lags a reel the user just narrated
+      // manually and hasn't switched away from, which would otherwise get re-narrated (wasted TTS + orphan blob).
+      const liveAudioId = canvasRefsMap.current.get(e.id)?.getOverlays().find(o => o.id === ov.id)?.audioId;
+      return (liveAudioId ?? ov.audioId) ? [] : [{ id: e.id, overlayId: ov.id }];
+    });
+    if (!targets.length) { setBatchNotice('No un-narrated Reddit reels found (build some in Bulk build, or they’re already narrated).'); return; }
+    const original = selectedId;
+    batchCancelRef.current = false;
+    setBatchNotice(null); setBatchOp('narration');
+    setBatchProgress({ done: 0, total: targets.length, status: 'Starting…' });
+    let errors = 0;
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        if (batchCancelRef.current) break;
+        const { id, overlayId } = targets[i];
+        setBatchProgress(p => ({ ...p, status: `Reel ${i + 1}/${targets.length}: loading…` }));
+        setSelectedId(id);
+        const ref = await waitForOverlay(id, overlayId);
+        if (!ref || !ref.getOverlays().find(o => o.id === overlayId)?.src) {
+          errors++; setBatchProgress(p => ({ ...p, done: p.done + 1 })); continue;
+        }
+        const err = await generateNarration(id, overlayId, apiKey, s =>
+          setBatchProgress(p => ({ ...p, status: `Reel ${i + 1}/${targets.length}: ${s}` })));
+        if (err) { errors++; console.error('[batch narration]', id, err); }
+        else {
+          // Snapshot the fresh narration so it persists once we cycle off this reel. getFraming() returns
+          // null while the video is still loading (so it'd silently drop the last reel's narration) —
+          // capture the narrated overlays DIRECTLY instead, stripping the runtime-only object URLs.
+          const ovs = canvasRefsMap.current.get(id)?.getOverlays();
+          if (ovs) setFramingMap(prev => ({ ...prev, [id]: { ...prev[id], overlays: ovs.map(({ src, audioSrc, ...o }) => o) } }));
+        }
+        setBatchProgress(p => ({ ...p, done: p.done + 1 }));
+      }
+    } finally {
+      setSelectedId(original);
+      markFramingDirty();
+      setBatchOp(null);
+      setBatchProgress(p => ({ ...p, status: '' }));
+    }
+    setBatchNotice(batchCancelRef.current ? 'Narration cancelled.'
+      : errors ? `Narration finished — ${errors} reel${errors === 1 ? '' : 's'} failed (open them to retry).`
+      : 'Narration generated for every reel. ✓');
+    return { errors };   // let Run all aggregate the outcome across phases (its own setBatchNotice would else hide this)
+  }, [batchOp, exportBusy, entries, framingMap, selectedId, generateNarration, waitForOverlay, canvasRefsMap, setFramingMap, markFramingDirty]);
+
+  // Generate a YouTube title + description for every Reddit reel that's missing one. Pure API (re-imports
+  // the thread + hits /api/description), so no canvas mount needed — runs a couple in parallel.
+  const batchGenerateCopy = useCallback(async () => {
+    if (batchOp || exportBusy) return;
+    const targets = entries.flatMap(e => {
+      const f = framingMap[e.id];
+      const url = f?.redditThread?.url;
+      const needTitle = !f?.ytTitle, needDesc = !f?.description;
+      // Only regenerate the field(s) actually missing — never clobber a title/description the user already
+      // wrote. When both are missing, only=undefined regenerates both.
+      return url && (needTitle || needDesc)
+        ? [{ id: e.id, url, only: needTitle && needDesc ? undefined : (needTitle ? 'title' as const : 'description' as const) }]
+        : [];
+    });
+    if (!targets.length) { setBatchNotice('No reels need copy — they either have no Reddit thread or already have a title & description.'); return; }
+    batchCancelRef.current = false;
+    setBatchNotice(null); setBatchOp('copy');
+    setBatchProgress({ done: 0, total: targets.length, status: '' });
+    let errors = 0;
+    const CONCURRENCY = 2;
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, targets.length) }, async () => {
+      for (let i = next++; i < targets.length && !batchCancelRef.current; i = next++) {
+        const { id, url, only } = targets[i];
+        // Retry once (with a short backoff) — a transient rate-limit / re-import hiccup under concurrency
+        // shouldn't silently leave a reel without copy.
+        let ok = false;
+        for (let attempt = 0; attempt < 2 && !ok && !batchCancelRef.current; attempt++) {
+          if (attempt > 0) await new Promise(r => setTimeout(r, 1500));
+          try {
+            const imp = await fetch('/api/reddit', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              // skipAvatars: avatars are never read here (only post/comments feed /api/description), and
+              // the per-author lookups jam the shared browser page under concurrency.
+              body: JSON.stringify({ url, skipAvatars: true }), signal: AbortSignal.timeout(240_000),
+            });
+            const impJson = await imp.json();
+            if (!imp.ok) throw new Error(impJson.error ?? 'thread load failed');
+            const res = await fetch('/api/description', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url, thread: { post: impJson.post, comments: impJson.comments ?? [] }, only }),
+              signal: AbortSignal.timeout(90_000),
+            });
+            const json = await res.json();
+            if (!res.ok) throw new Error(json.error ?? 'copy generation failed');
+            setFramingMap(prev => ({
+              ...prev,
+              [id]: {
+                ...prev[id],
+                ...(json.title !== undefined ? { ytTitle: json.title } : {}),
+                ...(json.description !== undefined ? { description: json.description } : {}),
+              },
+            }));
+            ok = true;
+          } catch (e) { if (attempt === 1) { errors++; console.error('[batch copy]', e); } }
+        }
+        setBatchProgress(p => ({ ...p, done: p.done + 1 }));
+      }
+    }));
+    markFramingDirty();
+    setBatchOp(null);
+    setBatchNotice(batchCancelRef.current ? 'Copy generation cancelled.'
+      : errors ? `Copy finished — ${errors} reel${errors === 1 ? '' : 's'} failed.`
+      : 'Title & description generated for every reel. ✓');
+    return { errors };
+  }, [batchOp, exportBusy, entries, framingMap, setFramingMap, markFramingDirty]);
+
+  // ── Run all: narrate every reel → write copy for every reel → download all, in one click ─────────
+  // Continue-through-failures: each phase reports its own progress + count of failures (narration/copy
+  // notices, Download-All's "N couldn't be rendered"), so a couple of bad reels never abort the batch.
+  // Cancellable during the narrate/copy phases (the Cancel link sets batchCancelRef); once the export
+  // phase starts it runs to completion. runningAll gates the individual batch buttons but is deliberately
+  // NOT folded into exportBusy — the sub-functions guard on exportBusy and would otherwise self-block.
+  const [runningAll, setRunningAll] = useState(false);
+  const runAll = useCallback(async () => {
+    if (runningAll || batchOp || exportBusy) return;
+    setRunningAll(true);
+    batchCancelRef.current = false;   // clear any STALE cancel from a prior batch, else the guards below would
+                                      // silently skip copy+export whenever narration takes its no-targets return.
+    try {
+      const nar = await batchGenerateNarration();
+      if (batchCancelRef.current) return;          // cancelled mid-narration → stop before copy
+      const cp = await batchGenerateCopy();
+      if (batchCancelRef.current) return;          // cancelled mid-copy → stop before export
+      await downloadAllReels();
+      // One combined summary owns the final notice, so a phase's transient message (incl. the "nothing to
+      // do" no-op notices, and copy overwriting narration's failure count) never hides the real outcome.
+      const parts: string[] = [];
+      if (nar?.errors) parts.push(`narration ${nar.errors} failed`);
+      if (cp?.errors) parts.push(`copy ${cp.errors} failed`);
+      setBatchNotice(parts.length ? `Run all done — ${parts.join(', ')} (open those reels to retry).` : 'Run all complete. ✓');
+    } finally {
+      setRunningAll(false);
+    }
+  }, [runningAll, batchOp, exportBusy, batchGenerateNarration, batchGenerateCopy, downloadAllReels]);
 
   const selectedEntry = entries.find(e => e.id === selectedId) ?? entries[0];
 
@@ -1861,6 +2428,12 @@ export function CanvasGrid({
     const e = selectedEntry;
     if (!e) return;
     if (e.localVideoSrc || e.videoUrl || !e.data) return;
+    // Footage reels stream from our own R2 (URLs never expire) and are large ~100MB clips — eagerly
+    // full-downloading one into a blob just to view/narrate stalls the pipeline (and a batch cycling every
+    // reel would download them all). Skip: footage streams via <video> and is fetched in full only at
+    // export. This pre-download stays ONLY for expiring TikTok/IG/X CDN links, where caching bytes early
+    // guards against the link 403-ing before export.
+    if (isFootageUrl(e.url) || isFootageUrl(e.data.hdplay || e.data.play || '')) return;
     if (videoBlobUrls[e.id] || blobFetchingRef.current.has(e.id)) return;
     const proxyUrl = bestVideoUrl(e.data);
     if (!proxyUrl) return;
@@ -1869,18 +2442,22 @@ export function CanvasGrid({
     (async () => {
       try {
         const res = await fetch(proxyUrl);
-        if (!res.ok || cancelled) return;
+        if (cancelled) return;
+        // This is the only load a deferred LINK reel gets (footage/uploads early-return above). A dead
+        // response = the TikTok/IG/X CDN URL expired — flag it so the reel goes videoFailed, which re-enables
+        // the Fetch button + auto-fetch so the user can re-scrape. (Was a silent return before deferral.)
+        if (!res.ok) { onHandleVideoError(e.id); return; }
         const blobUrl = URL.createObjectURL(await res.blob());
         if (cancelled) { URL.revokeObjectURL(blobUrl); return; }
         setVideoBlobUrls(prev => {
           if (prev[e.id]) { URL.revokeObjectURL(blobUrl); return prev; }
           return { ...prev, [e.id]: blobUrl };
         });
-      } catch { /* best-effort */ }
+      } catch { if (!cancelled) onHandleVideoError(e.id); }
       finally { blobFetchingRef.current.delete(e.id); }
     })();
     return () => { cancelled = true; };
-  }, [selectedEntry, videoBlobUrls]);
+  }, [selectedEntry, videoBlobUrls, onHandleVideoError]);
 
   // First-run / empty state: reels posting in twitter mode with no reel templates → send to the editor.
   // While templates are still loading, render blank (not the posting UI) so it doesn't flash for a frame.
@@ -2142,6 +2719,18 @@ export function CanvasGrid({
               <button type="button" onClick={() => setDownloadNotice(null)} aria-label="Dismiss" className="text-fg-4 hover:text-fg focus-ring rounded-xs">×</button>
             </span>
           )}
+          {/* Live batch-generation status (detailed per-reel step) and post-run summary. */}
+          {batchOp && (
+            <span className="flex items-center gap-1.5 text-caption text-fg-2 whitespace-nowrap max-w-[440px] truncate" title={batchProgress.status}>
+              {batchProgress.status || `${batchProgress.done}/${batchProgress.total}`}
+            </span>
+          )}
+          {batchNotice && (
+            <span className="flex items-center gap-1.5 text-caption text-fg-2 whitespace-nowrap">
+              {batchNotice}
+              <button type="button" onClick={() => setBatchNotice(null)} aria-label="Dismiss" className="text-fg-4 hover:text-fg focus-ring rounded-xs">×</button>
+            </span>
+          )}
           {reelCapNotice && (
             <span className="flex items-center gap-1.5 text-caption text-fg-2 whitespace-nowrap">
               {reelCapNotice}
@@ -2159,10 +2748,11 @@ export function CanvasGrid({
                 if (exportBusy) return;
                 const id = selectedEntry.id;
                 setDownloadingOne(true);
-                // The render surfaces its own failure via the canvas status; swallow the rejection
-                // here so it doesn't become an uncaught promise error.
+                // Surface a failure in the toolbar: the canvas status only shows WHILE recording, so an
+                // export that throws (e.g. the clip fetch 502s / a link URL expired) would otherwise fail
+                // completely silently — no file, no message. setDownloadNotice paints a dismissible line.
                 try { await exportGuard.guard(`reel:${id}`, () => canvasRefsMap.current.get(id)?.startDownload()); }
-                catch (err) { console.error('[reel download]', err); }
+                catch (err) { console.error('[reel download]', err); setDownloadNotice(err instanceof Error ? err.message : 'Export failed — please try again.'); }
                 finally { setDownloadingOne(false); }
               }}
               disabled={exportBusy}
@@ -2172,21 +2762,56 @@ export function CanvasGrid({
               Download
             </Button>
           )}
+          {onAddReels && (
+            <Button variant="secondary" size="sm" onClick={() => setBulkOpen(true)} className="rounded-full">
+              Bulk build
+            </Button>
+          )}
+          {/* One-click pipeline (Run all) + the individual batch steps for every Reddit reel, with live
+              progress + cancel. Run all chains narrate → copy → download; each step reports its own count. */}
+          {entries.some(e => framingMap[e.id]?.overlays?.some(o => o.name === 'Reddit thread')) && (
+            <>
+              <Button variant="primary" size="sm" onClick={() => void runAll()} disabled={exportBusy || runningAll} className="rounded-full">
+                {runningAll
+                  ? (batchOp === 'narration' ? `Narrating ${batchProgress.done}/${batchProgress.total}…`
+                    : batchOp === 'copy' ? `Writing copy ${batchProgress.done}/${batchProgress.total}…`
+                    : isDownloadingAll ? `Exporting ${downloadProgress.done}/${downloadProgress.total}…`
+                    : 'Running…')
+                  : 'Run all'}
+              </Button>
+              <Button variant="secondary" size="sm" onClick={() => void batchGenerateCopy()} disabled={exportBusy || !!batchOp || runningAll} className="rounded-full">
+                {batchOp === 'copy' && !runningAll ? `Writing copy ${batchProgress.done}/${batchProgress.total}…` : 'Generate copy (all)'}
+              </Button>
+              <Button variant="secondary" size="sm" onClick={() => void batchGenerateNarration()} disabled={exportBusy || !!batchOp || runningAll} className="rounded-full">
+                {batchOp === 'narration' && !runningAll ? `Narrating ${batchProgress.done}/${batchProgress.total}…` : 'Generate narration (all)'}
+              </Button>
+              {/* Cancel is only meaningful in the narrate/copy phases (batchOp set); once Run all reaches the
+                  export phase it runs to completion — show a static hint so the control slot doesn't just vanish. */}
+              {batchOp ? (
+                <button type="button" onClick={() => { batchCancelRef.current = true; }} className="text-caption text-fg-3 hover:text-fg underline underline-offset-2">Cancel</button>
+              ) : runningAll && isDownloadingAll ? (
+                <span className="text-caption text-fg-3">Export can’t be cancelled</span>
+              ) : null}
+            </>
+          )}
           {/* Download every reel (cycles through them); only shown when there's more than one. */}
           {videoRenderEntries.length > 1 && (
             <Button
               variant="secondary"
               size="sm"
               onClick={downloadAllReels}
-              disabled={exportBusy}
+              disabled={exportBusy || !!batchOp || runningAll}
               leadingIcon={<DownloadIcon size={13} />}
               className="rounded-full"
             >
-              {isDownloadingAll ? `Downloading ${downloadProgress.done}/${downloadProgress.total}…` : 'Download All'}
+              {isDownloadingAll && !runningAll ? `Downloading ${downloadProgress.done}/${downloadProgress.total}…` : 'Download All'}
             </Button>
           )}
         </div>
       </div>
+      {/* Always mounted (renders null while closed) so pasted links, imported threads, and selections
+          survive closing and reopening the panel. */}
+      <BulkBuilder open={bulkOpen} onClose={() => setBulkOpen(false)} onBuild={buildReelsFromThreads} />
 
       {onDeleteAllReels && (
         <Modal

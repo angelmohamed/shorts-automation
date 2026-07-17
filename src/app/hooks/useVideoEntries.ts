@@ -55,6 +55,24 @@ export function useVideoEntries() {
     });
   }
 
+  // Bulk-create reels (each optionally seeded with a footage URL), capped at MAX_REELS. Returns the
+  // new reel ids synchronously (derived from the current entries ref) so the caller can attach a
+  // card to each. If the current grid is a single blank reel, the first spec replaces it.
+  function addReels(urls: (string | undefined)[]): string[] {
+    const cur = entriesRef.current;
+    const startBlank = cur.length === 1 && !cur[0].url.trim() && !cur[0].localVideoSrc && !cur[0].data;
+    const room = MAX_REELS - (startBlank ? 0 : cur.length);
+    const mode = cur[0]?.mode ?? 'twitter';
+    const created = urls.slice(0, Math.max(0, room)).map((url, i) => {
+      const e = makeEmptyEntry(`${Date.now().toString(36)}-${i}-${Math.random().toString(36).slice(2, 6)}`, mode);
+      if (url) e.url = url;
+      return e;
+    });
+    if (!created.length) return [];
+    setEntries(prev => (startBlank ? created : [...prev, ...created]));
+    return created.map(e => e.id);
+  }
+
   function removeRow(id: string) {
     // Allow deleting any row, including the last — the grid tolerates zero entries (every entries[0]
     // access is guarded) and always shows the "add row" ghost card to recover. Previously this no-op'd
@@ -232,7 +250,7 @@ export function useVideoEntries() {
 
   return {
     entries, setEntries, canvasRefsMap,
-    addRow, removeRow, duplicateRow, resetEverything, deleteAllReels, updateEntry, updateLocalVideo, setMode, handleVideoError,
+    addRow, addReels, removeRow, duplicateRow, resetEverything, deleteAllReels, updateEntry, updateLocalVideo, setMode, handleVideoError,
     fetchVideo, fetchAllVideos,
   };
 }

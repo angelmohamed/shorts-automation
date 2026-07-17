@@ -41,8 +41,21 @@ async function passChallenge(page: Page): Promise<void> {
 }
 
 /** GET a reddit.com path (e.g. "/comments/abc123.json?raw_json=1") inside the browser session.
-    Retries once through a fresh challenge pass if the wall reappears. */
-export async function redditBrowserJson(path: string): Promise<unknown> {
+    Retries once through a fresh challenge pass if the wall reappears.
+
+    SERIALIZED: the whole session shares ONE puppeteer page, and a challenge retry does a page.goto()
+    that destroys the execution context of any concurrent page.evaluate() — so a bulk import at
+    concurrency N would drop threads with "Execution context was destroyed". Every call is chained
+    through a module-level queue so shared-page access is strictly one-at-a-time (which also cuts the
+    rapid-fire throttling that triggers the challenge in the first place). */
+let browserChain: Promise<unknown> = Promise.resolve();
+export function redditBrowserJson(path: string): Promise<unknown> {
+  const run = browserChain.then(() => runRedditBrowserJson(path), () => runRedditBrowserJson(path));
+  browserChain = run.catch(() => {});   // keep the chain alive regardless of this call's outcome
+  return run;
+}
+
+async function runRedditBrowserJson(path: string): Promise<unknown> {
   const page = await getPage();
   for (let attempt = 0; attempt < 2; attempt++) {
     const result = await page.evaluate(async (p: string) => {

@@ -25,7 +25,7 @@ const EMPTY_BRAND: BrandProps = {
 export default function Home() {
   const {
     entries, setEntries, canvasRefsMap,
-    addRow, removeRow, duplicateRow, deleteAllReels, updateEntry, updateLocalVideo, handleVideoError,
+    addRow, addReels, removeRow, duplicateRow, deleteAllReels, updateEntry, updateLocalVideo, handleVideoError,
     fetchVideo,
   } = useVideoEntries();
 
@@ -46,6 +46,7 @@ export default function Home() {
             canvasRefsMap={canvasRefsMap}
             brand={EMPTY_BRAND}
             onAddRow={addRow}
+            onAddReels={addReels}
             onRemoveRow={removeRow}
             onDuplicateRow={duplicateRow}
             onDeleteAllReels={deleteAllReels}
