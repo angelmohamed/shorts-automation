@@ -16,10 +16,11 @@ export function clampZoom(val: number, min = 0.5, max = 3): number {
   return Math.max(min, Math.min(max, val));
 }
 
-/** Format seconds as M:SS */
+/** Format seconds as M:SS. Clamps to 0 — a duration is never negative, and JS `%`/`floor` sign rules would
+ *  otherwise emit a garbled field (e.g. -5 → "-1:-5"). */
 export function fmtTime(s: number): string {
-  const m = Math.floor(s / 60);
-  return `${m}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  const t = Math.max(0, Math.floor(s));
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
 }
 
 /** Pick the best-QUALITY video URL from a VideoData-like object, proxied.

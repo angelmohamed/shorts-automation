@@ -176,7 +176,7 @@ export function Switch({ checked, onChange, label, disabled, className }: Switch
       className={cn(
         'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full px-0.5 focus-ring',
         'transition-colors duration-[var(--dur-base)] disabled:opacity-40',
-        checked ? 'bg-accent' : 'bg-zinc-700',
+        checked ? 'bg-accent' : 'bg-surface-3',   // surface-3 = zinc-700 in dark (unchanged), tan in light
         className,
       )}
     >

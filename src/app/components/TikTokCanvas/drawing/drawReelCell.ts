@@ -145,20 +145,24 @@ export function drawReelTemplatePreview(
     verifiedImgRef: MutableRefObject<HTMLImageElement | null>;
     getCellImg: (url?: string) => HTMLImageElement | null;
     overlayCaption?: string;   // when set, caption text elements render it (else the editor sample shows)
+    // Optional theme override for the EMPTY-state chrome only (base fill + "▶ Your video" band + label).
+    // The default reel is full-bleed, so headerBgColor/#18181b never appear in a real reel — only in this
+    // placeholder — so tinting them to the app theme keeps an empty reel cohesive without touching exports.
+    chrome?: { bg?: string; band?: string; text?: string };
   },
 ): void {
   const L = reelLayout(s);
-  ctx.fillStyle = s.headerBgColor;
+  ctx.fillStyle = o.chrome?.bg ?? s.headerBgColor;
   ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
   drawReelCells({ ctx, s, L, logoSrc: o.logoSrc, name: o.name, handle: o.handle, logoImgRef: o.logoImgRef, verifiedImgRef: o.verifiedImgRef, getCellImg: o.getCellImg, placeholder: true, overlayCaption: o.overlayCaption });
   const videoLayer = s.videoLayer ?? 0;
   drawFreeElements({ ctx, s, logoSrc: o.logoSrc, name: o.name, handle: o.handle, logoImgRef: o.logoImgRef, verifiedImgRef: o.verifiedImgRef, getCellImg: o.getCellImg, placeholder: true, overlayCaption: o.overlayCaption, to: videoLayer });
   // Centred video-band placeholder.
-  ctx.fillStyle = '#18181b';
+  ctx.fillStyle = o.chrome?.band ?? '#18181b';
   ctx.beginPath();
   ctx.roundRect(L.bandX, L.bandY, L.bandW, L.bandH, s.videoCornerRadius ?? 24);
   ctx.fill();
-  ctx.fillStyle = '#52525b';
+  ctx.fillStyle = o.chrome?.text ?? '#52525b';
   ctx.font = `500 40px ${SANS}`;
   ctx.textAlign = 'center';
   ctx.fillText('▶  Your video', CANVAS_W / 2, L.bandY + L.bandH / 2);

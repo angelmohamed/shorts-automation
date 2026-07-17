@@ -29,8 +29,11 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // suppressHydrationWarning on <html>: the inline script below sets data-theme on it before hydration,
+  // so its attributes intentionally differ from the server render — scoped to <html>'s own attributes
+  // only (children still hydrate normally).
   return (
-    <html lang="en" className="overscroll-x-none">
+    <html lang="en" className="overscroll-x-none" suppressHydrationWarning>
       {/* overscroll-x-none disables the macOS two-finger swipe-back gesture so panning the
           canvas left at its edge can't navigate the browser back (set on both html and body
           to cover viewport overscroll-behavior propagation). */}
@@ -38,6 +41,12 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} ${anton.variable} antialiased overscroll-x-none`}
         suppressHydrationWarning
       >
+        {/* Apply the saved theme before paint so light mode doesn't flash dark. No saved pref → dark (default). */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var t=localStorage.getItem('reels:theme');if(t==='light')document.documentElement.setAttribute('data-theme','light');else document.documentElement.removeAttribute('data-theme');}catch(e){}})();`,
+          }}
+        />
         <RangeSliderSync />
         {children}
       </body>

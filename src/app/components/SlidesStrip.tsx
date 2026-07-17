@@ -5,8 +5,10 @@ import { createPortal } from 'react-dom';
 import { CloseIcon, PlusIcon } from '@/lib/icons';
 
 // Only id + name are needed, so any {id,name} works (carousel slides, reels, …). `progress` (0–1) drives a
-// per-card export progress bar — set while that reel/slide is being downloaded, omitted otherwise.
-type StripItem = { id: string; name: string; progress?: number };
+// per-card export progress bar — set while that reel/slide is being downloaded, omitted otherwise. `duration`
+// shows a length badge (reels): `label` is the m:ss (prefixed "~" when estimated), `over` reddens it past the
+// 3:00 Shorts limit.
+type StripItem = { id: string; name: string; progress?: number; duration?: { label: string; over: boolean } };
 
 interface SlidesStripProps {
   slides: StripItem[];
@@ -144,7 +146,7 @@ function SlideCard({
   onSelect, onRename, onDelete, onDuplicate,
   onDragStart, onDragOver, onDrop,
 }: {
-  slide: { id: string; name: string; progress?: number };
+  slide: StripItem;
   index: number;
   isActive: boolean;
   isDragging: boolean;
@@ -301,7 +303,7 @@ function SlideCard({
               unnamed reel keeps its original number-only look; a named reel shows the name beneath the
               number exactly like a slide. */}
           {(!numbered || editing || slide.name !== '') && (
-          <div className="shrink-0 px-1.5 pb-1 min-w-0">
+          <div className={`shrink-0 px-1.5 pb-1 min-w-0 ${slide.duration && !editing ? 'pr-9' : ''}`}>
             {editing ? (
               <input
                 ref={inputRef}
@@ -329,6 +331,22 @@ function SlideCard({
               </div>
             )}
           </div>
+          )}
+          {/* Length badge (reels): m:ss of the final Short — estimated ("~") until narration is generated,
+              exact after. Reddens + appends "!" past the 3:00 Shorts limit (colour alone isn't accessible) so
+              an over-long reel is scannable at a glance. pointer-events-none so it never eats card drag/click —
+              hence aria-label (not title, which an inert element can't surface) carries the reason. */}
+          {slide.duration && (
+            <div
+              className={`absolute bottom-1 right-1 px-1 rounded text-[10px] leading-[14px] font-semibold tabular-nums pointer-events-none ${
+                slide.duration.over ? 'bg-danger-tint text-danger-text' : 'bg-surface-3/85 text-fg-2'
+              }`}
+              aria-label={slide.duration.over
+                ? `${slide.duration.label}, over the 3:00 Shorts limit`
+                : `${slide.duration.label} estimated final length`}
+            >
+              {slide.duration.label}{slide.duration.over ? ' !' : ''}
+            </div>
           )}
           {/* Export progress — a bar across the card's bottom edge while this reel is downloading. */}
           {slide.progress != null && (

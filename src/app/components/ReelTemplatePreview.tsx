@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useReducer, useEffect, useLayoutEffect } from 'react';
+import { useRef, useReducer, useEffect, useLayoutEffect, useState } from 'react';
 import { CANVAS_W, CANVAS_H, VERIFIED_TICK_SVG } from './TikTokCanvas/constants';
 import { drawReelTemplatePreview } from './TikTokCanvas/drawing/drawReelCell';
 import type { TwitterTemplateSettings } from './twitterTemplateTypes';
@@ -23,6 +23,18 @@ export function ReelTemplatePreview({ settings, brand, width, overlayCaption }: 
   const verifiedRef = useRef<HTMLImageElement | null>(null);
   const cellImgRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const [tick, force] = useReducer(x => x + 1, 0);
+
+  // Track light/dark so the empty-reel placeholder chrome (base + "▶ Your video" band + label) matches the
+  // app theme. Only the placeholder is tinted — the default reel is full-bleed, so these colours never
+  // appear in a real reel/export (once a video is added the live canvas takes over). Redraw on toggle.
+  const [light, setLight] = useState(false);
+  useEffect(() => {
+    const read = () => setLight(document.documentElement.getAttribute('data-theme') === 'light');
+    read();
+    const obs = new MutationObserver(read);
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    return () => obs.disconnect();
+  }, []);
 
   const name = settings.defaultDisplayName || brand.displayName || 'Your name';
   const handle = settings.defaultHandle || brand.handle || '@yourhandle';
@@ -64,8 +76,16 @@ export function ReelTemplatePreview({ settings, brand, width, overlayCaption }: 
       const img = url ? cellImgRef.current.get(url) : undefined;
       return img && img.complete && img.naturalWidth > 0 ? img : null;
     };
-    drawReelTemplatePreview(ctx, settings, { name, handle, logoSrc: '', logoImgRef: logoRef, verifiedImgRef: verifiedRef, getCellImg, overlayCaption });
-  }, [settings, name, handle, overlayCaption, tick]);
+    // In light mode, tint the empty-state chrome to the app palette (read live so it tracks the theme);
+    // dark keeps the original design colours (headerBgColor / #18181b / #52525b).
+    let chrome: { bg: string; band: string; text: string } | undefined;
+    if (light) {
+      const cs = getComputedStyle(document.documentElement);
+      const g = (v: string, fb: string) => cs.getPropertyValue(v).trim() || fb;
+      chrome = { bg: g('--surface-2', '#ebdbb2'), band: g('--surface-3', '#d5c4a1'), text: g('--fg-3', '#665c54') };
+    }
+    drawReelTemplatePreview(ctx, settings, { name, handle, logoSrc: '', logoImgRef: logoRef, verifiedImgRef: verifiedRef, getCellImg, overlayCaption, chrome });
+  }, [settings, name, handle, overlayCaption, tick, light]);
 
   return (
     <canvas

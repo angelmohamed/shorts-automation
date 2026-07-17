@@ -132,6 +132,11 @@
   --z-max: 2147483000;
 
   /* —— Misc —— */
+  color-scheme: dark;                        /* native scrollbars / form controls follow the theme */
+  --grid-line: rgb(255 255 255 / 0.07);      /* faint page-grid line colour (overridden in light) */
+  --canvas-dot: rgb(255 255 255 / 0.16);     /* dotted flow-canvas dots (pipeline view) — matches DE's canvas */
+  --scrollbar-thumb: var(--zinc-700);        /* custom scrollbar thumb (theme-aware; overrides native color-scheme) */
+  --scrollbar-thumb-hover: var(--zinc-600);
   --scrim: rgb(0 0 0 / 0.60);
   --shadow-1: 0 1px 2px rgb(0 0 0 / 0.40);
   --shadow-2: 0 8px 24px rgb(0 0 0 / 0.50);
@@ -155,6 +160,74 @@
 }
 @supports not (backdrop-filter: blur(1px)) {
   :root { --surface-overlay: var(--zinc-900); }
+}
+
+/* ============================================================================
+   LIGHT THEME — "Vim Light Soft" (gruvbox light, soft-contrast background).
+   Opt-in via <html data-theme="light"> (set by the theme toggle / no-flash script).
+   Only remaps the SEMANTIC tokens — components reference those via @theme inline, so
+   nothing else needs to change. Warm cream surfaces + dark warm-grey ink + faded
+   gruvbox accents; the signature brand green is kept (darkened where used as text).
+   Palette: bg0_soft #f2e5bc · bg1 #ebdbb2 · bg2 #d5c4a1 · bg3 #bdae93 · bg4 #a89984
+            fg1 #3c3836 · fg2 #504945 · fg3 #665c54 · fg4 #7c6f64
+   ========================================================================== */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* —— Surfaces (raised tiers get DARKER on light, mirroring the dark ramp inverted) —— */
+  --surface-page: #f2e5bc;
+  --surface-1: #f2e5bc;
+  --surface-2: #ebdbb2;
+  --surface-3: #d5c4a1;
+  --surface-overlay: rgb(235 219 178 / 0.92);   /* bg1, near-opaque */
+  --surface-hover: rgb(60 56 54 / 0.06);         /* hover = darken (not lighten) on light */
+  --surface-active: rgb(60 56 54 / 0.11);
+  --surface-inset: #e6d7a6;                       /* recessed wells sit a touch darker than surface-1 */
+
+  /* —— Borders —— */
+  --line: #d5c4a1;
+  --line-strong: #bdae93;
+  --line-faint: rgb(60 56 54 / 0.10);
+
+  /* —— Text —— */
+  --fg: #3c3836;
+  --fg-2: #504945;
+  --fg-3: #665c54;
+  --fg-4: #7c6f64;
+
+  /* —— Primary action: a dark warm button with cream text (white-on-light would vanish) —— */
+  --action: #3c3836;
+  --action-hover: #504945;
+  --action-active: #282828;
+  --action-fg: #f9f5d7;
+
+  /* —— Brand accent kept; text/border darkened so green reads on cream —— */
+  --accent: var(--brand-500);
+  --accent-hover: var(--brand-600);
+  --accent-fg: var(--black);
+  --accent-text: #0a6e2a;                         /* dark brand green for green-as-text */
+  --accent-tint: rgb(0 205 64 / 0.16);
+  --accent-tint-hover: rgb(0 205 64 / 0.24);
+  --accent-border: rgb(0 168 54 / 0.55);
+
+  /* —— Status: gruvbox faded (darker) hues for contrast on cream —— */
+  --info: #458588;    --info-text: #076678;    --info-tint: rgb(69 133 136 / 0.16);  --info-border: rgb(69 133 136 / 0.45);
+  --danger: #cc241d;  --danger-text: #9d0006;  --danger-tint: rgb(204 36 29 / 0.14); --danger-tint-hover: rgb(204 36 29 / 0.22); --danger-border: rgb(204 36 29 / 0.50);
+  --success: #79740e; --success-text: #79740e; --success-tint: rgb(152 151 26 / 0.18); --success-border: rgb(121 116 14 / 0.50);
+  --warning: #d65d0e; --warning-text: #af3a03; --warning-tint: rgb(214 93 14 / 0.16); --warning-border: rgb(214 93 14 / 0.50);
+
+  --focus: #3c3836;
+
+  /* —— Warm, soft shadows + subtle dark grid line —— */
+  --scrim: rgb(60 56 54 / 0.40);
+  --shadow-1: 0 1px 2px rgb(80 73 69 / 0.14);
+  --shadow-2: 0 8px 24px rgb(80 73 69 / 0.16);
+  --shadow-3: 0 16px 48px rgb(80 73 69 / 0.22);
+  --shadow-glow: 0 0 40px rgb(0 205 64 / 0.18);
+  --grid-line: rgb(60 56 54 / 0.06);
+  --canvas-dot: rgb(60 56 54 / 0.14);        /* subtle warm-grey dots on the cream flow canvas */
+  --scrollbar-thumb: #bdae93;                /* warm-grey thumb on cream (gruvbox bg3/bg4) */
+  --scrollbar-thumb-hover: #a89984;
 }
 
 /* ============================================================================
@@ -351,11 +424,11 @@ button:active { transform: scale(0.97); transition: transform var(--dur-fast) va
   .z-max      { z-index: var(--z-max); }
   .scrollbar-none { scrollbar-width: none; }
   .scrollbar-none::-webkit-scrollbar { display: none; }
-  /* Faint page grid (was the inline GRID_BG_STYLE). */
+  /* Faint page grid (was the inline GRID_BG_STYLE). Line colour is theme-aware (--grid-line). */
   .bg-dot-grid {
     background-image:
-      linear-gradient(rgb(255 255 255 / 0.07) 1px, transparent 1px),
-      linear-gradient(90deg, rgb(255 255 255 / 0.07) 1px, transparent 1px);
+      linear-gradient(var(--grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
     background-size: 96px 96px;
   }
   /* Shared focus ring used by ui/ primitives (inset-safe two-tone ring). */
@@ -410,12 +483,12 @@ input[type='color']::-moz-color-swatch { border: none; border-radius: var(--radi
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb {
-    background: var(--zinc-700); border-radius: 9999px;
+    background: var(--scrollbar-thumb); border-radius: 9999px;
     border: 2px solid transparent; background-clip: padding-box;
   }
-  ::-webkit-scrollbar-thumb:hover { background: var(--zinc-600); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 }
-* { scrollbar-width: thin; scrollbar-color: var(--zinc-700) transparent; }
+* { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) transparent; }
 
 /* Hide the native scrollbar on a specific element (the canvas has its own custom overview/pan bar).
    Deliberately UNLAYERED and after the rules above, with !important, so it reliably wins: the layered

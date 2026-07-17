@@ -875,7 +875,7 @@ export const TikTokCanvas = forwardRef<TikTokCanvasRef, TikTokCanvasProps>(funct
         width={CANVAS_W}
         height={CANVAS_H}
         style={{ width: CANVAS_W * DISPLAY_SCALE, height: CANVAS_H * DISPLAY_SCALE }}
-        className="block border border-zinc-700"
+        className="block border border-line"
       />
       <VideoOverlays isVideoLoading={isVideoLoading} videoError={videoError} />
       {/* Image-overlay editing chrome: one positioned div per overlay (drag = move, corner = resize,

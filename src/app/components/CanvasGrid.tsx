@@ -17,7 +17,7 @@ import { defaultTwitterTemplateSettings } from './twitterTemplateTypes';
 import type { VideoEntry, BrandProps } from '../types';
 import type { RecordingState } from './TikTokCanvas/types';
 import { VideoControlsBar } from './VideoControlsBar';
-import { bestVideoUrl, proxyStreamUrl } from '@/lib/utils';
+import { bestVideoUrl, proxyStreamUrl, fmtTime } from '@/lib/utils';
 import { getVideoBlob } from '@/lib/reelVideoBlob';
 import { Button, IconButton, Modal, HEADER_H } from './ui';
 import { AutosaveChip } from './AutosaveChip';
@@ -26,6 +26,10 @@ import { ReelTemplatePreview } from './ReelTemplatePreview';
 import { SlidesStrip } from './SlidesStrip';
 import { EditorScrollBar } from './EditorScrollBar';
 import { ZoomControl } from './ZoomControl';
+import { ThemeToggle } from './ThemeToggle';
+import { PipelineView, type StageKey } from './PipelineView';
+import { SHORTS_MAX_SECONDS, estimateNarrationSeconds, reelDurationInfo } from '@/lib/reelDuration';
+import { computePipelineStages, computePipelineMusicId } from '@/lib/pipelineStatus';
 import { useObservedSize, fitScaleFor } from '@/app/hooks/useElementSize';
 import { useEditorZoomPan, EDITOR_ZOOM_MIN as ZOOM_MIN, EDITOR_ZOOM_MAX as ZOOM_MAX } from '@/app/hooks/useEditorZoomPan';
 import {
@@ -599,6 +603,9 @@ const LS_NARRATION_SPEED = 'reels:narration-speed';
 const NARRATION_SPEEDS = [1, 1.05, 1.1, 1.15, 1.2] as const;
 const DEFAULT_NARRATION_SPEED = 1.15;
 
+// Short-length model (SHORTS_MAX_SECONDS / estimateNarrationSeconds / reelDurationInfo) lives in
+// '@/lib/reelDuration' — imported at the top — so it's unit-testable in isolation.
+
 const REDDIT_POST_VOICE = { id: 'UgBBYS2sOqTuMpoF3BR0', name: 'Mark' };          // Natural Conversations (US)
 const REDDIT_COMMENT_VOICES = [
   { id: 'NNl6r8mD7vthiJatiJt1', name: 'Bradford' },   // Expressive and Articulate (British)
@@ -1003,10 +1010,11 @@ interface BulkThread {
   selectedParas: Set<number>;
 }
 
-function BulkBuilder({ open, onClose, onBuild }: {
+function BulkBuilder({ open, onClose, onBuild, speed }: {
   open: boolean;
   onClose: () => void;
   onBuild: (threads: Array<{ url: string; post: ImportedRedditPost; comments: ImportedRedditComment[]; selectedComments: number[]; selectedParas: number[] }>) => Promise<void>;
+  speed: number;   // narration speed — scales the live length estimate shown while picking comments
 }) {
   const [linksText, setLinksText] = useState('');
   const [threads, setThreads] = useState<BulkThread[]>([]);
@@ -1110,6 +1118,19 @@ function BulkBuilder({ open, onClose, onBuild }: {
   }));
 
   const ready = threads.filter(t => t.selectedComments.size + t.selectedParas.size > 0);
+  // Estimated final length of the reel a thread would build — title + its ticked paragraphs + ticked
+  // comments, at the current narration speed. Rough (real duration lands once narrated), but enough to flag
+  // a thread that would blow past the 3:00 Shorts limit BEFORE any TTS is spent.
+  const threadEstSeconds = (t: BulkThread) => {
+    const parts = [t.post.title];
+    for (const pi of t.selectedParas) if (t.paragraphs[pi]) parts.push(t.paragraphs[pi]);
+    for (const ci of t.selectedComments) if (t.comments[ci]) parts.push(t.comments[ci].body);
+    return estimateNarrationSeconds(parts.join(' '), speed);
+  };
+  // Only estimate a thread that will actually build a reel (≥1 pick) — else a title-only phantom ~m:ss shows
+  // for an untouched thread, disagreeing with the tab badge + Build button (both gated on picks).
+  const at = threads[activeThread];
+  const activeEst = at && at.selectedComments.size + at.selectedParas.size > 0 ? threadEstSeconds(at) : 0;
 
   async function build() {
     if (!ready.length) return;
@@ -1167,12 +1188,14 @@ function BulkBuilder({ open, onClose, onBuild }: {
                 <div className="flex gap-1 px-3 pt-2 pb-2 overflow-x-auto">
                   {threads.map((t, ti) => {
                     const picks = t.selectedComments.size + t.selectedParas.size;
+                    const over = picks > 0 && threadEstSeconds(t) > SHORTS_MAX_SECONDS;   // would exceed the Shorts limit
                     return (
                       <button key={ti} type="button" onClick={() => setActiveThread(ti)}
+                        title={over ? 'Estimated over the 3:00 Shorts limit — untick some comments' : undefined}
                         className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-caption whitespace-nowrap shrink-0 ${ti === activeThread ? 'bg-active text-fg font-medium' : 'text-fg-3 hover:bg-hover'}`}>
                         <span className="opacity-60">{ti + 1}</span>
                         <span className="max-w-[150px] truncate">{t.post.title}</span>
-                        {picks > 0 && <span className="flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-action text-action-fg text-[10px] leading-none">{picks}</span>}
+                        {picks > 0 && <span className={`flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full text-[10px] leading-none ${over ? 'bg-danger-tint text-danger-text' : 'bg-action text-action-fg'}`}>{picks}</span>}
                       </button>
                     );
                   })}
@@ -1320,6 +1343,13 @@ function BulkBuilder({ open, onClose, onBuild }: {
                 {phase === 'building' ? 'Building…' : `Build ${ready.length} reel${ready.length === 1 ? '' : 's'}`}
               </Button>
               <span className="text-caption text-fg-3">Ticked threads become reels with a card + random footage.</span>
+              {/* Live length estimate for the OPEN thread — flags an over-limit reel before any TTS is spent. */}
+              {activeEst > 0 && (
+                <span className={`text-caption tabular-nums ${activeEst > SHORTS_MAX_SECONDS ? 'text-danger-text font-medium' : 'text-fg-3'}`}
+                  title={activeEst > SHORTS_MAX_SECONDS ? 'Estimated over the 3:00 YouTube Shorts limit' : 'Estimated final length of this reel'}>
+                  ~{fmtTime(activeEst > SHORTS_MAX_SECONDS ? Math.ceil(activeEst) : activeEst)}{activeEst > SHORTS_MAX_SECONDS ? ' · over 3:00 limit' : ''}
+                </span>
+              )}
               {error && <span className="text-caption text-danger-text">{error}</span>}
               <button type="button" onClick={reset} className="ml-auto text-caption text-fg-3 hover:text-fg underline underline-offset-2 shrink-0">Start over</button>
             </div>
@@ -1407,6 +1437,10 @@ export function CanvasGrid({
   // write — must still read the fresh values for the export filenames + .txt sidecars). Mirrors isDownloadingAllRef.
   const framingMapRef = useRef(framingMap);
   useEffect(() => { framingMapRef.current = framingMap; }, [framingMap]);
+  // Thread (post+comments) captured at bulk-build, keyed by reel id, so the copy phase can feed
+  // /api/description WITHOUT re-importing via /api/reddit (the serialized-puppeteer step that caps copy
+  // concurrency). In-memory / session-only — copy falls back to a re-import for reels from a prior reload.
+  const threadCacheRef = useRef<Map<string, { url: string; post: ImportedRedditPost; comments: ImportedRedditComment[] }>>(new Map());
   // entryId → live image-overlay list, reported by each canvas — feeds the timeline's overlay lane.
   const [overlaysMap, setOverlaysMap] = useState<Record<string, ImageOverlay[]>>({});
   // Narration voice palette (voices[0] = default narrator) + the voice armed as a line-painting
@@ -1903,9 +1937,11 @@ export function CanvasGrid({
     const segments: { samples: Float32Array; beats: number[]; voiceId: string }[] = [];
     const ac = new AudioContext({ sampleRate: MIX_SR });
     try {
-      for (let gi = 0; gi < groups.length; gi++) {
-        const g = groups[gi];
-        onStatus?.(groups.length > 1 ? `Generating voice ${gi + 1}/${groups.length}…` : 'Generating narration…');
+      // Build each voice group's text upfront (pure — join lines, add terminal punctuation at block ends,
+      // record per-line char offsets for beat timing), then fire ALL the /api/tts calls CONCURRENTLY
+      // (bounded). ElevenLabs round-trips dominate narration time, so a card with N voices generates ~N×
+      // faster. Decode + stitch below stays strictly in group order, so the output WAV is byte-identical.
+      const groupTexts = groups.map(g => {
         let joined = '';
         const offs: number[] = [];
         for (let i = 0; i < g.lines.length; i++) {
@@ -1915,44 +1951,88 @@ export function CanvasGrid({
           offs.push(joined.length);
           joined += endsBlock && !/[.!?…,:;]$/.test(line.text) ? `${line.text}.` : line.text;
         }
-
-        const res = await fetch('/api/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            apiKey, voiceId: g.voiceId, text: joined,
-            // Excited meme-narrator delivery: low stability + high style = animated, hyped read.
-            // `speed` is ElevenLabs' native pacing (1 = natural, 1.2 = max) — reveal sync holds
-            // automatically because the returned timestamps describe the sped audio.
-            voiceSettings: { stability: 0.35, similarity_boost: 0.8, style: 0.6, use_speaker_boost: true, speed: narrationSpeed },
-          }),
-        });
-        const json = await res.json().catch(() => ({}));
-        if (!res.ok) return (json as { error?: string }).error ?? 'Narration failed.';
-        const { audio_base64: audioB64, alignment } = json as {
-          audio_base64?: string;
-          alignment?: { characters?: string[]; character_start_times_seconds?: number[]; character_end_times_seconds?: number[] };
-        };
-        if (!audioB64 || !alignment?.character_start_times_seconds?.length) return 'ElevenLabs returned no audio.';
-
-        const bytes = Uint8Array.from(atob(audioB64), c => c.charCodeAt(0));
+        return { joined, offs, voiceId: g.voiceId };
+      });
+      type TtsOut = { audioB64?: string; starts?: number[]; error?: string };
+      const ttsResults = new Array<TtsOut>(groups.length);
+      const TTS_ATTEMPTS = 4;         // 1 try + 3 retries — rides out transient ElevenLabs rate-limits (429→502)
+      const fetchTts = async (gi: number): Promise<TtsOut> => {
+        const gt = groupTexts[gi];
+        let lastErr = 'Narration failed — the voice service is busy; try again in a moment.';
+        for (let attempt = 0; attempt < TTS_ATTEMPTS; attempt++) {
+          // Exponential backoff with jitter (0.6s → 1.2s → 2.4s) so concurrent groups that collide on a rate
+          // limit don't re-fire in lockstep. The /api/tts route folds ElevenLabs' 429 into a 502 + a retryable hint.
+          if (attempt) await new Promise(r => setTimeout(r, 600 * 2 ** (attempt - 1) + Math.random() * 400));
+          let res: Response;
+          try {
+            res = await fetch('/api/tts', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                apiKey, voiceId: gt.voiceId, text: gt.joined,
+                // Excited meme-narrator delivery: low stability + high style = animated, hyped read. `speed`
+                // is ElevenLabs' native pacing — reveal sync holds because the timestamps describe the sped audio.
+                voiceSettings: { stability: 0.35, similarity_boost: 0.8, style: 0.6, use_speaker_boost: true, speed: narrationSpeed },
+              }),
+            });
+          } catch { lastErr = 'Could not reach the narration service.'; continue; }   // network blip → retry
+          const json = await res.json().catch(() => ({})) as {
+            audio_base64?: string; alignment?: { character_start_times_seconds?: number[] }; error?: string; retryable?: boolean;
+          };
+          if (res.ok) return { audioB64: json.audio_base64, starts: json.alignment?.character_start_times_seconds };
+          if (json.error) lastErr = json.error;   // keep the ACTUAL message (bad key/plan/voice) to surface if we give up
+          // Retry only rate-limits / transient upstream 5xx; a deterministic config failure (retryable:false)
+          // won't improve, so surface its real message immediately instead of burning retries.
+          const retryable = res.status === 502 ? json.retryable !== false : (res.status === 429 || res.status === 503);
+          if (!retryable) return { error: lastErr };
+        }
+        return { error: lastErr };
+      };
+      // Cap at 2 — narrate-all is serial across cards, so this is the global ElevenLabs concurrency; 2 is the
+      // free-tier ceiling (still ~2× faster than serial) and, with the backoff above, rides out brief 429s.
+      const TTS_CONCURRENCY = 2;
+      let nextGi = 0, doneGroups = 0, poolFailed = false;
+      await Promise.all(Array.from({ length: Math.min(TTS_CONCURRENCY, groups.length) }, async () => {
+        // Stop claiming NEW groups once any group has definitively failed (fetchTts already exhausted its
+        // retries) — the whole card's narration fails on the first error anyway, so firing the rest just
+        // burns TTS calls and slows Cancel. Claims are contiguous (nextGi++ is atomic in JS) and in-flight
+        // groups still store their result, so the decode loop below never hits an undefined slot before the
+        // first error. At most CONCURRENCY-1 extra groups finish after the failure — unavoidable with a pool.
+        while (!poolFailed) {
+          const gi = nextGi++;
+          if (gi >= groups.length) break;
+          const out = await fetchTts(gi);
+          ttsResults[gi] = out;
+          if (out.error) poolFailed = true;
+          doneGroups++;
+          onStatus?.(groups.length > 1 ? `Generating voices ${doneGroups}/${groups.length}…` : 'Generating narration…');
+        }
+      }));
+      // Decode + gain + collect segments STRICTLY in group order — the stitched track must match serial output.
+      for (let gi = 0; gi < groups.length; gi++) {
+        const r = ttsResults[gi];
+        // A slot is undefined only if the pool short-circuited before claiming this group, which happens
+        // strictly AFTER a lower-gi group errored — so the r.error return below fires first. Guard anyway so
+        // the loop can never deref undefined regardless of ordering.
+        if (!r || r.error) return r?.error ?? 'Narration failed.';
+        if (!r.audioB64 || !r.starts?.length) return 'ElevenLabs returned no audio.';
+        const bytes = Uint8Array.from(atob(r.audioB64), c => c.charCodeAt(0));
         let decoded: AudioBuffer;
         try {
           decoded = await ac.decodeAudioData(bytes.buffer);
         } catch {
           return 'Couldn’t decode the narration audio.';
         }
-        const starts = alignment.character_start_times_seconds;
+        const starts = r.starts;
         const samples = Float32Array.from(decoded.getChannelData(0));   // ElevenLabs is mono
         // Channel gain: balance this voice against the rest of the cast (soft-clipped at ±1).
-        const gain = voiceGains[g.voiceId] ?? 1;
+        const gain = voiceGains[groups[gi].voiceId] ?? 1;
         if (gain !== 1) {
           for (let i = 0; i < samples.length; i++) samples[i] = Math.max(-1, Math.min(1, samples[i] * gain));
         }
         segments.push({
           samples,
-          beats: offs.map(off => starts[Math.min(off, starts.length - 1)] ?? 0),
-          voiceId: g.voiceId,
+          beats: groupTexts[gi].offs.map(off => starts[Math.min(off, starts.length - 1)] ?? 0),
+          voiceId: groups[gi].voiceId,
         });
       }
     } finally {
@@ -2055,6 +2135,7 @@ export function CanvasGrid({
   // full only at export — see TikTokCanvas <video>. Re-add a size-gated warm here if the timeline returns.
 
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [pipelineView, setPipelineView] = useState(false);   // Canvas ⇄ Pipeline (bulk stages-as-nodes) view
 
   // Bulk build: turn a set of imported threads (each with its picked comments/paragraphs) into reels.
   // Each reel gets random footage + its Reddit card written straight into the saved framing +
@@ -2079,6 +2160,7 @@ export function CanvasGrid({
       const overlayId = `ov-${Date.now().toString(36)}-${i}-${Math.random().toString(36).slice(2, 6)}`;
       await saveOverlayImage(overlayId, card.blob, 'reddit-card.png');
       const overlay: Omit<ImageOverlay, 'src' | 'audioSrc'> = { id: overlayId, name: 'Reddit thread', ...rect, start: 0, end: 3600, ocrLines, blockAuthors };
+      threadCacheRef.current.set(reelId, { url: t.url, post: t.post, comments: t.comments });   // url-tagged so copy skips the re-import ONLY while the thread is unchanged
       setFramingMap(prev => ({ ...prev, [reelId]: { ...prev[reelId], overlays: [overlay], redditThread: { url: t.url, comments: t.selectedComments, paras: t.selectedParas } } }));
     }));
     markFramingDirty();
@@ -2153,7 +2235,12 @@ export function CanvasGrid({
         // Pipeline: start downloading the NEXT reel's bytes while this one exports, so flipping to it
         // isn't gated on a fresh CDN fetch (its canvas then loads instantly from the blob cache).
         const next = ordered[i + 1];
-        const nextSrc = next && !next.localVideoSrc ? (next.videoUrl ?? (next.data ? bestVideoUrl(next.data) : null)) : null;
+        // Prefetch the SAME url the reel will mount + export from — activeVideoSrc resolves data-first
+        // (data ? bestVideoUrl(data) : videoUrl), so this must match or the prefetch warms the wrong key
+        // and export re-downloads. Skip if it already has a local/downloaded blob.
+        const nextSrc = next && !next.localVideoSrc && !videoBlobUrlsRef.current[next.id]
+          ? (next.data ? bestVideoUrl(next.data) : (next.videoUrl ?? null))
+          : null;
         if (nextSrc) void getVideoBlob(nextSrc);
         let ref = canvasRefsMap.current.get(entry.id);
         const vid = ref?.getVideoElement();
@@ -2303,17 +2390,26 @@ export function CanvasGrid({
         for (let attempt = 0; attempt < 2 && !ok && !batchCancelRef.current; attempt++) {
           if (attempt > 0) await new Promise(r => setTimeout(r, 1500));
           try {
-            const imp = await fetch('/api/reddit', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              // skipAvatars: avatars are never read here (only post/comments feed /api/description), and
-              // the per-author lookups jam the shared browser page under concurrency.
-              body: JSON.stringify({ url, skipAvatars: true }), signal: AbortSignal.timeout(240_000),
-            });
-            const impJson = await imp.json();
-            if (!imp.ok) throw new Error(impJson.error ?? 'thread load failed');
+            // Reuse the thread captured at bulk-build — /api/description only reads post.title/body +
+            // comment bodies, so we skip re-importing via /api/reddit (avatars aren't read, and the native
+            // transport's shared browser page serializes concurrent imports). Trust the cache ONLY when its
+            // tagged url matches this reel's CURRENT url — if the reel was re-pointed to a different thread
+            // (RedditFlyout) the cache is stale, so fall through to a re-import of the current url. Also
+            // covers reels created before this / restored after a reload (no cache entry).
+            const cached = threadCacheRef.current.get(id);
+            let thread = cached && cached.url === url ? { post: cached.post, comments: cached.comments } : undefined;
+            if (!thread) {
+              const imp = await fetch('/api/reddit', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, skipAvatars: true }), signal: AbortSignal.timeout(240_000),
+              });
+              const impJson = await imp.json();
+              if (!imp.ok) throw new Error(impJson.error ?? 'thread load failed');
+              thread = { post: impJson.post, comments: impJson.comments ?? [] };
+            }
             const res = await fetch('/api/description', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ url, thread: { post: impJson.post, comments: impJson.comments ?? [] }, only }),
+              body: JSON.stringify({ url, thread, only }),
               signal: AbortSignal.timeout(90_000),
             });
             const json = await res.json();
@@ -2368,6 +2464,53 @@ export function CanvasGrid({
       setRunningAll(false);
     }
   }, [runningAll, batchOp, exportBusy, batchGenerateNarration, batchGenerateCopy, downloadAllReels]);
+
+  // ── Bulk pipeline (stages-as-nodes) — pure status derivation lives in '@/lib/pipelineStatus' (tested) ──
+  const pipelineStages = useMemo(
+    () => computePipelineStages(entries, framingMap, { batchOp, batchProgress, isDownloadingAll, downloadProgress }),
+    [entries, framingMap, batchOp, batchProgress, isDownloadingAll, downloadProgress],
+  );
+  const pipelineTotalReels = pipelineStages[0]?.total ?? 0;
+  const pipelineMusicId = useMemo(() => computePipelineMusicId(entries, framingMap), [entries, framingMap]);
+
+  const applyMusicToAll = useCallback((id: string | null) => {
+    if (exportBusy) return;                              // don't change a reel's music mid-export
+    setFramingMap(prev => {
+      const next = { ...prev };
+      for (const e of entries) {
+        if ((prev[e.id]?.overlays ?? []).some(o => o.name === 'Reddit thread')) next[e.id] = { ...prev[e.id], musicId: id ?? '' };
+      }
+      return next;
+    });
+    markFramingDirty();
+  }, [entries, setFramingMap, markFramingDirty, exportBusy]);
+
+  // Re-roll a fresh random library clip for every Reddit reel (clear-then-set: drop data/videoUrl + set the
+  // new footage url so the auto-fetch re-resolves it). No-op without setEntries (non-workspace host).
+  const shuffleAllFootage = useCallback(async () => {
+    if (!setEntries || exportBusy) return;                              // don't swap footage mid-export
+    const segs = await fetchFootageManifest().catch(() => [] as FootageSegment[]);
+    if (!segs.length) return;
+    setEntries(prev => prev.map(e => {
+      const isReddit = (framingMap[e.id]?.overlays ?? []).some(o => o.name === 'Reddit thread');
+      if (!isReddit || e.localVideoSrc) return e;                       // skip uploaded reels (url='' → IndexedDB restore) + non-Reddit
+      const pool = segs.filter(s => s.url !== e.url);                   // exclude the current clip → always a real change (no same-url no-op)
+      const pick = (pool.length ? pool : segs)[Math.floor(Math.random() * (pool.length || segs.length))];
+      autoFetched.current.delete(e.id);                                // clear the "already fetched this url" guard so it re-resolves
+      return { ...e, url: pick.url, data: null, videoUrl: undefined };
+    }));
+  }, [setEntries, framingMap, exportBusy]);
+
+  // The reel canvas stays mounted (just hidden) in Pipeline view, so pause it on entry — otherwise a reel
+  // left playing (via the timeline) keeps its video/narration/music audio looping with no visible control.
+  useEffect(() => { if (pipelineView) canvasRefsMap.current.get(displayId)?.pause(); }, [pipelineView, displayId, canvasRefsMap]);
+
+  const runPipelineStage = useCallback((key: StageKey) => {
+    if (key === 'footage') void shuffleAllFootage();
+    else if (key === 'narrate') void batchGenerateNarration();
+    else if (key === 'copy') void batchGenerateCopy();
+    else if (key === 'export') void downloadAllReels();
+  }, [shuffleAllFootage, batchGenerateNarration, batchGenerateCopy, downloadAllReels]);
 
   const selectedEntry = entries.find(e => e.id === selectedId) ?? entries[0];
 
@@ -2478,7 +2621,7 @@ export function CanvasGrid({
 
       {/* ── Element rail (mirrors the template editor): link + caption flyouts edit the SELECTED reel,
             with undo/redo for the URL/caption edits beneath. ── */}
-      {selectedEntry && (
+      {selectedEntry && !pipelineView && (
         <ElementRail
           categories={[
             { id: 'link', label: 'Video link', icon: linkGlyph, content: (
@@ -2508,6 +2651,9 @@ export function CanvasGrid({
                 key={selectedEntry.id}
                 saved={framingMap[selectedEntry.id]?.redditThread ?? null}
                 onSaveThread={t => {
+                  // Re-pointing the reel to a different thread invalidates the build-time thread cache (copy
+                  // must re-import the new url). Read the prior url from the live ref, not a stale closure.
+                  if (framingMapRef.current[selectedEntry.id]?.redditThread?.url !== t?.url) threadCacheRef.current.delete(selectedEntry.id);
                   setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], redditThread: t ?? undefined } }));
                   markFramingDirty();
                 }}
@@ -2642,7 +2788,20 @@ export function CanvasGrid({
         {/* Left slot: the Canvas ⇄ Sheet toggle when the host provides one; otherwise an empty
             spacer keeping justify-between honest (autosave + download stay pinned right even when
             the absolutely-centred template dropdown is the only other child). Mirrors Carousels. */}
-        <div className="flex items-center">{viewToggle}</div>
+        <div className="flex items-center gap-2">
+          {viewToggle}
+          {/* Canvas ⇄ Pipeline (bulk stages-as-nodes) view switch */}
+          <div className="flex items-center rounded-full border border-line p-0.5">
+            {(['canvas', 'pipeline'] as const).map(m => (
+              <button key={m} type="button" onClick={() => setPipelineView(m === 'pipeline')}
+                className={`focus-ring rounded-full px-2.5 py-1 text-caption capitalize transition-colors ${
+                  (m === 'pipeline') === pipelineView ? 'bg-active text-fg font-medium' : 'text-fg-3 hover:text-fg'}`}>
+                {m}
+              </button>
+            ))}
+          </div>
+          <ThemeToggle />
+        </div>
 
         {/* Centre: reel-template dropdown — mirrors the Carousels template dropdown. Selects which saved
             reel template (overlay style) is active; absolutely centred over the canvas. Only in twitter
@@ -2738,8 +2897,8 @@ export function CanvasGrid({
             </span>
           )}
           <AutosaveChip state={reelSaveState} />
-          {/* Download just the on-screen reel — keeps its live crop/pan/zoom. */}
-          {showVideoControls && selectedEntry && (
+          {/* Download just the on-screen reel — keeps its live crop/pan/zoom. (Canvas view only.) */}
+          {showVideoControls && selectedEntry && !pipelineView && (
             <Button
               variant="primary"
               size="sm"
@@ -2762,14 +2921,14 @@ export function CanvasGrid({
               Download
             </Button>
           )}
-          {onAddReels && (
+          {onAddReels && !pipelineView && (
             <Button variant="secondary" size="sm" onClick={() => setBulkOpen(true)} className="rounded-full">
               Bulk build
             </Button>
           )}
           {/* One-click pipeline (Run all) + the individual batch steps for every Reddit reel, with live
               progress + cancel. Run all chains narrate → copy → download; each step reports its own count. */}
-          {entries.some(e => framingMap[e.id]?.overlays?.some(o => o.name === 'Reddit thread')) && (
+          {entries.some(e => framingMap[e.id]?.overlays?.some(o => o.name === 'Reddit thread')) && !pipelineView && (
             <>
               <Button variant="primary" size="sm" onClick={() => void runAll()} disabled={exportBusy || runningAll} className="rounded-full">
                 {runningAll
@@ -2794,8 +2953,8 @@ export function CanvasGrid({
               ) : null}
             </>
           )}
-          {/* Download every reel (cycles through them); only shown when there's more than one. */}
-          {videoRenderEntries.length > 1 && (
+          {/* Download every reel (cycles through them); only shown when there's more than one. (Canvas view only.) */}
+          {videoRenderEntries.length > 1 && !pipelineView && (
             <Button
               variant="secondary"
               size="sm"
@@ -2811,7 +2970,7 @@ export function CanvasGrid({
       </div>
       {/* Always mounted (renders null while closed) so pasted links, imported threads, and selections
           survive closing and reopening the panel. */}
-      <BulkBuilder open={bulkOpen} onClose={() => setBulkOpen(false)} onBuild={buildReelsFromThreads} />
+      <BulkBuilder open={bulkOpen} onClose={() => setBulkOpen(false)} onBuild={buildReelsFromThreads} speed={narrationSpeed} />
 
       {onDeleteAllReels && (
         <Modal
@@ -2839,10 +2998,29 @@ export function CanvasGrid({
         </Modal>
       )}
 
+      {/* Bulk pipeline view (stages-as-nodes) — shown in place of the reel canvas while active. The reel
+          canvas stays MOUNTED (just hidden) so the current reel's live framing isn't lost on the switch. */}
+      {pipelineView && (
+        <PipelineView
+          stages={pipelineStages}
+          totalReels={pipelineTotalReels}
+          runningAll={runningAll}
+          busy={exportBusy || runningAll}
+          onRunAll={runAll}
+          onRunStage={runPipelineStage}
+          onOpenBulkBuilder={() => setBulkOpen(true)}
+          musicTracks={BACKGROUND_TRACKS}
+          currentMusicId={pipelineMusicId}
+          onPickMusic={applyMusicToAll}
+          narrationSpeeds={NARRATION_SPEEDS}
+          narrationSpeed={narrationSpeed}
+          onNarrationSpeed={setNarrationSpeed}
+        />
+      )}
       {/* ── Reel canvas — one reel at a time, like the carousels editor (switch via the docked strip) ── */}
       <div
         ref={attachScroll}
-        className="flex-1 overflow-auto overscroll-contain no-native-scrollbar flex flex-col [align-items:safe_center] [justify-content:safe_center]"
+        className={`flex-1 overflow-auto overscroll-contain no-native-scrollbar flex flex-col [align-items:safe_center] [justify-content:safe_center]${pipelineView ? ' hidden' : ''}`}
       >
         {/* World wrapper — width = lane × viewScale/ZOOM_MIN. At min zoom it exactly fills the view (whole
             reel visible, nothing to pan); zoom in and it overflows so you pan within that one reel. The
@@ -2958,7 +3136,7 @@ export function CanvasGrid({
       {/* ── Video timeline — bottom panel; toggled from the on-canvas button. Sits in FRONT of the left
             rail (z-30) so the undo/redo island tucks behind the timeline instead of overlapping it. ── */}
       <div className="relative bg-surface-1" style={{ zIndex: 40 }}>
-        {timelineStripShown && (
+        {timelineStripShown && !pipelineView && (
           showVideoControls ? (
             <VideoControlsBar
               entryId={selectedEntry!.id}
@@ -2981,14 +3159,31 @@ export function CanvasGrid({
           out of the spotlight carousel flow and never pushes the active reel off-centre. Click-through
           outer that tracks the rail; the centred card captures clicks and is capped to the canvas region.
           Hidden while the reel video timeline is open — the timeline takes over the bottom strip. */}
-      {!timelineStripShown && (
+      {!timelineStripShown && !pipelineView && (
       <div className="fixed bottom-4 z-30 flex justify-center pointer-events-none" style={{ left: 'var(--rail-w, 0px)', right: 0 }}>
         {/* Cap the strip to the canvas region so it stays centred under the reel. */}
         <div className="pointer-events-auto" style={{ maxWidth: 'calc(100% - 20%)' }}>
           <SlidesStrip
             slides={entries.map(e => {
               const rs = recordingStateMap[e.id];
-              return { id: e.id, name: reelNameMap[e.id] ?? '', progress: rs?.isRecording ? rs.recProgress : undefined };
+              // The on-screen reel's LIVE overlays (audioDuration once narrated, enabled ocrLines as toggled)
+              // live in overlaysMap; framingMap is only re-snapshotted when you switch reels. Read the live copy
+              // for the displayed reel so the badge reacts to narrate/clear + line toggles immediately; every
+              // other reel (canvas unmounted) falls back to its already-fresh framingMap snapshot.
+              // Trust the live list whenever it exists (arrays are truthy, so an empty [] — overlay removed —
+              // correctly clears the badge instead of falling back to the stale snapshot). undefined (canvas
+              // not mounted yet) falls back to framingMap.
+              const live = e.id === displayId ? overlaysMap[e.id] : undefined;
+              const framing = live ? ({ ...framingMap[e.id], overlays: live } as Framing) : framingMap[e.id];
+              const dur = reelDurationInfo(framing, narrationSpeed);
+              const over = !!dur && dur.seconds > SHORTS_MAX_SECONDS;
+              return {
+                id: e.id, name: reelNameMap[e.id] ?? '',
+                progress: rs?.isRecording ? rs.recProgress : undefined,
+                // Ceil an over-limit value so the red pill never prints "3:00" (a floored 180.4s) — that would
+                // read as at-limit while colored over. In-limit values stay floored (179.6s → "2:59", not "3:00").
+                duration: dur ? { label: (dur.estimated ? '~' : '') + fmtTime(over ? Math.ceil(dur.seconds) : dur.seconds), over } : undefined,
+              };
             })}
             activeSlideId={selectedId}
             onSelect={setSelectedId}
@@ -3006,7 +3201,7 @@ export function CanvasGrid({
       )}
 
       {/* Portals into <body>, so the wrapper's display:none (Sheet view) can't hide it — gate on active. */}
-      {active && (
+      {active && !pipelineView && (
         <EditorScrollBar
           targetRef={scrollRef}
           zoom={fitFactor * viewScale}
@@ -3016,7 +3211,7 @@ export function CanvasGrid({
       )}
 
       {/* Bottom-left zoom box — hidden while the reel timeline is open (it would overlap the timeline). */}
-      {!timelineStripShown && (
+      {!timelineStripShown && !pipelineView && (
         <ZoomControl value={fitFactor * viewScale} min={fitFactor * ZOOM_MIN} max={fitFactor * ZOOM_MAX} resetTo={1} onChange={v => { captureFocal(); setViewScale(v / fitFactor); }} />
       )}
     </div>

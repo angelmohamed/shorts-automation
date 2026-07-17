@@ -15,6 +15,7 @@ import { drawMarketRow } from '../drawing/drawMarketRow';
 import { trackById, trackStreamSrc, DEFAULT_MUSIC_VOLUME } from '@/lib/music';
 import { drawImageOverlays } from '../drawing/drawOverlays';
 import { getOverlayImage } from '@/lib/localVideoStore';
+import { getCachedBlob } from '@/lib/reelVideoBlob';
 import { countCaptionLines } from '../drawing/countCaptionLines';
 import type { Box, ImageOverlay, MarketData } from '../types';
 import type { TwitterTemplateSettings } from '../../twitterTemplateTypes';
@@ -248,10 +249,22 @@ export function useRecording(config: UseRecordingConfig) {
 
       setRecStatus('Downloading video file...');
       let arrayBuffer: ArrayBuffer;
+      // A batch export prefetches the NEXT reel's bytes (getVideoBlob) while the current reel encodes, so the
+      // file is often already fully downloaded in the shared blob cache — reuse it instead of re-fetching the
+      // ~100MB footage from the CDN a second time. The prefetch keys the cache by the RELATIVE proxy url
+      // (bestVideoUrl → "/api/proxy?stream=1&url=…"), but video.src resolves to an ABSOLUTE url, so also probe
+      // the relative pathname+search form (how the prefetch stored it).
+      let relSrc = videoSrcUrl;
+      try { const u = new URL(videoSrcUrl, window.location.href); relSrc = u.pathname + u.search; } catch { /* keep as-is */ }
+      const cachedBlob = getCachedBlob(videoSrcUrl) ?? getCachedBlob(videoUrl) ?? getCachedBlob(relSrc);
       try {
-        const response = await fetch(videoUrl);
-        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        arrayBuffer = await response.arrayBuffer();
+        if (cachedBlob) {
+          arrayBuffer = await cachedBlob.arrayBuffer();
+        } else {
+          const response = await fetch(videoUrl);
+          if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          arrayBuffer = await response.arrayBuffer();
+        }
       } catch (fetchError) {
         console.error('[EXPORT] ❌ Download failed:', fetchError);
         throw new Error(`Failed to download video: ${fetchError instanceof Error ? fetchError.message : 'Unknown error'}`);
@@ -331,6 +344,22 @@ export function useRecording(config: UseRecordingConfig) {
       const outputDuration = clipDuration / videoRate;   // sped-up video compresses the output timeline
       const totalFrames = Math.floor(outputDuration * EXPORT_FPS);
 
+      // E1: bound the DECODE to the composited window. The consumer only draws [clipStart, clipEnd] (up to
+      // totalFrames), but the producer used to decode the ENTIRE file — pure waste on a narration-truncated
+      // or trimmed reel (a 40s clip bounded to ~20s decodes ~2x the frames it uses). Decode from the
+      // keyframe at/before clipStart (required to reconstruct clipStart) through clipEnd + a reorder margin.
+      // No-op for a full clip: clipStart=0 → decodeStartIdx=0, and clipEnd=fullDuration → decodeEndIdx=end.
+      let decodeStartIdx = 0;
+      for (let i = 0; i < videoSamples.length; i++) {
+        if (videoSamples[i].timestamp > clipStart) break;
+        if (videoSamples[i].isKeyframe) decodeStartIdx = i;
+      }
+      let decodeEndIdx = videoSamples.length;
+      for (let i = decodeStartIdx; i < videoSamples.length; i++) {
+        if (videoSamples[i].timestamp > clipEnd + 0.5) { decodeEndIdx = i; break; }
+      }
+      const decodeCount = Math.max(1, decodeEndIdx - decodeStartIdx);
+
       // ── Extract AVC decoder description from MP4Box ──────────────────────────
       let description: Uint8Array | undefined;
       if (typeof MP4BoxFile.getSampleDescription === 'function') {
@@ -356,7 +385,11 @@ export function useRecording(config: UseRecordingConfig) {
       setRecStatus('Preparing audio...');
 
       const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
-      const videoSource = new VideoSampleSource({ codec: 'avc', bitrate: QUALITY_HIGH });
+      // prefer-hardware routes H.264 encode through the OS encoder (VideoToolbox on macOS) — materially
+      // faster than software AVC, and it transparently falls back to software if unavailable. latencyMode
+      // is left at the default 'quality' on purpose: 'realtime' can drop frames, and encode is already
+      // back-pressured by awaiting every add() below, so we take the speed without the quality risk.
+      const videoSource = new VideoSampleSource({ codec: 'avc', bitrate: QUALITY_HIGH, hardwareAcceleration: 'prefer-hardware' });
       output.addVideoTrack(videoSource);
 
       let audioSource: TEncodedAudioPacketSource | null = null;
@@ -606,7 +639,7 @@ export function useRecording(config: UseRecordingConfig) {
 
       const producer = (async () => {
         try {
-          for (let i = 0; i < videoSamples.length; i++) {
+          for (let i = decodeStartIdx; i < decodeEndIdx; i++) {
             if (signal.aborted) throw new Error('Cancelled');
             if (decoderError) throw decoderError;
             while (frameQueue.length >= MAX_BUFFERED) {
@@ -620,7 +653,7 @@ export function useRecording(config: UseRecordingConfig) {
               timestamp: s.timestamp * 1_000_000,
               data: s.data,
             }));
-            setRecProgress(0.05 + (i / videoSamples.length) * 0.1);
+            setRecProgress(0.05 + ((i - decodeStartIdx) / decodeCount) * 0.1);
           }
           // Bound flush too: decoder.flush() can hang on a stalled hardware decoder, which would leave the
           // final `await producer` below hanging forever. A healthy flush is near-instant (frames stream out

@@ -30,7 +30,9 @@ export function useObservedSize(ref: RefObject<HTMLElement | null>): ElementSize
     if (!el) return;
     const ro = new ResizeObserver(entries => {
       const box = entries[0]?.contentRect;
-      if (box) setSize({ width: box.width, height: box.height });
+      // Ignore a collapsed (0×0) measurement — a display:none consumer (e.g. the reel canvas hidden in
+      // Pipeline view) would otherwise zero out the fit-scale and jump the pan on the way back.
+      if (box && (box.width > 0 || box.height > 0)) setSize({ width: box.width, height: box.height });
     });
     ro.observe(el);
     return () => ro.disconnect();
@@ -49,7 +51,9 @@ export function useElementSize<T extends HTMLElement>() {
     if (!el) return;
     const ro = new ResizeObserver(entries => {
       const box = entries[0]?.contentRect;
-      if (box) setSize({ width: box.width, height: box.height });
+      // Ignore a collapsed (0×0) measurement — a display:none consumer (e.g. the reel canvas hidden in
+      // Pipeline view) would otherwise zero out the fit-scale and jump the pan on the way back.
+      if (box && (box.width > 0 || box.height > 0)) setSize({ width: box.width, height: box.height });
     });
     ro.observe(el);
     return () => ro.disconnect();

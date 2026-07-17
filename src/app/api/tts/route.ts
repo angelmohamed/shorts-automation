@@ -59,7 +59,11 @@ export async function POST(request: NextRequest) {
         : res.status === 422 ? 'ElevenLabs rejected the request — check the voice ID.'
         : `ElevenLabs error (${res.status}).`;
       console.error('[tts]', res.status, detail.slice(0, 300));
-      return NextResponse.json({ error: msg }, { status: 502 });
+      // Only 429 (rate limit) / upstream 5xx are worth a client retry; 401/402/422 are deterministic config
+      // errors that won't improve on retry. Surface both the upstream status and a retryable hint so the client
+      // can back off on the former and fail fast (with the real message) on the latter.
+      const retryable = res.status === 429 || res.status >= 500;
+      return NextResponse.json({ error: msg, upstreamStatus: res.status, retryable }, { status: 502 });
     }
     // { audio_base64, alignment: { characters, character_start_times_seconds, character_end_times_seconds } }
     return NextResponse.json(await res.json());

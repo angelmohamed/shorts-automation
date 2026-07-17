@@ -21,7 +21,9 @@ export function isFootageUrl(url: string): boolean {
 
 /** VideoData for a footage segment — the shape a fetched link produces, with no resolver call. */
 export function footageVideoData(url: string): VideoData {
-  const name = decodeURIComponent(url.split('/').pop() ?? 'footage');
+  // `|| 'footage'` (not `??`): split('/').pop() returns '' (never undefined) for '' / a trailing-slash url,
+  // so `??` would leave an empty name — `||` catches the empty string and applies the intended default.
+  const name = decodeURIComponent(url.split('/').pop() || 'footage');
   return {
     id: name,
     title: name.replace(/\.mp4$/, ''),
