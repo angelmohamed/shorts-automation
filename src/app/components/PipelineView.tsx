@@ -163,7 +163,13 @@ export function PipelineView(props: PipelineViewProps) {
     if (Math.abs(e.clientX - x0) + Math.abs(e.clientY - y0) > 2) panMoved.current = true;
     setView(v => ({ ...v, x: vx + (e.clientX - x0), y: vy + (e.clientY - y0) }));
   };
-  const onCanvasPointerUp = () => { pan.current = null; };
+  const onCanvasPointerUp = () => {
+    // Deselect only on a click that BEGAN on the empty background (pan started here) and didn't drag. Nodes and
+    // the zoom controls stopPropagation on pointerdown, so pan.current stays null for them → they never
+    // deselect (this is why the deselect lives here and not in a bubbling onClick, which the zoom buttons hit).
+    if (pan.current && !panMoved.current) setSelected(null);
+    pan.current = null;
+  };
 
   // Per-stage config-drawer body.
   const controls = (key: StageKey): ReactNode => {
@@ -247,14 +253,13 @@ export function PipelineView(props: PipelineViewProps) {
           ref={canvasRef}
           className="relative flex-1 overflow-hidden touch-none select-none bg-page cursor-grab active:cursor-grabbing"
           style={{
-            backgroundImage: `radial-gradient(var(--canvas-dot, rgba(255,255,255,0.16)) ${1.1 * view.scale}px, transparent ${1.1 * view.scale}px)`,
+            backgroundImage: `radial-gradient(var(--canvas-dot, rgba(255,255,255,0.16)) ${Math.max(0.6, 1.1 * view.scale)}px, transparent ${Math.max(0.6, 1.1 * view.scale)}px)`,
             backgroundSize: `${28 * view.scale}px ${28 * view.scale}px`,
             backgroundPosition: `${view.x}px ${view.y}px`,
           }}
           onPointerDown={onCanvasPointerDown}
           onPointerMove={onCanvasPointerMove}
           onPointerUp={onCanvasPointerUp}
-          onClick={() => { if (panMoved.current) { panMoved.current = false; return; } setSelected(null); }}
         >
           {/* World layer — nodes pan/zoom together. */}
           <div className="absolute inset-0 origin-top-left will-change-transform" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}>

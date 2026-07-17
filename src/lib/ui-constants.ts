@@ -26,9 +26,3 @@ export const GRID_BG_STYLE: React.CSSProperties = {
   backgroundSize: '96px 96px',
 };
 
-/** Dotted-canvas background for the flow/pipeline view — small dots on a fine grid, n8n-style.
- *  Dot colour is theme-aware (--canvas-dot: faint white on dark, faint warm-grey on light). */
-export const DOT_CANVAS_STYLE: React.CSSProperties = {
-  backgroundImage: 'radial-gradient(var(--canvas-dot, rgba(255,255,255,0.16)) 1.2px, transparent 1.2px)',
-  backgroundSize: '22px 22px',
-};
