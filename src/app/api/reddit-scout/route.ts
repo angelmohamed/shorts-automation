@@ -4,7 +4,7 @@ import { runScan, type ScanResult } from '@/lib/redditScout/scan';
 import { browserSource } from '@/lib/redditScout/source';
 import { topComments } from '@/lib/redditScout/parse';
 import { SCOUT_COMMENTS_PER_POST, SCOUT_SUBREDDITS } from '@/lib/redditScout/config';
-import { sanitizeDecisionFeatures } from '@/lib/redditScout/features';
+import { sanitizeDecisionFeatures, cleanText, MAX_TITLE_CHARS } from '@/lib/redditScout/features';
 
 // Reddit Scout API (server-side — the Supabase secret key and the browser transport never reach the client).
 //   POST { action:'scan' }                                — fetch + filter + rank a session of candidates
@@ -45,7 +45,7 @@ export async function POST(request: NextRequest) {
       const url = String(body.url ?? '');
       const id = postIdFromUrl(url);
       if (!id) return NextResponse.json({ error: 'unrecognised reddit url' }, { status: 400 });
-      await markDecision({ id, subreddit: subredditFromUrl(url) ?? 'unknown', title: String(body.title ?? '') }, 'used');
+      await markDecision({ id, subreddit: subredditFromUrl(url) ?? 'unknown', title: cleanText(body.title, MAX_TITLE_CHARS) }, 'used');
       return NextResponse.json({ ok: true, id });
     }
     if (action === 'decide') {
@@ -57,11 +57,13 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'valid id and status(used|rejected) required' }, { status: 400 });
       }
       // Candidate features ride along as TRAINING DATA for the future learned ranker. Category is
-      // derived server-side from config (never trusted from the client); the rest is sanitized.
-      const subreddit = String(body.subreddit ?? 'unknown');
+      // derived server-side from config (never trusted from the client); every string is scrubbed
+      // (length cap + well-formed UTF-16 + NUL-free — a poisoned title/body would 500 the Postgres
+      // write and leave the post permanently undecidable).
+      const subreddit = cleanText(body.subreddit, 50) || 'unknown';
       const category = SCOUT_SUBREDDITS.find(s => s.name.toLowerCase() === subreddit.toLowerCase())?.category;
       const features = sanitizeDecisionFeatures(body, category);
-      await markDecision({ id, subreddit, title: String(body.title ?? '') }, status, features);
+      await markDecision({ id, subreddit, title: cleanText(body.title, MAX_TITLE_CHARS) }, status, features);
       return NextResponse.json({ ok: true });
     }
     if (action === 'undecide') {
