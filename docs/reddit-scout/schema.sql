@@ -5,11 +5,18 @@
 -- (Never dropped by the app — the ledger is the permanent memory.)
 
 create table if not exists reddit_seen (
-  post_id    text primary key,                       -- Reddit base36 id (e.g. "1abcde"), no "t3_" prefix
-  status     text not null check (status in ('used', 'rejected')),
-  subreddit  text not null,
-  title      text not null,
-  decided_at timestamptz not null default now()
+  post_id      text primary key,                     -- Reddit base36 id (e.g. "1abcde"), no "t3_" prefix
+  status       text not null check (status in ('used', 'rejected')),
+  subreddit    text not null,
+  title        text not null,
+  decided_at   timestamptz not null default now(),
+  -- Candidate FEATURES at decide time (nullable — the mark-used hook has no candidate context).
+  -- status = the label, these = the features: every decision is a training row for the phase-2 ranker.
+  body         text,                                 -- selftext (≤40k chars, Reddit's own cap)
+  score        integer,
+  num_comments integer,
+  created_utc  bigint,
+  category     text                                  -- scout category A-D from config at decide time
 );
 
 -- The app talks to this table server-side only (API routes) with the project's SECRET key

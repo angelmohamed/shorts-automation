@@ -1,4 +1,5 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import type { DecisionFeatures } from './features';
 
 // Server-only Supabase client for the Scout's no-repeat ledger (table: reddit_seen — see
 // docs/reddit-scout/schema.sql). Used exclusively from API routes; the SECRET key must never
@@ -40,16 +41,38 @@ export async function getSeenIds(): Promise<Set<string>> {
   return new Set((data ?? []).map(r => r.post_id as string));
 }
 
-/** Record a decision permanently. Upsert on post_id: deciding the same post again (e.g. the shared-ledger
-    hook re-marking a manually-imported post as used) updates rather than duplicates. */
-export async function markDecision(post: SeenPost, status: SeenStatus): Promise<void> {
-  const { error } = await ledger()
-    .from('reddit_seen')
-    .upsert(
-      { post_id: post.id, status, subreddit: post.subreddit, title: post.title, decided_at: new Date().toISOString() },
-      { onConflict: 'post_id' },
-    );
-  if (error) throw new Error(`ledger write failed: ${error.message}`);
+/** Record a decision permanently, optionally with the candidate FEATURES (training data for the future
+    learned ranker). Write strategy is deliberate — PostgREST upsert REPLACES the whole conflicting row
+    (omitted columns are NOT preserved), so:
+    - WITH features (a Scout decide): one full-row upsert — we provide every column.
+    - WITHOUT features (the mark-used hook from a reel build): update-then-insert, so re-marking a post
+      that already carries features can never wipe them. */
+export async function markDecision(post: SeenPost, status: SeenStatus, features?: DecisionFeatures): Promise<void> {
+  const base = { post_id: post.id, status, subreddit: post.subreddit, title: post.title, decided_at: new Date().toISOString() };
+  if (features) {
+    const { error } = await ledger()
+      .from('reddit_seen')
+      .upsert({
+        ...base,
+        body: features.body ?? null,
+        score: features.score ?? null,
+        num_comments: features.numComments ?? null,
+        created_utc: features.createdUtc ?? null,
+        category: features.category ?? null,
+      }, { onConflict: 'post_id' });
+    if (error) throw new Error(`ledger write failed: ${error.message}`);
+    return;
+  }
+  // Feature-less path: touch ONLY the base columns of an existing row…
+  const upd = await ledger().from('reddit_seen')
+    .update({ status, decided_at: base.decided_at, subreddit: post.subreddit, title: post.title })
+    .eq('post_id', post.id)
+    .select('post_id');
+  if (upd.error) throw new Error(`ledger write failed: ${upd.error.message}`);
+  if (upd.data?.length) return;
+  // …or insert a fresh one. 23505 = a concurrent insert raced us — the row exists, which is the goal.
+  const ins = await ledger().from('reddit_seen').insert(base);
+  if (ins.error && ins.error.code !== '23505') throw new Error(`ledger write failed: ${ins.error.message}`);
 }
 
 /** Remove a decision — the §4.6 session-level UNDO for a misclicked Use/Reject. The post becomes

@@ -80,7 +80,11 @@ export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, 
   const decide = useCallback(async (c: ScoutCandidate, index: number, kind: 'used' | 'rejected') => {
     setDeciding(c.id);
     try {
-      await post({ action: 'decide', id: c.id, status: kind, subreddit: c.subreddit, title: c.title });
+      // body/score/comments/age ride along as training features for the future learned ranker.
+      await post({
+        action: 'decide', id: c.id, status: kind, subreddit: c.subreddit, title: c.title,
+        body: c.body, score: c.score, numComments: c.numComments, createdUtc: c.createdUtc,
+      });
       removeById(c.id);
       setLastDecision({ kind, candidate: c, index });
       if (kind === 'used') onBuffer(c);
