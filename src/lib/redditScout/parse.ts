@@ -12,7 +12,9 @@ interface RawChild { kind?: string; data?: Record<string, unknown> }
 interface RawListing { data?: { children?: RawChild[] } }
 
 const str = (v: unknown, fallback = ''): string => (typeof v === 'string' ? v : v == null ? fallback : String(v));
-const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : Number(v) || 0);
+// Finite-or-0: coerce FIRST, then finiteness-check the result — `Number(v) || 0` would re-admit
+// ±Infinity (truthy), which downstream subtraction comparators turn into NaN (Infinity−Infinity).
+const num = (v: unknown): number => { const n = typeof v === 'number' ? v : Number(v); return Number.isFinite(n) ? n : 0; };
 const bool = (v: unknown): boolean => v === true;
 
 /** Map a subreddit `top` listing to candidates. Skips non-post (t3) children and anything malformed. */

@@ -48,6 +48,15 @@ describe('parseListing', () => {
     expect(p.permalink).toBe('https://redd.it/2def');
   });
 
+  it('maps non-finite numerics (JSON 1e999 → Infinity) to 0 — Infinity would NaN-poison the rank comparator', () => {
+    // Real-JSON reachable: JSON.parse turns an out-of-range literal into Infinity, not an error.
+    const raw = JSON.parse('{"data":{"children":[{"kind":"t3","data":{"id":"abc","subreddit":"x","title":"t","permalink":"/p","score":1e999,"created_utc":1e999,"num_comments":-1e999}}]}}');
+    const [p] = parseListing(raw);
+    expect(p.score).toBe(0);
+    expect(p.createdUtc).toBe(0);
+    expect(p.numComments).toBe(0);
+  });
+
   it('normalises the id to lowercase (must equal postIdFromUrl’s lowercased ledger key)', () => {
     const out = parseListing(listing([t3({ id: '1ABC2D', subreddit: 'x', title: 't', permalink: '/p' })]));
     expect(out[0].id).toBe('1abc2d');
