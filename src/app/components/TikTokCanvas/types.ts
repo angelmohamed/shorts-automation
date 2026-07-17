@@ -63,6 +63,21 @@ export interface ImageOverlay {
   ocrLines?: OcrTextLine[];
 }
 
+/** User tweaks to a Reddit thread's TEXT, applied at Pick time — keyed by the imported thread's
+    paragraph/comment indices IN THE FLYOUT'S UNIVERSE (paragraphs from splitParagraphs(post.body);
+    comments = the depth-0-filtered list). The card render, narration (via the card's ocrLines) and
+    YouTube copy all consume the EDITED text; empty/whitespace overrides mean "no override"
+    (deselection is how you delete). `paraOrig`/`commentOrig` snapshot the ORIGINAL text at edit time —
+    content anchors so a re-imported thread whose item drifted (edited/deleted/reordered on Reddit)
+    SKIPS the stale override instead of silently rewriting the wrong item. */
+export interface RedditThreadEdits {
+  title?: string;
+  paras?: Record<number, string>;
+  comments?: Record<number, string>;
+  paraOrig?: Record<number, string>;
+  commentOrig?: Record<number, string>;
+}
+
 export interface Framing {
   box?: Box;
   videoOffset?: { x: number; y: number };
@@ -80,8 +95,9 @@ export interface Framing {
   /** Music bed volume 0..1 (absent = DEFAULT_MUSIC_VOLUME). */
   musicVolume?: number;
   /** Reddit thread import for this reel: the pasted link plus the picked comment/paragraph indices,
-      so reopening the flyout (or reloading) can restore the exact selection after re-import. */
-  redditThread?: { url: string; comments?: number[]; paras?: number[] };
+      so reopening the flyout (or reloading) can restore the exact selection after re-import — and the
+      user's text edits (tweaked at Pick time; survive re-imports since text is re-fetched by index). */
+  redditThread?: { url: string; comments?: number[]; paras?: number[]; edits?: RedditThreadEdits };
   /** Generated YouTube title + description for this reel (editable; /api/description). */
   ytTitle?: string;
   description?: string;

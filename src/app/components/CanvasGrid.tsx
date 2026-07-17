@@ -34,6 +34,8 @@ import { markRedditUsed } from '@/lib/redditScout/markUsed';
 import { ScoutPanel } from './ScoutPanel';
 import { toImportedPost } from '@/lib/redditScout/parse';
 import { remainingBufferAfterBuild, buildOutcomeNotice } from '@/lib/redditScout/buffer';
+import { applyThreadEdits, hasThreadEdits, remapCommentEdits, splitParagraphs } from '@/lib/redditThreadEdits';
+import type { RedditThreadEdits } from './TikTokCanvas/types';
 import type { ScoutCandidate, ScoutRedditComment } from '@/lib/redditScout/types';
 import { useObservedSize, fitScaleFor } from '@/app/hooks/useElementSize';
 import { useEditorZoomPan, EDITOR_ZOOM_MIN as ZOOM_MIN, EDITOR_ZOOM_MAX as ZOOM_MAX } from '@/app/hooks/useEditorZoomPan';
@@ -270,7 +272,8 @@ interface ImportedRedditComment {
   body: string; timeAgo?: string; score?: string; depth: number; isOP?: boolean;
 }
 
-const splitParagraphs = (body?: string) => (body ?? '').split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+// splitParagraphs now lives in '@/lib/redditThreadEdits' — ONE canonical splitter, shared with the
+// edit-application logic, so pick indices and edit indices can never drift apart.
 
 /** Re-normalize depths for an arbitrary selection: a reply whose parent isn't selected is promoted
     to one level under its nearest SELECTED ancestor (or to top level) so connector rails on the
@@ -302,8 +305,10 @@ function buildRedditCardData(post: ImportedRedditPost, comments: ImportedRedditC
 // YouTube copy generator — its own rail flyout. Reads the reel's saved Reddit thread link, imports
 // the thread (cached for the mount), and generates title + description in one model call, or
 // regenerates either individually. Fields persist per reel via Framing (ytTitle / description).
-function YtCopyFlyout({ threadUrl, ytTitle, onYtTitleChange, description, onDescriptionChange }: {
+function YtCopyFlyout({ threadUrl, threadEdits, ytTitle, onYtTitleChange, description, onDescriptionChange }: {
   threadUrl: string | null;
+  /** Pick-stage text edits for this reel — the copy must describe the tweaked thread, not the original. */
+  threadEdits?: RedditThreadEdits;
   ytTitle: string;
   onYtTitleChange: (t: string) => void;
   description: string;
@@ -332,12 +337,22 @@ function YtCopyFlyout({ threadUrl, ytTitle, onYtTitleChange, description, onDesc
         thread = { post: impJson.post, comments: impJson.comments ?? [] };
         threadCache.current = thread;
       }
+      // Apply the reel's Pick-stage text edits so the generated copy matches what's actually narrated.
+      // remapCommentEdits: edit indices are authored in the flyout's depth-0-filtered universe; this raw
+      // import is unfiltered, so keys must be translated onto actual array positions first.
+      const rawComments = (thread.comments as ImportedRedditComment[]) ?? [];
+      const eff = applyThreadEdits(
+        thread.post as ImportedRedditPost,
+        rawComments,
+        remapCommentEdits(rawComments, threadEdits),
+      );
       const res = await fetch('/api/description', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: threadUrl, thread, only }),
+        body: JSON.stringify({ url: threadUrl, thread: { post: eff.post, comments: eff.comments }, only }),
         signal: AbortSignal.timeout(90_000),
       });
+      if (eff.skipped.length) setDescError(`Note: ${eff.skipped.length} text tweak${eff.skipped.length === 1 ? '' : 's'} no longer matched the thread and ${eff.skipped.length === 1 ? 'was' : 'were'} skipped.`);
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? 'Generation failed.');
       if (json.title !== undefined) onYtTitleChange(json.title);
@@ -410,11 +425,47 @@ function YtCopyFlyout({ threadUrl, ytTitle, onYtTitleChange, description, onDesc
   );
 }
 
+function PencilIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+    </svg>
+  );
+}
+
+/** Inline editor for one thread text item (title / paragraph / comment). Cmd/Ctrl-Enter saves,
+    Escape cancels; committing text identical to the original clears the override. */
+function ThreadEditBox({ label, draft, setDraft, onSave, onCancel, rows = 4 }: {
+  label: string; draft: string; setDraft: (s: string) => void; onSave: () => void; onCancel: () => void; rows?: number;
+}) {
+  return (
+    <div className="flex flex-col gap-1 rounded-sm border border-accent-border bg-surface-2 p-1.5">
+      <span className="text-caption text-fg-3">Editing {label} — the card, narration and copy all use this text</span>
+      <textarea
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); onSave(); }
+        }}
+        rows={rows}
+        autoFocus
+        className="focus-ring w-full resize-y rounded-sm border border-line bg-surface-1 px-1.5 py-1 text-caption text-fg"
+      />
+      <div className="flex items-center gap-2">
+        <Button variant="primary" size="sm" onClick={onSave}>Save</Button>
+        <Button variant="ghost" size="sm" onClick={onCancel}>Cancel</Button>
+        <span className="text-caption text-fg-4">⌘↵ save · esc cancel · matching the original clears the edit</span>
+      </div>
+    </div>
+  );
+}
+
 function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
   hasVideo: boolean;
   /** Persisted thread state for this reel (rides Framing, like music). */
-  saved?: { url: string; comments?: number[]; paras?: number[] } | null;
-  onSaveThread: (s: { url: string; comments?: number[]; paras?: number[] } | null) => void;
+  saved?: { url: string; comments?: number[]; paras?: number[]; edits?: RedditThreadEdits } | null;
+  onSaveThread: (s: { url: string; comments?: number[]; paras?: number[]; edits?: RedditThreadEdits } | null) => void;
   onAdd: (blob: Blob, lines: MemeLine[], dims: { w: number; h: number }, blockAuthors: string[]) => Promise<void>;
 }) {
   const [url, setUrl] = useState(saved?.url ?? '');
@@ -424,9 +475,18 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
   const [comments, setComments] = useState<ImportedRedditComment[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [selectedParas, setSelectedParas] = useState<Set<number>>(new Set());
+  // Pick-stage TEXT edits (title / paragraph / comment overrides, keyed by import index). Persisted on
+  // redditThread so they survive reloads AND re-imports (text is re-fetched; overrides re-apply by index).
+  const [edits, setEdits] = useState<RedditThreadEdits>({});
+  const [editing, setEditing] = useState<{ kind: 't' | 'p' | 'c'; idx: number } | null>(null);
+  const [draft, setDraft] = useState('');
+  // The url the DISPLAYED post was imported from — the persist effect must save against this, never the
+  // live input (typing a new url then toggling would otherwise attach the OLD thread's index-keyed
+  // selections+edits to the NEW url).
+  const importedUrlRef = useRef(saved?.url ?? '');
 
   async function importThread() {
-    setBusy('import'); setError(''); setPost(null); setComments([]); setSelected(new Set()); setSelectedParas(new Set());
+    setBusy('import'); setError(''); setPost(null); setComments([]); setSelected(new Set()); setSelectedParas(new Set()); setEdits({}); setEditing(null);
     try {
       const res = await fetch('/api/reddit', {
         method: 'POST',
@@ -437,14 +497,17 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? 'Import failed.');
       setPost(json.post);
-      // Top-level replies only (belt & braces — the route already filters depth).
+      // Depth-0 only — THIS filtered list is the universe comment-edit indices are authored in (the
+      // copy paths remap onto their unfiltered arrays via remapCommentEdits).
       setComments((json.comments ?? []).filter((c: ImportedRedditComment) => (c.depth ?? 0) === 0));
-      // Persist the link with the reel; re-importing the saved link restores the saved selection.
+      importedUrlRef.current = url.trim();
+      // Persist the link with the reel; re-importing the saved link restores the saved selection + edits.
       if (saved?.url === url.trim()) {
         setSelected(new Set(saved.comments ?? []));
         setSelectedParas(new Set(saved.paras ?? []));
+        setEdits(saved.edits ?? {});
       } else {
-        onSaveThread({ url: url.trim() });
+        onSaveThread({ url: url.trim() });   // new url → old selections AND edits are meaningless
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Import failed.');
@@ -461,20 +524,68 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
     });
   const toggle = toggleIn(setSelected);
   const togglePara = toggleIn(setSelectedParas);
-  // Selection edits persist alongside the link (debounced by the framing autosave itself).
+  // Selection + text edits persist alongside the IMPORTED link (never the live input — see importedUrlRef).
   useEffect(() => {
-    if (post && url.trim()) onSaveThread({ url: url.trim(), comments: [...selected], paras: [...selectedParas] });
+    if (post && importedUrlRef.current) {
+      onSaveThread({
+        url: importedUrlRef.current, comments: [...selected], paras: [...selectedParas],
+        edits: hasThreadEdits(edits) ? edits : undefined,
+      });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, selectedParas]);
+  }, [selected, selectedParas, edits]);
 
-  const paragraphs = post ? splitParagraphs(post.body) : [];
+  // ── Edit box helpers: open with the CURRENT (edited or original) text; commit trims; committing text
+  //    identical to the ORIGINAL clears the override (so "undo my edit" is just retyping/clearing). ──
+  const editedTitle = edits.title?.trim() ? edits.title : post?.title ?? '';
+  const paragraphsRaw = post ? splitParagraphs(post.body) : [];
+  const paraText = (i: number) => (edits.paras?.[i]?.trim() ? edits.paras![i] : paragraphsRaw[i]);
+  const commentText = (i: number) => (edits.comments?.[i]?.trim() ? edits.comments![i] : comments[i]?.body ?? '');
+  function openEdit(kind: 't' | 'p' | 'c', idx: number) {
+    setEditing({ kind, idx });
+    setDraft(kind === 't' ? editedTitle : kind === 'p' ? paraText(idx) : commentText(idx));
+  }
+  function commitEdit() {
+    if (!editing) return;
+    const { kind, idx } = editing;
+    const t = draft.trim();
+    setEdits(prev => {
+      const next: RedditThreadEdits = {
+        ...prev,
+        paras: { ...prev.paras }, comments: { ...prev.comments },
+        paraOrig: { ...prev.paraOrig }, commentOrig: { ...prev.commentOrig },
+      };
+      // Compare NORMALISED forms (what applyThreadEdits would actually produce) so a whitespace-only
+      // "edit" doesn't stick around as a spurious override + badge.
+      if (kind === 't') {
+        if (!t || t.replace(/\s*\n+\s*/g, ' ') === post?.title) delete next.title; else next.title = t;
+      } else if (kind === 'p') {
+        if (!t || t.replace(/\n\s*\n/g, '\n') === paragraphsRaw[idx]) { delete next.paras![idx]; delete next.paraOrig![idx]; }
+        else { next.paras![idx] = t; next.paraOrig![idx] = paragraphsRaw[idx]; }   // content anchor (drift guard)
+      } else {
+        if (!t || t === comments[idx]?.body) { delete next.comments![idx]; delete next.commentOrig![idx]; }
+        else { next.comments![idx] = t; next.commentOrig![idx] = comments[idx]?.body ?? ''; }
+      }
+      for (const k of ['paras', 'comments', 'paraOrig', 'commentOrig'] as const) {
+        if (!Object.keys(next[k]!).length) delete next[k];
+      }
+      return next;
+    });
+    setEditing(null);
+  }
+
   const totalSelected = selected.size + selectedParas.size;
 
   async function addToReel() {
     if (!post) return;
     setBusy('add'); setError('');
     try {
-      const data = buildRedditCardData(post, comments, selected, selectedParas);
+      // Apply the text edits BEFORE the card render — the card, its ocrLines (narration + reveals) and
+      // the copy stage (which reads edits from redditThread) all inherit the tweaked text. No remap here:
+      // the flyout's own filtered list IS the universe the edit indices were authored in.
+      const eff = applyThreadEdits(post, comments, hasThreadEdits(edits) ? edits : undefined);
+      if (eff.skipped.length) setError(`Note: ${eff.skipped.length} tweak${eff.skipped.length === 1 ? '' : 's'} (${eff.skipped.join(', ')}) no longer matched the thread and ${eff.skipped.length === 1 ? 'was' : 'were'} skipped.`);
+      const data = buildRedditCardData(eff.post, eff.comments, selected, selectedParas);
       const card = await renderRedditCard(data);
       // Author per narration block, aligned with MemeLine.blockIdx: 0/1 = post title/body,
       // 2+i = the i-th comment on the card. Lets the overlay arrive pre-painted per participant.
@@ -510,64 +621,88 @@ function RedditFlyout({ hasVideo, saved, onSaveThread, onAdd }: {
       </div>
       {post && (
         <>
-          <div className="text-caption text-fg-2 leading-snug border-l-2 border-line-strong pl-2">
-            <span className="text-fg font-medium">{post.user.name}</span> · {post.title.length > 90 ? `${post.title.slice(0, 90)}…` : post.title}
-          </div>
+          {editing?.kind === 't' ? (
+            <ThreadEditBox label="Title" draft={draft} setDraft={setDraft} onSave={commitEdit} onCancel={() => setEditing(null)} rows={2} />
+          ) : (
+            <div className="flex items-start gap-1 text-caption text-fg-2 leading-snug border-l-2 border-line-strong pl-2">
+              <span className="min-w-0 flex-1">
+                <span className="text-fg font-medium">{post.user.name}</span> · {editedTitle.length > 90 ? `${editedTitle.slice(0, 90)}…` : editedTitle}
+                {edits.title?.trim() && <span className="text-accent-text"> · edited</span>}
+              </span>
+              <button type="button" onClick={() => openEdit('t', 0)} aria-label="Edit title" title="Tweak the title text"
+                className="focus-ring shrink-0 rounded-sm p-0.5 text-fg-4 hover:text-fg hover:bg-hover">
+                <PencilIcon size={11} />
+              </button>
+            </div>
+          )}
           <div className="max-h-[48vh] overflow-y-auto overscroll-contain flex flex-col gap-0.5 pr-1">
-            {paragraphs.length > 0 && (
+            {paragraphsRaw.length > 0 && (
               <>
                 <span className="text-caption text-fg-3 pt-0.5">Post text — tick the paragraphs to include:</span>
-                {paragraphs.map((para, i) => (
-                  <button
-                    key={`p${i}`}
-                    type="button"
-                    onClick={() => togglePara(i)}
-                    className={`flex items-start gap-2 py-1.5 px-1.5 rounded-sm text-left transition-colors focus-ring ${
-                      selectedParas.has(i) ? 'bg-active' : 'hover:bg-hover'
-                    }`}
-                  >
-                    <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${
-                      selectedParas.has(i) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'
-                    }`}>
-                      <CheckIcon size={9} />
-                    </span>
-                    <span className="min-w-0 flex-1 text-caption text-fg-3 truncate">{para}</span>
-                  </button>
+                {paragraphsRaw.map((_, i) => editing?.kind === 'p' && editing.idx === i ? (
+                  <ThreadEditBox key={`p${i}`} label={`Paragraph ${i + 1}`} draft={draft} setDraft={setDraft} onSave={commitEdit} onCancel={() => setEditing(null)} />
+                ) : (
+                  <div key={`p${i}`} className={`flex items-start rounded-sm transition-colors ${selectedParas.has(i) ? 'bg-active' : 'hover:bg-hover'}`}>
+                    <button
+                      type="button"
+                      onClick={() => togglePara(i)}
+                      className="flex items-start gap-2 py-1.5 pl-1.5 min-w-0 flex-1 rounded-sm text-left focus-ring"
+                    >
+                      <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${
+                        selectedParas.has(i) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'
+                      }`}>
+                        <CheckIcon size={9} />
+                      </span>
+                      <span className="min-w-0 flex-1 text-caption text-fg-3 truncate">
+                        {edits.paras?.[i]?.trim() && <span className="text-accent-text">edited · </span>}{paraText(i)}
+                      </span>
+                    </button>
+                    <button type="button" onClick={() => openEdit('p', i)} aria-label={`Edit paragraph ${i + 1}`} title="Tweak this paragraph's text"
+                      className="focus-ring shrink-0 rounded-sm p-1 mt-1 mr-0.5 text-fg-4 hover:text-fg hover:bg-hover">
+                      <PencilIcon size={11} />
+                    </button>
+                  </div>
                 ))}
                 <span className="text-caption text-fg-3 pt-1">Comments:</span>
               </>
             )}
-            {comments.map((c, i) => (
-              <button
-                key={i}
-                type="button"
-                onClick={() => toggle(i)}
-                className={`flex items-stretch pl-1.5 pr-1.5 rounded-sm text-left transition-colors focus-ring ${
-                  selected.has(i) ? 'bg-active' : 'hover:bg-hover'
-                }`}
-              >
-                {/* thread rails: one vertical line per ancestor level, aligned across rows */}
-                {Array.from({ length: Math.min(c.depth, 4) }, (_, d) => (
-                  <span key={d} aria-hidden className="w-3 shrink-0 border-l-2 border-line-strong ml-0.5" />
-                ))}
-                {c.depth > 0 && <span aria-hidden className="self-center mr-1 text-fg-3 text-caption leading-none">↳</span>}
-                <span className="flex items-start gap-2 py-1.5 min-w-0 flex-1">
-                  <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${
-                    selected.has(i) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'
-                  }`}>
-                    <CheckIcon size={9} />
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-caption truncate">
-                      <span className={c.depth === 0 ? 'text-fg font-medium' : 'text-fg'}>{c.user.name}</span>
-                      {c.isOP && <span className="text-[#4d9df6] font-semibold"> OP</span>}
-                      {c.timeAgo && <span className="text-fg-3"> · {c.timeAgo}</span>}
-                      {c.depth > 0 && <span className="text-fg-3"> · reply</span>}
+            {comments.map((c, i) => editing?.kind === 'c' && editing.idx === i ? (
+              <ThreadEditBox key={i} label={`${c.user.name}'s comment`} draft={draft} setDraft={setDraft} onSave={commitEdit} onCancel={() => setEditing(null)} />
+            ) : (
+              <div key={i} className={`flex items-stretch rounded-sm transition-colors ${selected.has(i) ? 'bg-active' : 'hover:bg-hover'}`}>
+                <button
+                  type="button"
+                  onClick={() => toggle(i)}
+                  className="flex items-stretch pl-1.5 min-w-0 flex-1 rounded-sm text-left focus-ring"
+                >
+                  {/* thread rails: one vertical line per ancestor level, aligned across rows */}
+                  {Array.from({ length: Math.min(c.depth, 4) }, (_, d) => (
+                    <span key={d} aria-hidden className="w-3 shrink-0 border-l-2 border-line-strong ml-0.5" />
+                  ))}
+                  {c.depth > 0 && <span aria-hidden className="self-center mr-1 text-fg-3 text-caption leading-none">↳</span>}
+                  <span className="flex items-start gap-2 py-1.5 min-w-0 flex-1">
+                    <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${
+                      selected.has(i) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'
+                    }`}>
+                      <CheckIcon size={9} />
                     </span>
-                    <span className="block text-caption text-fg-3 truncate">{c.body}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-caption truncate">
+                        <span className={c.depth === 0 ? 'text-fg font-medium' : 'text-fg'}>{c.user.name}</span>
+                        {c.isOP && <span className="text-[#4d9df6] font-semibold"> OP</span>}
+                        {c.timeAgo && <span className="text-fg-3"> · {c.timeAgo}</span>}
+                        {c.depth > 0 && <span className="text-fg-3"> · reply</span>}
+                        {edits.comments?.[i]?.trim() && <span className="text-accent-text"> · edited</span>}
+                      </span>
+                      <span className="block text-caption text-fg-3 truncate">{commentText(i)}</span>
+                    </span>
                   </span>
-                </span>
-              </button>
+                </button>
+                <button type="button" onClick={() => openEdit('c', i)} aria-label={`Edit ${c.user.name}'s comment`} title="Tweak this comment's text"
+                  className="focus-ring shrink-0 rounded-sm p-1 mt-1.5 mr-0.5 self-start text-fg-4 hover:text-fg hover:bg-hover">
+                  <PencilIcon size={11} />
+                </button>
+              </div>
             ))}
             {comments.length === 0 && <span className="text-caption text-fg-3">No usable comments in that thread.</span>}
           </div>
@@ -2409,6 +2544,7 @@ export function CanvasGrid({
     setBatchNotice(null); setBatchOp('copy');
     setBatchProgress({ done: 0, total: targets.length, status: '' });
     let errors = 0;
+    let skippedEdits = 0;   // drift-anchored text tweaks that no longer matched their thread
     const CONCURRENCY = 2;
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, targets.length) }, async () => {
@@ -2437,9 +2573,18 @@ export function CanvasGrid({
               if (!imp.ok) throw new Error(impJson.error ?? 'thread load failed');
               thread = { post: impJson.post, comments: impJson.comments ?? [] };
             }
+            // The user's Pick-stage text edits apply here too — the description must describe the
+            // TWEAKED thread (the one actually narrated on the card), not Reddit's original. Read the
+            // edits FRESH (framingMapRef, not the targets snapshot) so a tweak made mid-batch counts.
+            // remapCommentEdits: edit indices live in the flyout's depth-0-filtered universe, but THIS
+            // array is unfiltered (raw import / full-tree bulk cache) — translate or the override lands
+            // on the wrong comment. Drift-anchored overrides skip when content no longer matches.
+            const edits = framingMapRef.current[id]?.redditThread?.edits;
+            const eff = applyThreadEdits(thread.post, thread.comments, remapCommentEdits(thread.comments, edits));
+            if (eff.skipped.length) skippedEdits += eff.skipped.length;
             const res = await fetch('/api/description', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ url, thread, only }),
+              body: JSON.stringify({ url, thread: { post: eff.post, comments: eff.comments }, only }),
               signal: AbortSignal.timeout(90_000),
             });
             const json = await res.json();
@@ -2460,9 +2605,10 @@ export function CanvasGrid({
     }));
     markFramingDirty();
     setBatchOp(null);
+    const skipNote = skippedEdits ? ` (${skippedEdits} text tweak${skippedEdits === 1 ? '' : 's'} no longer matched and ${skippedEdits === 1 ? 'was' : 'were'} skipped)` : '';
     setBatchNotice(batchCancelRef.current ? 'Copy generation cancelled.'
-      : errors ? `Copy finished — ${errors} reel${errors === 1 ? '' : 's'} failed.`
-      : 'Title & description generated for every reel. ✓');
+      : errors ? `Copy finished — ${errors} reel${errors === 1 ? '' : 's'} failed.${skipNote}`
+      : `Title & description generated for every reel. ✓${skipNote}`);
     return { errors };
   }, [batchOp, exportBusy, entries, framingMap, setFramingMap, markFramingDirty]);
 
@@ -2789,6 +2935,7 @@ export function CanvasGrid({
               <YtCopyFlyout
                 key={selectedEntry.id}
                 threadUrl={framingMap[selectedEntry.id]?.redditThread?.url ?? null}
+                threadEdits={framingMap[selectedEntry.id]?.redditThread?.edits}
                 ytTitle={framingMap[selectedEntry.id]?.ytTitle ?? ''}
                 onYtTitleChange={t => {
                   setFramingMap(prev => ({ ...prev, [selectedEntry.id]: { ...prev[selectedEntry.id], ytTitle: t || undefined } }));

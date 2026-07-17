@@ -163,6 +163,27 @@ function normalizeFraming(f: unknown): Framing {
         comments: Array.isArray(rt.comments) ? (rt.comments as unknown[]).filter((n): n is number => Number.isFinite(n)) : undefined,
         paras:    Array.isArray(rt.paras)    ? (rt.paras as unknown[]).filter((n): n is number => Number.isFinite(n))    : undefined,
       };
+      // Pick-stage TEXT edits: sanitise to non-empty-string-valued, non-negative-integer-keyed records
+      // so a legacy/corrupt blob can never feed junk into the card/copy edit application.
+      if (rt.edits && typeof rt.edits === 'object' && !Array.isArray(rt.edits)) {
+        const ed = rt.edits as Record<string, unknown>;
+        const rec = (v: unknown): Record<number, string> | undefined => {
+          if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+          const r: Record<number, string> = {};
+          for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+            // Strict digit-key check — Number('') === 0 would smuggle an empty-string key in as index 0.
+            if (/^\d+$/.test(k) && typeof val === 'string' && val.trim()) r[Number(k)] = val;
+          }
+          return Object.keys(r).length ? r : undefined;
+        };
+        const edits: NonNullable<Framing['redditThread']>['edits'] = {};
+        if (typeof ed.title === 'string' && ed.title.trim()) edits.title = ed.title;
+        const pe = rec(ed.paras);       if (pe) edits.paras = pe;
+        const ce = rec(ed.comments);    if (ce) edits.comments = ce;
+        const po = rec(ed.paraOrig);    if (po) edits.paraOrig = po;      // drift anchors ride along
+        const co = rec(ed.commentOrig); if (co) edits.commentOrig = co;
+        if (edits.title || edits.paras || edits.comments) out.redditThread.edits = edits;
+      }
     }
   }
   return out;
