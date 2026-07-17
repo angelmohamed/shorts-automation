@@ -1,13 +1,12 @@
 'use client';
 
-import { Fragment, useState, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Button } from './ui/Button';
-import { DOT_CANVAS_STYLE } from '@/lib/ui-constants';
 
-// Bulk pipeline view — a fixed left→right flow of stage nodes on a dotted canvas, styled after the
-// digital-estate automations section (square node cards, animated dashed connectors, --canvas-dot bg).
-// Purely presentational: CanvasGrid computes the per-stage status from the workspace reels and passes the
-// run/config callbacks. Clicking a node opens a right-side config drawer that DOES that stage's work.
+// Bulk pipeline view — a fixed left→right flow of stage nodes on a pan/zoom dotted canvas, styled after the
+// digital-estate automations section (square node cards, animated dashed connectors, --canvas-dot bg that
+// scales+offsets with the view). Purely presentational: CanvasGrid computes the per-stage status and passes
+// the run/config callbacks. Clicking a node opens a right-side config drawer that DOES that stage's work.
 
 export type StageKey = 'import' | 'pick' | 'footage' | 'music' | 'narrate' | 'copy' | 'export';
 
@@ -28,7 +27,7 @@ export interface PipelineViewProps {
   onRunStage: (key: StageKey) => void; // footage / narrate / copy / export
   onOpenBulkBuilder: () => void;       // import / pick
   musicTracks: { id: string; name: string }[];
-  currentMusicId: string | null;       // representative selection (most common across reels), or null
+  currentMusicId: string | null;       // representative selection (common across reels), or null
   onPickMusic: (id: string | null) => void;   // apply to all reddit reels
   narrationSpeeds: readonly number[];
   narrationSpeed: number;
@@ -61,7 +60,10 @@ function StageNode({ info, selected, onSelect }: { info: StageInfo; selected: bo
   return (
     <button
       type="button"
-      onClick={onSelect}
+      // Stop propagation so grabbing a node neither starts a canvas pan nor bubbles into the empty-canvas
+      // "deselect" click handler.
+      onPointerDown={e => e.stopPropagation()}
+      onClick={e => { e.stopPropagation(); onSelect(); }}
       aria-label={`${meta.title} — ${info.total > 0 ? `${info.done} of ${info.total} reels` : meta.sub}`}
       className={`focus-ring relative flex size-[168px] shrink-0 flex-col rounded-xl border p-3.5 text-left transition-colors ${
         selected ? 'border-accent-border bg-surface-2' : 'border-line bg-surface-1 hover:border-line-strong'
@@ -101,6 +103,8 @@ function Connector() {
   );
 }
 
+const INITIAL_VIEW = { x: 56, y: 56, scale: 1 };
+
 export function PipelineView(props: PipelineViewProps) {
   const { stages, totalReels, runningAll, busy, onRunAll, onRunStage, onOpenBulkBuilder,
     musicTracks, currentMusicId, onPickMusic, narrationSpeeds, narrationSpeed, onNarrationSpeed } = props;
@@ -108,6 +112,58 @@ export function PipelineView(props: PipelineViewProps) {
   const byKey = Object.fromEntries(stages.map(s => [s.key, s])) as Record<StageKey, StageInfo>;
   const sel = selected ? byKey[selected] : null;
   const noReels = totalReels === 0;
+
+  // ── Pan/zoom canvas (mirrors the digital-estate automations canvas: {x,y,scale}, cursor-anchored zoom,
+  //    wheel-pan, drag-pan; the dotted bg scales + offsets with the view). ──
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const [view, setView] = useState(INITIAL_VIEW);
+  const pan = useRef<{ x0: number; y0: number; vx: number; vy: number } | null>(null);
+  const panMoved = useRef(false);
+  const clampScale = (s: number) => Math.min(2, Math.max(0.3, s));
+  const zoomAt = useCallback((factor: number, center?: { x: number; y: number }) => {
+    setView(v => {
+      const scale = clampScale(v.scale * factor);
+      if (scale === v.scale) return v;
+      const rect = canvasRef.current?.getBoundingClientRect();
+      const cx = center?.x ?? (rect ? rect.width / 2 : 0);
+      const cy = center?.y ?? (rect ? rect.height / 2 : 0);
+      const wx = (cx - v.x) / v.scale, wy = (cy - v.y) / v.scale;
+      return { scale, x: cx - wx * scale, y: cy - wy * scale };
+    });
+  }, []);
+  const resetView = () => setView(INITIAL_VIEW);
+
+  // Wheel: ctrl/⌘ zooms toward the cursor; otherwise pans. Non-passive so we can preventDefault (else the
+  // browser page would scroll / pinch-zoom).
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      if (e.ctrlKey || e.metaKey) {
+        const rect = el.getBoundingClientRect();
+        zoomAt(Math.exp(-e.deltaY * 0.0015), { x: e.clientX - rect.left, y: e.clientY - rect.top });
+      } else {
+        setView(v => ({ ...v, x: v.x - e.deltaX, y: v.y - e.deltaY }));
+      }
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [zoomAt]);
+
+  const onCanvasPointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;                    // left-drag pans (nodes stopPropagation, so we're on the bg)
+    panMoved.current = false;
+    pan.current = { x0: e.clientX, y0: e.clientY, vx: view.x, vy: view.y };
+    canvasRef.current?.setPointerCapture?.(e.pointerId);
+  };
+  const onCanvasPointerMove = (e: React.PointerEvent) => {
+    if (!pan.current) return;
+    const { x0, y0, vx, vy } = pan.current;
+    if (Math.abs(e.clientX - x0) + Math.abs(e.clientY - y0) > 2) panMoved.current = true;
+    setView(v => ({ ...v, x: vx + (e.clientX - x0), y: vy + (e.clientY - y0) }));
+  };
+  const onCanvasPointerUp = () => { pan.current = null; };
 
   // Per-stage config-drawer body.
   const controls = (key: StageKey): ReactNode => {
@@ -185,15 +241,44 @@ export function PipelineView(props: PipelineViewProps) {
             {runningAll ? 'Running…' : 'Run all'}
           </Button>
         </div>
-        {/* Dotted flow canvas */}
-        <div className="flex-1 overflow-auto p-8" style={DOT_CANVAS_STYLE}>
-          <div className="flex w-max items-center min-h-full">
-            {ORDER.map((key, i) => (
-              <Fragment key={key}>
-                {i > 0 && <Connector />}
-                <StageNode info={byKey[key]} selected={selected === key} onSelect={() => setSelected(key)} />
-              </Fragment>
-            ))}
+
+        {/* Pan/zoom dotted flow canvas — solid bg-page (so the page grid never shows through) + dots only. */}
+        <div
+          ref={canvasRef}
+          className="relative flex-1 overflow-hidden touch-none select-none bg-page cursor-grab active:cursor-grabbing"
+          style={{
+            backgroundImage: `radial-gradient(var(--canvas-dot, rgba(255,255,255,0.16)) ${1.1 * view.scale}px, transparent ${1.1 * view.scale}px)`,
+            backgroundSize: `${28 * view.scale}px ${28 * view.scale}px`,
+            backgroundPosition: `${view.x}px ${view.y}px`,
+          }}
+          onPointerDown={onCanvasPointerDown}
+          onPointerMove={onCanvasPointerMove}
+          onPointerUp={onCanvasPointerUp}
+          onClick={() => { if (panMoved.current) { panMoved.current = false; return; } setSelected(null); }}
+        >
+          {/* World layer — nodes pan/zoom together. */}
+          <div className="absolute inset-0 origin-top-left will-change-transform" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}>
+            <div className="flex w-max items-center">
+              {ORDER.map((key, i) => (
+                <Fragment key={key}>
+                  {i > 0 && <Connector />}
+                  <StageNode info={byKey[key]} selected={selected === key} onSelect={() => setSelected(key)} />
+                </Fragment>
+              ))}
+            </div>
+          </div>
+
+          {/* Zoom controls — bottom-left, matching the reel editor's ZoomControl theme. */}
+          <div className="absolute bottom-4 left-4 z-10 flex items-center gap-0.5 rounded-xl border border-line bg-surface-1 p-1 shadow-2 select-none" onPointerDown={e => e.stopPropagation()}>
+            <button type="button" onClick={() => zoomAt(1 / 1.2)} aria-label="Zoom out" title="Zoom out" className="focus-ring flex size-7 items-center justify-center rounded-lg text-fg-2 transition-colors hover:bg-hover hover:text-fg">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden><path d="M5 12h14" /></svg>
+            </button>
+            <button type="button" onClick={resetView} aria-label="Reset zoom" title="Reset zoom" className="focus-ring h-7 min-w-[3.25rem] rounded-lg px-1 text-caption tabular-nums text-fg-2 transition-colors hover:bg-hover hover:text-fg">
+              {Math.round(view.scale * 100)}%
+            </button>
+            <button type="button" onClick={() => zoomAt(1.2)} aria-label="Zoom in" title="Zoom in" className="focus-ring flex size-7 items-center justify-center rounded-lg text-fg-2 transition-colors hover:bg-hover hover:text-fg">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden><path d="M12 5v14M5 12h14" /></svg>
+            </button>
           </div>
         </div>
       </div>
