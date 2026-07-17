@@ -8,7 +8,7 @@ import { Button } from './ui/Button';
 // scales+offsets with the view). Purely presentational: CanvasGrid computes the per-stage status and passes
 // the run/config callbacks. Clicking a node opens a right-side config drawer that DOES that stage's work.
 
-export type StageKey = 'import' | 'pick' | 'footage' | 'music' | 'narrate' | 'copy' | 'export';
+export type StageKey = 'scout' | 'import' | 'pick' | 'footage' | 'music' | 'narrate' | 'copy' | 'export';
 
 export interface StageInfo {
   key: StageKey;
@@ -16,6 +16,8 @@ export interface StageInfo {
   total: number;
   running: boolean;
   progress?: { done: number; total: number } | null;
+  /** Overrides the derived "n/m reels" line (the Scout node shows "N new · M buffered" instead). */
+  statusLine?: string;
 }
 
 export interface PipelineViewProps {
@@ -26,6 +28,7 @@ export interface PipelineViewProps {
   onRunAll: () => void;
   onRunStage: (key: StageKey) => void; // footage / narrate / copy / export
   onOpenBulkBuilder: () => void;       // import / pick
+  onOpenScout: () => void;             // the scout node opens the wide review panel, not the drawer
   musicTracks: { id: string; name: string }[];
   currentMusicId: string | null;       // representative selection (common across reels), or null
   onPickMusic: (id: string | null) => void;   // apply to all reddit reels
@@ -34,13 +37,14 @@ export interface PipelineViewProps {
   onNarrationSpeed: (s: number) => void;
 }
 
-const ORDER: StageKey[] = ['import', 'pick', 'footage', 'music', 'narrate', 'copy', 'export'];
+const ORDER: StageKey[] = ['scout', 'import', 'pick', 'footage', 'music', 'narrate', 'copy', 'export'];
 
 const svg = (children: ReactNode) => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>{children}</svg>
 );
 
 const META: Record<StageKey, { type: string; title: string; sub: string; icon: ReactNode }> = {
+  scout:   { type: 'Source',    title: 'Scout',        sub: 'Discover Reddit posts',           icon: svg(<><circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" /></>) },
   import:  { type: 'Trigger',   title: 'Import',       sub: 'Paste & fetch Reddit threads',   icon: svg(<><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /></>) },
   pick:    { type: 'Transform', title: 'Pick comments', sub: 'Choose comments & paragraphs',   icon: svg(<><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></>) },
   footage: { type: 'Source',    title: 'Footage',      sub: 'Assign background clips',         icon: svg(<><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18" /><path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5" /></>) },
@@ -56,7 +60,7 @@ function StageNode({ info, selected, onSelect }: { info: StageInfo; selected: bo
   const pct = info.progress && info.progress.total ? info.progress.done / info.progress.total : 0;
   const statusLine = info.running && info.progress
     ? `${info.progress.done}/${info.progress.total}…`
-    : info.total > 0 ? `${info.done}/${info.total} reels` : meta.sub;
+    : info.statusLine ?? (info.total > 0 ? `${info.done}/${info.total} reels` : meta.sub);
   return (
     <button
       type="button"
@@ -106,7 +110,7 @@ function Connector() {
 const INITIAL_VIEW = { x: 56, y: 56, scale: 1 };
 
 export function PipelineView(props: PipelineViewProps) {
-  const { stages, totalReels, runningAll, busy, onRunAll, onRunStage, onOpenBulkBuilder,
+  const { stages, totalReels, runningAll, busy, onRunAll, onRunStage, onOpenBulkBuilder, onOpenScout,
     musicTracks, currentMusicId, onPickMusic, narrationSpeeds, narrationSpeed, onNarrationSpeed } = props;
   const [selected, setSelected] = useState<StageKey | null>(null);
   const byKey = Object.fromEntries(stages.map(s => [s.key, s])) as Record<StageKey, StageInfo>;
@@ -174,6 +178,8 @@ export function PipelineView(props: PipelineViewProps) {
   // Per-stage config-drawer body.
   const controls = (key: StageKey): ReactNode => {
     switch (key) {
+      case 'scout':
+        return null;   // unreachable — the scout node opens the wide panel, never the drawer
       case 'import':
       case 'pick':
         return (
@@ -267,7 +273,7 @@ export function PipelineView(props: PipelineViewProps) {
               {ORDER.map((key, i) => (
                 <Fragment key={key}>
                   {i > 0 && <Connector />}
-                  <StageNode info={byKey[key]} selected={selected === key} onSelect={() => setSelected(key)} />
+                  <StageNode info={byKey[key]} selected={selected === key} onSelect={() => (key === 'scout' ? onOpenScout() : setSelected(key))} />
                 </Fragment>
               ))}
             </div>

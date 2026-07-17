@@ -31,6 +31,10 @@ import { PipelineView, type StageKey } from './PipelineView';
 import { SHORTS_MAX_SECONDS, estimateNarrationSeconds, reelDurationInfo } from '@/lib/reelDuration';
 import { computePipelineStages, computePipelineMusicId } from '@/lib/pipelineStatus';
 import { markRedditUsed } from '@/lib/redditScout/markUsed';
+import { ScoutPanel } from './ScoutPanel';
+import { toImportedPost } from '@/lib/redditScout/parse';
+import { remainingBufferAfterBuild, buildOutcomeNotice } from '@/lib/redditScout/buffer';
+import type { ScoutCandidate, ScoutRedditComment } from '@/lib/redditScout/types';
 import { useObservedSize, fitScaleFor } from '@/app/hooks/useElementSize';
 import { useEditorZoomPan, EDITOR_ZOOM_MIN as ZOOM_MIN, EDITOR_ZOOM_MAX as ZOOM_MAX } from '@/app/hooks/useEditorZoomPan';
 import {
@@ -1014,7 +1018,7 @@ interface BulkThread {
 function BulkBuilder({ open, onClose, onBuild, speed }: {
   open: boolean;
   onClose: () => void;
-  onBuild: (threads: Array<{ url: string; post: ImportedRedditPost; comments: ImportedRedditComment[]; selectedComments: number[]; selectedParas: number[] }>) => Promise<void>;
+  onBuild: (threads: Array<{ url: string; post: ImportedRedditPost; comments: ImportedRedditComment[]; selectedComments: number[]; selectedParas: number[] }>) => Promise<{ built: number; failed: number }>;
   speed: number;   // narration speed — scales the live length estimate shown while picking comments
 }) {
   const [linksText, setLinksText] = useState('');
@@ -1137,12 +1141,23 @@ function BulkBuilder({ open, onClose, onBuild, speed }: {
     if (!ready.length) return;
     setPhase('building'); setError('');
     try {
-      await onBuild(ready.map(t => ({ url: t.url, post: t.post, comments: t.comments, selectedComments: [...t.selectedComments], selectedParas: [...t.selectedParas] })));
-      // Keep the imported threads (persistence) but clear their selections so reopening the panel can't
-      // accidentally rebuild the same reels; drop back to 'select' so it's not stuck on "Building…".
-      setThreads(prev => prev.map(t => ({ ...t, selectedComments: new Set(), selectedParas: new Set() })));
+      const r = await onBuild(ready.map(t => ({ url: t.url, post: t.post, comments: t.comments, selectedComments: [...t.selectedComments], selectedParas: [...t.selectedParas] })));
+      if (r.built >= ready.length && r.failed === 0) {
+        // Clean full build: keep the imported threads (persistence) but clear their selections so
+        // reopening the panel can't accidentally rebuild the same reels.
+        setThreads(prev => prev.map(t => ({ ...t, selectedComments: new Set(), selectedParas: new Set() })));
+        setPhase('select');
+        onClose();
+        return;
+      }
+      // Truncated (reel cap) or partial card failure: KEEP the selections so nothing is silently lost,
+      // and say exactly what happened. (Rebuilding may duplicate the reels that DID build — the message
+      // says so; the user chooses.)
+      const parts: string[] = [];
+      if (r.built < ready.length) parts.push(`${ready.length - r.built} thread${ready.length - r.built === 1 ? '' : 's'} didn't fit the reel cap`);
+      if (r.failed) parts.push(`${r.failed} card${r.failed === 1 ? '' : 's'} failed to render`);
+      setError(`Built ${r.built} of ${ready.length} — ${parts.join('; ')}. Selections kept (rebuilding may duplicate the built ones).`);
       setPhase('select');
-      onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Build failed.');
       setPhase('select');
@@ -2142,11 +2157,16 @@ export function CanvasGrid({
   // Each reel gets random footage + its Reddit card written straight into the saved framing +
   // IndexedDB — no canvas mount needed, so it scales to many reels at once. The card appears when
   // the reel is selected (or Download All cycles it); narration stays a per-reel/batch step.
+  // Returns { built, failed }: `built` = threads that got a GRID REEL (addReels truncates at the reel cap,
+  // so built < threads.length when the grid is full — callers must NOT treat the surplus as done);
+  // `failed` = reels created whose card render failed (the reel exists; its card can be re-imported).
+  // Deliberately does NOT throw on partial failure — callers need the counts to reconcile their state
+  // (the Scout buffer keeps unbuilt entries; the bulk builder keeps selections + shows the error).
   const buildReelsFromThreads = useCallback(async (threads: Array<{
     url: string; post: ImportedRedditPost; comments: ImportedRedditComment[];
     selectedComments: number[]; selectedParas: number[];
-  }>) => {
-    if (!onAddReels || !threads.length) return;
+  }>): Promise<{ built: number; failed: number }> => {
+    if (!onAddReels || !threads.length) return { built: 0, failed: 0 };
     const segs = await fetchFootageManifest().catch(() => [] as FootageSegment[]);
     const rand = () => (segs.length ? segs[Math.floor(Math.random() * segs.length)].url : undefined);
     const ids = onAddReels(threads.map(() => rand()));
@@ -2173,10 +2193,8 @@ export function CanvasGrid({
     }));
     markFramingDirty();
     if (ids[0]) setSelectedId(ids[0]);
-    // Surface partial failures (Promise.all used to do this by rejecting; allSettled swallows them) — the
-    // bulk builder catches this and shows the error while the successful reels stay built + marked.
     const failed = results.filter(r => r.status === 'rejected').length;
-    if (failed) throw new Error(`${failed} of ${ids.length} reels failed to build — the rest were created.`);
+    return { built: ids.length, failed };
   }, [onAddReels, setFramingMap, markFramingDirty]);
 
   // "Delete all reels" confirm. Only offered when there's actually something to clear (more than one
@@ -2477,12 +2495,106 @@ export function CanvasGrid({
     }
   }, [runningAll, batchOp, exportBusy, batchGenerateNarration, batchGenerateCopy, downloadAllReels]);
 
+  // ── Reddit Scout: approved-post buffer + panel state ──────────────────────────────────────────────
+  // The buffer PERSISTS (localStorage): a Use marks the post 'used' in the permanent ledger immediately,
+  // so losing the buffer on reload would orphan approved posts (used forever, never built).
+  const [scoutOpen, setScoutOpen] = useState(false);
+  const [scoutNewCount, setScoutNewCount] = useState(0);
+  const [scoutBuilding, setScoutBuilding] = useState(false);
+  type ScoutBufferEntry = { candidate: ScoutCandidate; comments: ScoutRedditComment[] | null };
+  const [scoutBuffer, setScoutBuffer] = useState<ScoutBufferEntry[]>(() => {
+    // Shape-validate, not just parse-guard: valid-JSON-wrong-shape (a legacy format, '{}', [null]) would
+    // crash later at .candidate.id. Malformed entries are dropped, not the whole buffer.
+    try {
+      const raw: unknown = JSON.parse(localStorage.getItem('scout:buffer') ?? '[]');
+      if (!Array.isArray(raw)) return [];
+      return raw.filter((e): e is ScoutBufferEntry =>
+        !!e && typeof e === 'object'
+        && typeof (e as ScoutBufferEntry).candidate?.id === 'string'
+        && (Array.isArray((e as ScoutBufferEntry).comments) || (e as ScoutBufferEntry).comments === null),
+      );
+    } catch { return []; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('scout:buffer', JSON.stringify(scoutBuffer)); } catch { /* quota/private */ }
+  }, [scoutBuffer]);
+  const scoutBufferedIds = useMemo(() => new Set(scoutBuffer.map(e => e.candidate.id)), [scoutBuffer]);
+
+  /** Top comments for a post via the scout route (n=12: enough material for the copy stage + picking). */
+  const fetchScoutComments = useCallback(async (id: string): Promise<ScoutRedditComment[] | null> => {
+    try {
+      const res = await fetch('/api/reddit-scout', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'comments', id, n: 12 }),
+      });
+      const json = await res.json();
+      return res.ok ? ((json.comments ?? []) as ScoutRedditComment[]) : null;
+    } catch { return null; }
+  }, []);
+
+  const scoutBufferAdd = useCallback((c: ScoutCandidate) => {
+    setScoutBuffer(prev => (prev.some(e => e.candidate.id === c.id) ? prev : [...prev, { candidate: c, comments: null }]));
+    // Prefetch comments in the background so Build is instant and the copy stage has real material.
+    void fetchScoutComments(c.id).then(comments => {
+      if (comments) setScoutBuffer(prev => prev.map(e => (e.candidate.id === c.id ? { ...e, comments } : e)));
+    });
+  }, [fetchScoutComments]);
+
+  const scoutBufferRemove = useCallback((id: string) => {
+    setScoutBuffer(prev => prev.filter(e => e.candidate.id !== id));
+  }, []);
+
+  /** Turn the approved buffer into staged reels (capture-everything: comments attached, nothing
+      pre-selected — picking happens per reel in the Reddit flyout / bulk builder as today).
+      Returns a user-facing notice (cap truncation / failed cards) or null on a clean full build.
+      Buffer reconciliation (tested in lib/redditScout/buffer.ts): only the BUILT prefix leaves the
+      buffer — cap-truncated posts stay (they're already ledger-marked 'used'; wiping them would orphan
+      them forever), built posts always leave (retrying them would duplicate reels). */
+  const buildFromScoutBuffer = useCallback(async (): Promise<string | null> => {
+    if (!scoutBuffer.length || scoutBuilding) return null;
+    setScoutBuilding(true);
+    try {
+      const snapshot = scoutBuffer;
+      const threads = [];
+      for (const e of snapshot) {
+        // The Use-time prefetch usually landed; re-fetch stragglers now, and build with [] on failure
+        // (the copy stage still works — /api/description accepts a post-only thread).
+        const comments = e.comments ?? (await fetchScoutComments(e.candidate.id)) ?? [];
+        threads.push({
+          url: e.candidate.permalink,
+          post: toImportedPost(e.candidate),
+          comments,
+          selectedComments: [] as number[],
+          selectedParas: [] as number[],
+        });
+      }
+      const { built, failed } = await buildReelsFromThreads(threads);
+      const snapshotIds = snapshot.map(e => e.candidate.id);
+      setScoutBuffer(prev => remainingBufferAfterBuild(prev, snapshotIds, built, e => e.candidate.id));
+      const notice = buildOutcomeNotice(threads.length, built, failed, MAX_REELS);
+      if (!notice) setScoutOpen(false);
+      return notice;
+    } finally {
+      setScoutBuilding(false);
+    }
+  }, [scoutBuffer, scoutBuilding, fetchScoutComments, buildReelsFromThreads]);
+
   // ── Bulk pipeline (stages-as-nodes) — pure status derivation lives in '@/lib/pipelineStatus' (tested) ──
   const pipelineStages = useMemo(
-    () => computePipelineStages(entries, framingMap, { batchOp, batchProgress, isDownloadingAll, downloadProgress }),
-    [entries, framingMap, batchOp, batchProgress, isDownloadingAll, downloadProgress],
+    () => [
+      // The Scout source node — its status is the discovery funnel, not reel counts.
+      {
+        key: 'scout' as const,
+        done: scoutBuffer.length,
+        total: scoutBuffer.length,
+        running: scoutBuilding,
+        statusLine: `${scoutNewCount} new · ${scoutBuffer.length} buffered`,
+      },
+      ...computePipelineStages(entries, framingMap, { batchOp, batchProgress, isDownloadingAll, downloadProgress }),
+    ],
+    [entries, framingMap, batchOp, batchProgress, isDownloadingAll, downloadProgress, scoutBuffer.length, scoutBuilding, scoutNewCount],
   );
-  const pipelineTotalReels = pipelineStages[0]?.total ?? 0;
+  const pipelineTotalReels = pipelineStages.find(s => s.key === 'import')?.total ?? 0;   // NOT [0] — scout leads now
   const pipelineMusicId = useMemo(() => computePipelineMusicId(entries, framingMap), [entries, framingMap]);
 
   const applyMusicToAll = useCallback((id: string | null) => {
@@ -2983,6 +3095,18 @@ export function CanvasGrid({
       {/* Always mounted (renders null while closed) so pasted links, imported threads, and selections
           survive closing and reopening the panel. */}
       <BulkBuilder open={bulkOpen} onClose={() => setBulkOpen(false)} onBuild={buildReelsFromThreads} speed={narrationSpeed} />
+      {/* Reddit Scout — the wide review panel opened from the pipeline's Scout node. */}
+      <ScoutPanel
+        open={scoutOpen}
+        onClose={() => setScoutOpen(false)}
+        bufferCount={scoutBuffer.length}
+        bufferedIds={scoutBufferedIds}
+        onBuffer={scoutBufferAdd}
+        onUnbuffer={scoutBufferRemove}
+        onBuild={buildFromScoutBuffer}
+        building={scoutBuilding}
+        onNewCount={setScoutNewCount}
+      />
 
       {onDeleteAllReels && (
         <Modal
@@ -3021,6 +3145,7 @@ export function CanvasGrid({
           onRunAll={runAll}
           onRunStage={runPipelineStage}
           onOpenBulkBuilder={() => setBulkOpen(true)}
+          onOpenScout={() => setScoutOpen(true)}
           musicTracks={BACKGROUND_TRACKS}
           currentMusicId={pipelineMusicId}
           onPickMusic={applyMusicToAll}

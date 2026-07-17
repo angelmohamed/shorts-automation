@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSeenIds, markDecision, postIdFromUrl, subredditFromUrl } from '@/lib/redditScout/ledger';
+import { deleteDecision, getSeenIds, markDecision, postIdFromUrl, subredditFromUrl } from '@/lib/redditScout/ledger';
 import { runScan, type ScanResult } from '@/lib/redditScout/scan';
 import { browserSource } from '@/lib/redditScout/source';
 import { topComments } from '@/lib/redditScout/parse';
@@ -56,6 +56,13 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'valid id and status(used|rejected) required' }, { status: 400 });
       }
       await markDecision({ id, subreddit: String(body.subreddit ?? 'unknown'), title: String(body.title ?? '') }, status);
+      return NextResponse.json({ ok: true });
+    }
+    if (action === 'undecide') {
+      // §4.6 undo of the LAST decision — deletes the ledger row so the post is suggestible again.
+      const id = String(body.id ?? '').toLowerCase();
+      if (!/^[a-z0-9]+$/.test(id)) return NextResponse.json({ error: 'valid id required' }, { status: 400 });
+      await deleteDecision(id);
       return NextResponse.json({ ok: true });
     }
     return NextResponse.json({ error: 'unknown action' }, { status: 400 });

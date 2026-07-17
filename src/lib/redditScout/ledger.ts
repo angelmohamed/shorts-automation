@@ -52,6 +52,13 @@ export async function markDecision(post: SeenPost, status: SeenStatus): Promise<
   if (error) throw new Error(`ledger write failed: ${error.message}`);
 }
 
+/** Remove a decision — the §4.6 session-level UNDO for a misclicked Use/Reject. The post becomes
+    suggestible again (that is the point of undo); permanence applies to decisions the user keeps. */
+export async function deleteDecision(postId: string): Promise<void> {
+  const { error } = await ledger().from('reddit_seen').delete().eq('post_id', postId);
+  if (error) throw new Error(`ledger delete failed: ${error.message}`);
+}
+
 /** Extract the Reddit base36 post id from any thread-url shape the app handles:
     …/comments/<id>/…, redd.it/<id>, /gallery/<id>, or a bare "t3_<id>". Returns null if unrecognisable. */
 export function postIdFromUrl(url: string): string | null {
