@@ -17,7 +17,17 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 let pagePromise: Promise<Page> | null = null;
 
 async function getPage(): Promise<Page> {
-  pagePromise ??= (async () => {
+  // Validate a cached session before reuse: a browser/page that dies AFTER a successful launch (Chrome
+  // crash, tab killed) would otherwise stay cached forever — every later call fails until the dev server
+  // restarts. browser().connected is the primary liveness signal (isClosed() can miss abrupt browser
+  // death). Safe against concurrent resets: all callers are serialized through browserChain.
+  if (pagePromise) {
+    const cached = await pagePromise.catch(() => null);
+    if (cached && !cached.isClosed() && cached.browser().connected) return cached;
+    pagePromise = null;
+    if (cached) cached.browser().close().catch(() => {});   // reap a half-dead session before relaunching
+  }
+  pagePromise = (async () => {
     const executablePath = process.env.REDDIT_CHROME_PATH ?? CHROME_PATHS[process.platform];
     if (!executablePath) throw new Error('No Chrome path for this platform — set REDDIT_CHROME_PATH');
     const puppeteer = (await import('puppeteer-core')).default;
@@ -60,7 +70,10 @@ async function runRedditBrowserJson(path: string): Promise<unknown> {
   for (let attempt = 0; attempt < 2; attempt++) {
     const result = await page.evaluate(async (p: string) => {
       try {
-        const res = await fetch(p, { headers: { accept: 'application/json' } });
+        // 25s abort: without it a stalled response is bounded only by puppeteer's 180s protocolTimeout —
+        // a 13-fetch scan could hang ~40 min. The signal covers the body read too; the catch below turns
+        // an abort into {status:0}, which the caller's retry/skip-on-fail handles.
+        const res = await fetch(p, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(25_000) });
         const text = await res.text();
         return { status: res.status, text: text.slice(0, 5_000_000) };
       } catch (e) {

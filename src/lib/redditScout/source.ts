@@ -17,6 +17,9 @@ export interface RedditScoutSource {
 export const browserSource: RedditScoutSource = {
   fetchTopRaw: (subreddit, timeframe, limit) =>
     redditBrowserJson(`/r/${encodeURIComponent(subreddit)}/top.json?t=${encodeURIComponent(timeframe)}&limit=${limit}&raw_json=1`),
+  // depth=1: reddit's `limit` budgets the WHOLE tree (replies included), so without it a reply-heavy
+  // thread could starve the top-level pool topComments() draws from. depth=1 spends the entire budget
+  // on top-level comments — which is all the parser keeps anyway.
   fetchCommentsRaw: (postId, limit) =>
-    redditBrowserJson(`/comments/${encodeURIComponent(postId)}.json?raw_json=1&limit=${limit}&sort=top`),
+    redditBrowserJson(`/comments/${encodeURIComponent(postId)}.json?raw_json=1&limit=${limit}&sort=top&depth=1`),
 };
