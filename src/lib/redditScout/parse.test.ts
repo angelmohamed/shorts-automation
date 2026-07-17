@@ -48,6 +48,11 @@ describe('parseListing', () => {
     expect(p.permalink).toBe('https://redd.it/2def');
   });
 
+  it('normalises the id to lowercase (must equal postIdFromUrl’s lowercased ledger key)', () => {
+    const out = parseListing(listing([t3({ id: '1ABC2D', subreddit: 'x', title: 't', permalink: '/p' })]));
+    expect(out[0].id).toBe('1abc2d');
+  });
+
   it('returns [] for malformed / empty input rather than throwing', () => {
     expect(parseListing(null)).toEqual([]);
     expect(parseListing({})).toEqual([]);

@@ -62,3 +62,10 @@ export function postIdFromUrl(url: string): string | null {
     /^t3_([a-z0-9]+)$/i.exec(url.trim());
   return m ? m[1].toLowerCase() : null;
 }
+
+/** The subreddit name from a reddit thread url (`…/r/<name>/…`), or null. Case is preserved (Reddit
+    sub names are case-insensitive but conventionally cased); used only for the ledger row's readability. */
+export function subredditFromUrl(url: string): string | null {
+  const m = /\/r\/([A-Za-z0-9_]+)/.exec(url);
+  return m ? m[1] : null;
+}

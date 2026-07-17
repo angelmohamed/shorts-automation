@@ -23,7 +23,9 @@ export function parseListing(json: unknown): ScoutCandidate[] {
   for (const c of children) {
     if (c?.kind !== 't3' || !c.data) continue;
     const d = c.data;
-    const id = str(d.id);
+    // Lowercased to match postIdFromUrl's normalization — Reddit id36 is lowercase (0-9a-z) by spec, but
+    // both ledger key paths normalizing the same way makes the no-repeat match unconditional.
+    const id = str(d.id).toLowerCase();
     if (!id) continue;
     const permalink = str(d.permalink);
     out.push({

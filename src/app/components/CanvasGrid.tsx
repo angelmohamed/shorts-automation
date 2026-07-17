@@ -30,6 +30,7 @@ import { ThemeToggle } from './ThemeToggle';
 import { PipelineView, type StageKey } from './PipelineView';
 import { SHORTS_MAX_SECONDS, estimateNarrationSeconds, reelDurationInfo } from '@/lib/reelDuration';
 import { computePipelineStages, computePipelineMusicId } from '@/lib/pipelineStatus';
+import { markRedditUsed } from '@/lib/redditScout/markUsed';
 import { useObservedSize, fitScaleFor } from '@/app/hooks/useElementSize';
 import { useEditorZoomPan, EDITOR_ZOOM_MIN as ZOOM_MIN, EDITOR_ZOOM_MAX as ZOOM_MAX } from '@/app/hooks/useEditorZoomPan';
 import {
@@ -2149,7 +2150,9 @@ export function CanvasGrid({
     const segs = await fetchFootageManifest().catch(() => [] as FootageSegment[]);
     const rand = () => (segs.length ? segs[Math.floor(Math.random() * segs.length)].url : undefined);
     const ids = onAddReels(threads.map(() => rand()));
-    await Promise.all(ids.map(async (reelId, i) => {
+    // allSettled: one reel's card-render failure (e.g. canvas.toBlob → null on iOS/Safari size limits) must
+    // not abort its siblings' framing writes, the tail below, or their ledger marks.
+    const results = await Promise.allSettled(ids.map(async (reelId, i) => {
       const t = threads[i];
       if (!t) return;
       const data = buildRedditCardData(t.post, t.comments, new Set(t.selectedComments), new Set(t.selectedParas));
@@ -2162,9 +2165,18 @@ export function CanvasGrid({
       const overlay: Omit<ImageOverlay, 'src' | 'audioSrc'> = { id: overlayId, name: 'Reddit thread', ...rect, start: 0, end: 3600, ocrLines, blockAuthors };
       threadCacheRef.current.set(reelId, { url: t.url, post: t.post, comments: t.comments });   // url-tagged so copy skips the re-import ONLY while the thread is unchanged
       setFramingMap(prev => ({ ...prev, [reelId]: { ...prev[reelId], overlays: [overlay], redditThread: { url: t.url, comments: t.selectedComments, paras: t.selectedParas } } }));
+      // Shared no-repeat ledger — marked HERE, per reel, only after this reel actually framed: threads
+      // truncated by the reel cap (addReels slices at MAX_REELS) or whose card failed to render must NOT
+      // be recorded 'used' (§4.4: skipped ≠ decided), and one sibling's failure must not drop the others'
+      // marks. Best-effort/fire-and-forget — a ledger blip never breaks building.
+      void markRedditUsed(t.url, t.post.title);
     }));
     markFramingDirty();
     if (ids[0]) setSelectedId(ids[0]);
+    // Surface partial failures (Promise.all used to do this by rejecting; allSettled swallows them) — the
+    // bulk builder catches this and shows the error while the successful reels stay built + marked.
+    const failed = results.filter(r => r.status === 'rejected').length;
+    if (failed) throw new Error(`${failed} of ${ids.length} reels failed to build — the rest were created.`);
   }, [onAddReels, setFramingMap, markFramingDirty]);
 
   // "Delete all reels" confirm. Only offered when there's actually something to clear (more than one

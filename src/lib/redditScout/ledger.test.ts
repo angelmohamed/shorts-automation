@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { postIdFromUrl } from './ledger';
+import { postIdFromUrl, subredditFromUrl } from './ledger';
 
 // Pure URL→id extraction only — the Supabase read/write paths need live credentials and are
 // deliberately NOT exercised in the default test run (see BUILD-PLAN Phase 0).
@@ -41,5 +41,19 @@ describe('postIdFromUrl', () => {
     expect(postIdFromUrl('https://example.com/comments-page')).toBeNull();
     expect(postIdFromUrl('')).toBeNull();
     expect(postIdFromUrl('https://www.reddit.com/r/AskReddit/')).toBeNull();
+  });
+});
+
+describe('subredditFromUrl', () => {
+  it('extracts the sub name from a full permalink', () => {
+    expect(subredditFromUrl('https://www.reddit.com/r/AskReddit/comments/1abc/title/')).toBe('AskReddit');
+  });
+  it('preserves case and underscores', () => {
+    expect(subredditFromUrl('https://reddit.com/r/Two_Sentence_Horror/comments/x/')).toBe('Two_Sentence_Horror');
+  });
+  it('returns null when there is no /r/ segment (redd.it short links, junk)', () => {
+    expect(subredditFromUrl('https://redd.it/1abc')).toBeNull();
+    expect(subredditFromUrl('t3_1abc')).toBeNull();
+    expect(subredditFromUrl('')).toBeNull();
   });
 });
