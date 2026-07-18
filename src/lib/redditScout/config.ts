@@ -22,6 +22,7 @@ export const SCOUT_SUBREDDITS: ScoutSubreddit[] = [
   // Category A — question + replies
   { name: 'AskReddit',           category: 'A', minScore: 5000 },
   { name: 'TooAfraidToAsk',      category: 'A', minScore: 1000 },
+  { name: 'NoStupidQuestions',   category: 'A', minScore: 1500 },   // ~7.3M members
   { name: 'explainlikeimfive',   category: 'A', minScore: 2000 },
   // Category B — story / drama (body word-count flagged for part-splitting)
   { name: 'AmItheAsshole',       category: 'B', minScore: 2000 },
