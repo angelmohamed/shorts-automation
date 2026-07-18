@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { postIdFromUrl, subredditFromUrl } from './ledger';
+import { postIdFromUrl, subredditFromUrl } from './handoff';
 
 // Pure URL→id extraction only — the Supabase read/write paths need live credentials and are
 // deliberately NOT exercised in the default test run (see BUILD-PLAN Phase 0).

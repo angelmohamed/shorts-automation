@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Button } from './ui/Button';
 import type { ScoutCandidate } from '@/lib/redditScout/types';
+import type { UsedRow } from '@/lib/redditScout/ledger';   // type-only — erased at build, pulls no supabase
 import { SCOUT_SUBREDDITS } from '@/lib/redditScout/config';
 import { fmtAge, isLongStory } from '@/lib/redditScout/present';
 
@@ -27,7 +28,7 @@ async function post(body: Record<string, unknown>): Promise<Record<string, unkno
   return json;
 }
 
-export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, onUnbuffer, onSendToImport, onNewCount }: {
+export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, onUnbuffer, onSendToImport, builtPostIds, onNewCount }: {
   open: boolean;
   onClose: () => void;
   bufferCount: number;
@@ -35,8 +36,10 @@ export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, 
   onBuffer: (c: ScoutCandidate) => void;
   onUnbuffer: (id: string) => void;    // undo of a Use
   /** Hand the approved buffer to the Import stage (bulk builder auto-imports the threads; picking +
-      building happen THERE). The buffer releases entries only once their thread is actually present. */
+      building happen THERE). The buffer releases entries only once a reel is built from them. */
   onSendToImport: () => void;
+  /** Post ids that already have a reel in the workspace — excluded from a ledger restore. */
+  builtPostIds: Set<string>;
   onNewCount: (n: number) => void;
 }) {
   const [candidates, setCandidates] = useState<ScoutCandidate[]>([]);
@@ -105,6 +108,43 @@ export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, 
       setLastDecision(null);
     }
   }, [bufferedIds, lastDecision, deciding]);
+
+  // ── Lost-buffer recovery: rebuild the approved buffer from the LEDGER (every Use wrote a used-row with
+  // features first, so approvals are never truly lost). Rows whose post already has a workspace reel are
+  // excluded; the rest re-enter the buffer as reconstructed candidates (redd.it permalinks resolve fine
+  // at Import). ──
+  const [restoring, setRestoring] = useState(false);
+  const restoreFromLedger = useCallback(async () => {
+    setRestoring(true); setNotice(null);
+    const LIMIT = 50;
+    try {
+      const r = await post({ action: 'list-used', limit: LIMIT });
+      const rows = (r.used ?? []) as UsedRow[];
+      const fresh = rows.filter(row => !builtPostIds.has(row.post_id) && !bufferedIds.has(row.post_id));
+      for (const row of fresh) {
+        onBuffer({
+          id: row.post_id,
+          subreddit: row.subreddit,
+          title: row.title,
+          body: row.body ?? '',
+          score: row.score ?? 0,
+          numComments: row.num_comments ?? 0,
+          createdUtc: row.created_utc ?? (Math.floor(Date.parse(row.decided_at) / 1000) || 1),
+          over18: false, stickied: false, isImage: false,
+          permalink: `https://redd.it/${row.post_id}`,
+          author: '',
+        });
+      }
+      const truncated = rows.length >= LIMIT ? ` (showing the ${LIMIT} most recent — older approvals not listed)` : '';
+      setNotice(fresh.length
+        ? `Restored ${fresh.length} approved post${fresh.length === 1 ? '' : 's'} from the ledger.${truncated}`
+        : `Nothing to restore — every recent used post already has a reel or is buffered.${truncated}`);
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : 'Restore failed.');
+    } finally {
+      setRestoring(false);
+    }
+  }, [builtPostIds, bufferedIds, onBuffer]);
 
   const undo = useCallback(async () => {
     if (!lastDecision) return;
@@ -194,6 +234,12 @@ export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, 
         <div className="flex items-center gap-3 border-t border-line px-4 py-3 shrink-0">
           <span className="flex-1 text-caption text-fg-3 tabular-nums">
             {bufferCount ? `${bufferCount} approved, ready for Import` : 'Approved posts land here.'}
+            {' · '}
+            <button type="button" onClick={() => void restoreFromLedger()} disabled={restoring}
+              className="underline underline-offset-2 hover:text-fg disabled:opacity-40"
+              title="Rebuild the approved buffer from the ledger — recovers approvals lost to a cleared buffer (posts that already have reels are skipped)">
+              {restoring ? 'Restoring…' : 'Restore from ledger'}
+            </button>
           </span>
           <Button
             variant="primary" size="sm" disabled={!bufferCount}

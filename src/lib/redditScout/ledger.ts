@@ -1,3 +1,4 @@
+import 'server-only';   // hard guard: this module drags in supabase-js + the secret key — never bundle it client-side
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { DecisionFeatures } from './features';
 
@@ -69,21 +70,43 @@ export async function markDecision(post: SeenPost, status: SeenStatus, features?
     if (error) throw new Error(`ledger write failed: ${error.message}`);
     return;
   }
-  // Feature-less path: flip ONLY the status of an existing row (never decided_at/subreddit/title —
-  // see the docblock)…
-  const upd = await ledger().from('reddit_seen').update({ status }).eq('post_id', post.id).select('post_id');
+  // Feature-less path = the mark-used hook, fired when a REEL IS BUILT — so it stamps built_at (server-
+  // authoritative "a reel exists for this post"; recovery excludes these). It flips ONLY status + built_at
+  // of an existing row (never decided_at/subreddit/title/features — the decide-time training data)…
+  const builtMark = { status, built_at: base.decided_at };   // decided_at holds the ISO now
+  const upd = await ledger().from('reddit_seen').update(builtMark).eq('post_id', post.id).select('post_id');
   if (upd.error) throw new Error(`ledger write failed: ${upd.error.message}`);
   if (upd.data?.length) return;
-  // …or insert a fresh base row. On a 23505 PK race (a concurrent write landed the row first), RETRY
-  // the status update once so our status is deterministically applied — a bare swallow could leave a
-  // built reel labeled 'rejected' if the racer was a decide(rejected). A 0-row retry means a concurrent
-  // undecide deleted the row — that flow's prerogative; do not re-insert.
-  const ins = await ledger().from('reddit_seen').insert(base);
+  // …or insert a fresh base row (built_at set — this is a build). On a 23505 PK race (a concurrent write
+  // landed the row first), RETRY the mark once so our status/built_at is applied — a bare swallow could
+  // leave a built reel labeled 'rejected' if the racer was a decide(rejected). A 0-row retry means a
+  // concurrent undecide deleted the row — that flow's prerogative; do not re-insert.
+  const ins = await ledger().from('reddit_seen').insert({ ...base, built_at: base.decided_at });
   if (ins.error) {
     if (ins.error.code !== '23505') throw new Error(`ledger write failed: ${ins.error.message}`);
-    const retry = await ledger().from('reddit_seen').update({ status }).eq('post_id', post.id).select('post_id');
+    const retry = await ledger().from('reddit_seen').update(builtMark).eq('post_id', post.id).select('post_id');
     if (retry.error) throw new Error(`ledger write failed: ${retry.error.message}`);
   }
+}
+
+/** Recent 'used' but NOT-YET-BUILT rows with their decide-time features — the recovery source for a lost
+    approved buffer. `built_at IS NULL` is the server-authoritative guarantee that a restore can never
+    resurrect a completed post (whose reel exists) into a duplicate build — something the per-browser
+    workspace filter alone couldn't promise (localStorage is exactly what was lost). */
+export interface UsedRow {
+  post_id: string; subreddit: string; title: string; decided_at: string;
+  body: string | null; score: number | null; num_comments: number | null; created_utc: number | null;
+}
+export async function listUsed(limit = 50): Promise<UsedRow[]> {
+  const { data, error } = await ledger()
+    .from('reddit_seen')
+    .select('post_id, subreddit, title, decided_at, body, score, num_comments, created_utc')
+    .eq('status', 'used')
+    .is('built_at', null)
+    .order('decided_at', { ascending: false })
+    .limit(Math.min(200, Math.max(1, limit)));
+  if (error) throw new Error(`ledger read failed: ${error.message}`);
+  return (data ?? []) as UsedRow[];
 }
 
 /** Remove a decision — the §4.6 session-level UNDO for a misclicked Use/Reject. The post becomes
@@ -93,20 +116,6 @@ export async function deleteDecision(postId: string): Promise<void> {
   if (error) throw new Error(`ledger delete failed: ${error.message}`);
 }
 
-/** Extract the Reddit base36 post id from any thread-url shape the app handles:
-    …/comments/<id>/…, redd.it/<id>, /gallery/<id>, or a bare "t3_<id>". Returns null if unrecognisable. */
-export function postIdFromUrl(url: string): string | null {
-  const m =
-    /\/comments\/([a-z0-9]+)/i.exec(url) ??
-    /redd\.it\/([a-z0-9]+)/i.exec(url) ??
-    /\/gallery\/([a-z0-9]+)/i.exec(url) ??
-    /^t3_([a-z0-9]+)$/i.exec(url.trim());
-  return m ? m[1].toLowerCase() : null;
-}
-
-/** The subreddit name from a reddit thread url (`…/r/<name>/…`), or null. Case is preserved (Reddit
-    sub names are case-insensitive but conventionally cased); used only for the ledger row's readability. */
-export function subredditFromUrl(url: string): string | null {
-  const m = /\/r\/([A-Za-z0-9_]+)/.exec(url);
-  return m ? m[1] : null;
-}
+// postIdFromUrl / subredditFromUrl moved to '@/lib/redditScout/handoff' — they're PURE url helpers the
+// CLIENT also needs (filtering already-built posts), and this module drags supabase-js into any bundle
+// that imports it.

@@ -61,20 +61,32 @@ describe('partitionImportUrls', () => {
   });
 });
 
-describe('releaseByUrls (release-at-build)', () => {
+describe('releaseByUrls (release-at-build, canonical matching)', () => {
   const buffer = [cand('a', 'https://www.reddit.com/r/x/comments/a/s/'), cand('b', 'https://www.reddit.com/r/x/comments/b/s/')];
 
-  it('releases exactly the built permalinks; everything else stays buffered', () => {
+  it('releases the built thread; everything else stays buffered', () => {
     const out = releaseByUrls(buffer, ['https://www.reddit.com/r/x/comments/a/s/']);
     expect(out.map(c => c.id)).toEqual(['b']);
   });
-  it('a near-miss url (extra slash, different case) releases NOTHING — exact match only', () => {
-    const out = releaseByUrls(buffer, ['https://www.reddit.com/r/x/comments/A/s/', 'https://www.reddit.com/r/x/comments/b/s']);
-    expect(out).toHaveLength(2);
+
+  it('URL-SHAPE VARIANTS of one thread release together (a restored redd.it entry vs a built permalink)', () => {
+    // The exact bug: buffered as redd.it/<id> after a ledger restore, built as a full permalink.
+    const restored = [cand('a', 'https://redd.it/a')];
+    const out = releaseByUrls(restored, ['https://www.reddit.com/r/x/comments/a/some_slug/']);
+    expect(out).toHaveLength(0);   // released — exact-string matching would have stranded it
   });
-  it('empty built-list is a no-op; unknown urls are ignored', () => {
-    expect(releaseByUrls(buffer, [])).toHaveLength(2);
+
+  it('case / trailing-slash variants of the same id also release', () => {
+    const out = releaseByUrls(buffer, ['https://old.reddit.com/r/x/comments/A/other/', 'https://www.reddit.com/r/x/comments/b']);
+    expect(out).toHaveLength(0);   // both released via canonical key
+  });
+
+  it('a genuinely DIFFERENT post id releases nothing (no false release)', () => {
     expect(releaseByUrls(buffer, ['https://redd.it/zzz'])).toHaveLength(2);
+  });
+
+  it('empty built-list is a no-op', () => {
+    expect(releaseByUrls(buffer, [])).toHaveLength(2);
   });
 });
 

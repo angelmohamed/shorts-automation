@@ -32,7 +32,7 @@ import { SHORTS_MAX_SECONDS, estimateNarrationSeconds, reelDurationInfo } from '
 import { computePipelineStages, computePipelineMusicId } from '@/lib/pipelineStatus';
 import { markRedditUsed } from '@/lib/redditScout/markUsed';
 import { ScoutPanel } from './ScoutPanel';
-import { canonicalThreadKey, partitionImportUrls, releaseByUrls, migrateScoutBuffer } from '@/lib/redditScout/handoff';
+import { canonicalThreadKey, partitionImportUrls, releaseByUrls, migrateScoutBuffer, postIdFromUrl } from '@/lib/redditScout/handoff';
 import { applyThreadEdits, hasThreadEdits, remapCommentEdits, splitParagraphs } from '@/lib/redditThreadEdits';
 import type { RedditThreadEdits } from './TikTokCanvas/types';
 import type { ScoutCandidate } from '@/lib/redditScout/types';
@@ -2688,10 +2688,39 @@ export function CanvasGrid({
     try { return migrateScoutBuffer(JSON.parse(localStorage.getItem('scout:buffer') ?? '[]')); }
     catch { return []; }
   });
+  // Persist guards (the buffer was once lost to exactly this):
+  // 1. MOUNT-ECHO / FAILED-READ CLOBBER: never write [] over storage until a NON-EMPTY buffer has been
+  //    committed this mount. Value-based (not run-count) so it survives StrictMode's double effect-invoke
+  //    — a persisted ref would leave the 2nd invoke "armed" and clobber anyway. A legitimate emptying
+  //    (release-at-build/undo) is always preceded by a non-empty commit that sets the flag.
+  // 2. TOMBSTONE: whenever we decline/replace a stored buffer with [], stash the old value under
+  //    scout:buffer:prev first — including at the failed-read DIVERGENCE (state [], storage non-empty),
+  //    before a later first add can overwrite it unguarded. A one-slot net beneath the ledger restore.
+  const scoutSawNonEmpty = useRef(false);
   useEffect(() => {
-    try { localStorage.setItem('scout:buffer', JSON.stringify(scoutBuffer)); } catch { /* quota/private */ }
+    try {
+      if (scoutBuffer.length > 0) {
+        scoutSawNonEmpty.current = true;
+        localStorage.setItem('scout:buffer', JSON.stringify(scoutBuffer));
+        return;
+      }
+      const prev = localStorage.getItem('scout:buffer');
+      if (prev && prev !== '[]') localStorage.setItem('scout:buffer:prev', prev);   // tombstone before any []
+      if (!scoutSawNonEmpty.current) return;   // mount echo / failed read — do NOT write [] over good data
+      localStorage.setItem('scout:buffer', '[]');   // genuine emptying after a real commit
+    } catch { /* quota/private */ }
   }, [scoutBuffer]);
   const scoutBufferedIds = useMemo(() => new Set(scoutBuffer.map(c => c.id)), [scoutBuffer]);
+  // Post ids that already have a workspace reel — excluded from a ledger restore (they're done).
+  const scoutBuiltPostIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const e of entries) {
+      const url = framingMap[e.id]?.redditThread?.url;
+      const pid = url ? postIdFromUrl(url) : null;
+      if (pid) ids.add(pid);
+    }
+    return ids;
+  }, [entries, framingMap]);
 
   const scoutBufferAdd = useCallback((c: ScoutCandidate) => {
     setScoutBuffer(prev => (prev.some(x => x.id === c.id) ? prev : [...prev, c]));
@@ -3264,6 +3293,7 @@ export function CanvasGrid({
         onBuffer={scoutBufferAdd}
         onUnbuffer={scoutBufferRemove}
         onSendToImport={sendScoutToImport}
+        builtPostIds={scoutBuiltPostIds}
         onNewCount={setScoutNewCount}
       />
 

@@ -16,7 +16,8 @@ create table if not exists reddit_seen (
   score        integer,
   num_comments integer,
   created_utc  bigint,
-  category     text                                  -- scout category A-D from config at decide time
+  category     text,                                 -- scout category A-D from config at decide time
+  built_at     timestamptz                           -- set when a reel is built (mark-used); NULL = approved-but-unbuilt (restorable)
 );
 
 -- The app talks to this table server-side only (API routes) with the project's SECRET key

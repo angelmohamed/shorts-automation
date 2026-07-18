@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { deleteDecision, getSeenIds, markDecision, postIdFromUrl, subredditFromUrl } from '@/lib/redditScout/ledger';
+import { deleteDecision, getSeenIds, markDecision, listUsed } from '@/lib/redditScout/ledger';
+import { postIdFromUrl, subredditFromUrl } from '@/lib/redditScout/handoff';
 import { runScan, type ScanResult } from '@/lib/redditScout/scan';
 import { browserSource } from '@/lib/redditScout/source';
 import { SCOUT_SUBREDDITS } from '@/lib/redditScout/config';
@@ -10,6 +11,7 @@ import { sanitizeDecisionFeatures, cleanText, MAX_TITLE_CHARS } from '@/lib/redd
 //   POST { action:'decide', id, status, subreddit?, title? } — a Use/Reject from the Scout panel
 //   POST { action:'mark-used', url, title }               — shared-ledger hook from the reel-build path
 //   POST { action:'undecide', id }                        — §4.6 undo of the last decision
+//   POST { action:'list-used' }                           — recent used rows (lost-buffer recovery)
 // (The former 'comments' action was removed with the direct-build path — comment capture now happens at
 // the Import handoff via /api/reddit, which fetches the full tree.)
 
@@ -57,6 +59,12 @@ export async function POST(request: NextRequest) {
       const features = sanitizeDecisionFeatures(body, category);
       await markDecision({ id, subreddit, title: cleanText(body.title, MAX_TITLE_CHARS) }, status, features);
       return NextResponse.json({ ok: true });
+    }
+    if (action === 'list-used') {
+      // Recovery: recent used-but-unbuilt rows so a lost approved buffer can be reconstructed. `|| 50`
+      // guards a bare Number() → NaN reaching listUsed's clamp; listUsed bounds it to [1, 200].
+      const limit = Number(body.limit) || 50;
+      return NextResponse.json({ used: await listUsed(limit) });
     }
     if (action === 'undecide') {
       // §4.6 undo of the LAST decision — deletes the ledger row so the post is suggestible again.
