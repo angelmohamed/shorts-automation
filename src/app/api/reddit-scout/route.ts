@@ -2,15 +2,16 @@ import { NextRequest, NextResponse } from 'next/server';
 import { deleteDecision, getSeenIds, markDecision, postIdFromUrl, subredditFromUrl } from '@/lib/redditScout/ledger';
 import { runScan, type ScanResult } from '@/lib/redditScout/scan';
 import { browserSource } from '@/lib/redditScout/source';
-import { topComments } from '@/lib/redditScout/parse';
-import { SCOUT_COMMENTS_PER_POST, SCOUT_SUBREDDITS } from '@/lib/redditScout/config';
+import { SCOUT_SUBREDDITS } from '@/lib/redditScout/config';
 import { sanitizeDecisionFeatures, cleanText, MAX_TITLE_CHARS } from '@/lib/redditScout/features';
 
 // Reddit Scout API (server-side — the Supabase secret key and the browser transport never reach the client).
 //   POST { action:'scan' }                                — fetch + filter + rank a session of candidates
-//   POST { action:'comments', id, n? }                    — top usable comments for one post (preview / package)
 //   POST { action:'decide', id, status, subreddit?, title? } — a Use/Reject from the Scout panel
 //   POST { action:'mark-used', url, title }               — shared-ledger hook from the reel-build path
+//   POST { action:'undecide', id }                        — §4.6 undo of the last decision
+// (The former 'comments' action was removed with the direct-build path — comment capture now happens at
+// the Import handoff via /api/reddit, which fetches the full tree.)
 
 export const runtime = 'nodejs';
 // A scan is ~13 sequential listing fetches with a 1s politeness gap (~15-25s). No effect on a local/
@@ -31,15 +32,6 @@ export async function POST(request: NextRequest) {
     if (action === 'scan') {
       scanInFlight ??= runScan(browserSource, { getSeenIds }).finally(() => { scanInFlight = null; });
       return NextResponse.json(await scanInFlight);
-    }
-    if (action === 'comments') {
-      const id = String(body.id ?? '');
-      if (!/^[a-z0-9]+$/i.test(id)) return NextResponse.json({ error: 'valid post id required' }, { status: 400 });
-      // n: absent/null → the configured default; otherwise clamp to [1, 20] (floor floats, junk → default).
-      const nRaw = body.n == null ? NaN : Number(body.n);
-      const n = Number.isFinite(nRaw) ? Math.min(20, Math.max(1, Math.floor(nRaw))) : SCOUT_COMMENTS_PER_POST;
-      const raw = await browserSource.fetchCommentsRaw(id.toLowerCase(), 50);   // depth=1 → all 50 are top-level
-      return NextResponse.json({ comments: topComments(raw, n) });
     }
     if (action === 'mark-used') {
       const url = String(body.url ?? '');

@@ -44,9 +44,6 @@ export const SCOUT_TIMEFRAME: 'hour' | 'day' | 'week' | 'month' | 'year' | 'all'
 /** Posts fetched per subreddit before filtering. */
 export const SCOUT_POSTS_PER_SUB = 40;
 
-/** Top comments captured per used post (deleted/removed/sticky/bot comments excluded first). */
-export const SCOUT_COMMENTS_PER_POST = 3;
-
 /** Include NSFW-flagged posts (off by default). */
 export const SCOUT_INCLUDE_NSFW = false;
 

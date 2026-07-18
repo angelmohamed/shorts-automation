@@ -32,11 +32,10 @@ import { SHORTS_MAX_SECONDS, estimateNarrationSeconds, reelDurationInfo } from '
 import { computePipelineStages, computePipelineMusicId } from '@/lib/pipelineStatus';
 import { markRedditUsed } from '@/lib/redditScout/markUsed';
 import { ScoutPanel } from './ScoutPanel';
-import { toImportedPost } from '@/lib/redditScout/parse';
-import { remainingBufferAfterBuild, buildOutcomeNotice } from '@/lib/redditScout/buffer';
+import { canonicalThreadKey, partitionImportUrls, releaseByUrls, migrateScoutBuffer } from '@/lib/redditScout/handoff';
 import { applyThreadEdits, hasThreadEdits, remapCommentEdits, splitParagraphs } from '@/lib/redditThreadEdits';
 import type { RedditThreadEdits } from './TikTokCanvas/types';
-import type { ScoutCandidate, ScoutRedditComment } from '@/lib/redditScout/types';
+import type { ScoutCandidate } from '@/lib/redditScout/types';
 import { useObservedSize, fitScaleFor } from '@/app/hooks/useElementSize';
 import { useEditorZoomPan, EDITOR_ZOOM_MIN as ZOOM_MIN, EDITOR_ZOOM_MAX as ZOOM_MAX } from '@/app/hooks/useEditorZoomPan';
 import {
@@ -1150,11 +1149,19 @@ interface BulkThread {
   selectedParas: Set<number>;
 }
 
-function BulkBuilder({ open, onClose, onBuild, speed }: {
+function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsumed, onQueueDone }: {
   open: boolean;
   onClose: () => void;
   onBuild: (threads: Array<{ url: string; post: ImportedRedditPost; comments: ImportedRedditComment[]; selectedComments: number[]; selectedParas: number[] }>) => Promise<{ built: number; failed: number }>;
   speed: number;   // narration speed — scales the live length estimate shown while picking comments
+  /** Scout → Import handoff: approved post urls to auto-import when the panel opens. */
+  queuedUrls?: string[] | null;
+  /** Fired the moment the queue is picked up (clears the parent's slot so the effect can't double-fire). */
+  onQueueConsumed?: () => void;
+  /** Fired when the queued import finishes (ALWAYS, even on failure), with every url now present in the
+      builder — the parent uses it to clear its handoff indicator + surface import failures. The Scout
+      buffer itself releases only at BUILD time (builder threads aren't reload-durable; reels are). */
+  onQueueDone?: (presentUrls: string[]) => void;
 }) {
   const [linksText, setLinksText] = useState('');
   const [threads, setThreads] = useState<BulkThread[]>([]);
@@ -1167,32 +1174,25 @@ function BulkBuilder({ open, onClose, onBuild, speed }: {
   const [addText, setAddText] = useState('');
   const [adding, setAdding] = useState(false);                     // importing appended threads
   const [reading, setReading] = useState<{ kind: 'c' | 'p'; idx: number } | null>(null);  // comment/para shown full-text in the reading pane
+  const importGen = useRef(0);   // bumped by reset(); an in-flight import from a prior generation lands nothing
   const COMMENTS_PER_PAGE = 8;
   // Reset the reading pane when the active thread changes, so a stale index from another thread never shows.
   useEffect(() => { setReading(null); }, [activeThread]);
 
   // Import pasted links. append=false replaces the grid (initial import); append=true keeps the existing
   // threads and adds the new ones (dedup by URL) so more threads can be pulled in after the first fetch.
-  async function runImport(rawText: string, append: boolean) {
-    // Dedup on a canonical thread key (mirrors the server's resolveThreadId) so www / trailing-slash /
-    // ?utm_source variants of the same thread don't import twice (and build duplicate reels). The raw URL
-    // is still what gets imported — only the dedup key is canonical.
-    const canonKey = (u: string): string => {
-      try {
-        const url = new URL(u);
-        const host = url.hostname.replace(/^(www|old|new|np)\./, '');
-        const parts = url.pathname.split('/').filter(Boolean);
-        const ci = parts.indexOf('comments');
-        if (ci >= 0 && parts[ci + 1]) return parts[ci + 1].toLowerCase();
-        if (host === 'redd.it') return (parts[0] ?? u).toLowerCase();
-        return (host + url.pathname.replace(/\/$/, '')).toLowerCase();
-      } catch { return u.trim().toLowerCase(); }
-    };
-    const have = new Set(threads.map(t => canonKey(t.url)));
-    const seen = new Set<string>();
-    const urls = rawText.split(/\s+/).map(u => u.trim()).filter(u => /reddit\.com|redd\.it/.test(u))
-      .filter(u => { const k = canonKey(u); if (seen.has(k) || (append && have.has(k))) return false; seen.add(k); return true; });
-    if (!urls.length) { setError(append ? 'No new links to add (already imported, or none pasted).' : 'Paste at least one Reddit thread link.'); return; }
+  // Returns every input url that is PRESENT in the builder afterwards (imported this run, or skipped by
+  // dedup because its thread is already here) — the Scout handoff releases exactly these from its buffer.
+  async function runImport(rawText: string, append: boolean): Promise<string[]> {
+    // Partition via the canonical thread key (tested in lib/redditScout/handoff.ts) so www/trailing-slash/
+    // ?utm variants of one thread never import twice; urls whose thread is already here count "present".
+    const gen = importGen.current;   // a Start-over mid-import invalidates this run (see the post-await guard)
+    const have = append ? new Set(threads.map(t => canonicalThreadKey(t.url))) : new Set<string>();
+    const { toImport: urls, alreadyPresent } = partitionImportUrls(rawText, have);
+    if (!urls.length) {
+      setError(append && !alreadyPresent.length ? 'No new links to add (already imported, or none pasted).' : append ? '' : 'Paste at least one Reddit thread link.');
+      return alreadyPresent;
+    }
     setError('');
     setProgress({ done: 0, total: urls.length });
     if (append) setAdding(true); else setPhase('importing');
@@ -1222,30 +1222,64 @@ function BulkBuilder({ open, onClose, onBuild, speed }: {
         setProgress(p => ({ ...p, done: p.done + 1 }));
       }
     }));
+    // A Start-over while we awaited invalidated this run: the pre-reset thread state (and alreadyPresent,
+    // computed against it) is gone. Land nothing, report NOTHING present — interrupted posts stay
+    // buffered in the Scout for a clean re-send instead of being orphaned into hidden/replaced threads.
+    if (gen !== importGen.current) {
+      setAdding(false);
+      if (!append) setPhase('input');
+      return [];
+    }
     const out = results.filter((t): t is BulkThread => !!t);
+    const failedCount = urls.length - out.length;
     if (append) {
       setAdding(false);
-      if (!out.length) { setError('None of those links could be added.'); return; }
+      if (!out.length) { setError('None of those links could be added.'); return alreadyPresent; }
       const firstNew = threads.length;
       setThreads(prev => [...prev, ...out]);
       setActiveThread(firstNew);   // jump to the first newly-added thread
       setAddText(''); setAddOpen(false);
+      if (failedCount) setError(`${failedCount} link${failedCount === 1 ? '' : 's'} failed to import — the rest were added.`);
     } else if (out.length) {
       setThreads(out);
       setActiveThread(0);
       setVisible({});
       setPhase('select');
+      if (failedCount) setError(`${failedCount} link${failedCount === 1 ? '' : 's'} failed to import — the rest were added.`);
     } else {
       // Every link failed — return to the paste screen (phase is 'importing' right now) so the textarea +
       // "Import all" stay visible with the error, instead of stranding the user on a blank select screen.
       setPhase('input');
       setError('None of those links could be imported.');
     }
+    return [...out.map(t => t.url), ...alreadyPresent];
   }
 
+  // ── Scout → Import handoff: queued urls auto-import like pasted links (append when threads already
+  // exist, initial import otherwise). The queue is consumed BEFORE the import starts (double-fire guard).
+  // Deliberately NOT gated on `open`: the queue is only ever set together with opening the panel, the
+  // component stays mounted while closed, and a busy-parked queue must still self-consume once phase/
+  // adding settle — otherwise closing the panel at the wrong moment parks it (and the Scout node's
+  // "running" pulse) forever. onQueueDone always fires (even on a rejection) so the parent's handoff
+  // flag can't strand; it reports import failures — the buffer itself releases only at BUILD time.
+  useEffect(() => {
+    if (!queuedUrls?.length) return;
+    if (phase === 'importing' || phase === 'building' || adding) return;   // busy — effect refires when phase/adding settle
+    const urls = queuedUrls;
+    onQueueConsumed?.();
+    if (threads.length > 0) setAddOpen(true);   // surface the existing "Adding… x/y" progress strip
+    void runImport(urls.join('\n'), threads.length > 0).then(
+      present => onQueueDone?.(present),
+      () => onQueueDone?.([]),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queuedUrls, phase, adding]);
+
   // Discard everything and return to the paste screen (persistence keeps state across close, so this is
-  // the explicit way to start a fresh batch).
+  // the explicit way to start a fresh batch). Bumping importGen invalidates any in-flight import so its
+  // results can't land into (or report "present" against) the discarded thread state.
   function reset() {
+    importGen.current++;
     setThreads([]); setLinksText(''); setPhase('input');
     setActiveThread(0); setVisible({}); setError(''); setAddOpen(false); setAddText('');
   }
@@ -1502,7 +1536,7 @@ function BulkBuilder({ open, onClose, onBuild, speed }: {
                 </span>
               )}
               {error && <span className="text-caption text-danger-text">{error}</span>}
-              <button type="button" onClick={reset} className="ml-auto text-caption text-fg-3 hover:text-fg underline underline-offset-2 shrink-0">Start over</button>
+              <button type="button" onClick={reset} disabled={adding} className="ml-auto text-caption text-fg-3 hover:text-fg underline underline-offset-2 shrink-0 disabled:opacity-40 disabled:pointer-events-none">Start over</button>
             </div>
           </>
         )}
@@ -2300,8 +2334,8 @@ export function CanvasGrid({
   const buildReelsFromThreads = useCallback(async (threads: Array<{
     url: string; post: ImportedRedditPost; comments: ImportedRedditComment[];
     selectedComments: number[]; selectedParas: number[];
-  }>): Promise<{ built: number; failed: number }> => {
-    if (!onAddReels || !threads.length) return { built: 0, failed: 0 };
+  }>): Promise<{ built: number; failed: number; builtUrls: string[] }> => {
+    if (!onAddReels || !threads.length) return { built: 0, failed: 0, builtUrls: [] };
     const segs = await fetchFootageManifest().catch(() => [] as FootageSegment[]);
     const rand = () => (segs.length ? segs[Math.floor(Math.random() * segs.length)].url : undefined);
     const ids = onAddReels(threads.map(() => rand()));
@@ -2329,7 +2363,9 @@ export function CanvasGrid({
     markFramingDirty();
     if (ids[0]) setSelectedId(ids[0]);
     const failed = results.filter(r => r.status === 'rejected').length;
-    return { built: ids.length, failed };
+    // builtUrls = threads that now HAVE a grid reel (addReels consumes the prefix) — the Scout buffer
+    // releases exactly these (release-at-build: presence in the builder is not reload-durable, a reel is).
+    return { built: ids.length, failed, builtUrls: threads.slice(0, ids.length).map(t => t.url) };
   }, [onAddReels, setFramingMap, markFramingDirty]);
 
   // "Delete all reels" confirm. Only offered when there's actually something to clear (more than one
@@ -2643,87 +2679,54 @@ export function CanvasGrid({
 
   // ── Reddit Scout: approved-post buffer + panel state ──────────────────────────────────────────────
   // The buffer PERSISTS (localStorage): a Use marks the post 'used' in the permanent ledger immediately,
-  // so losing the buffer on reload would orphan approved posts (used forever, never built).
+  // so losing the buffer on reload would orphan approved posts (used forever, never imported). Entries
+  // leave the buffer only when their thread is actually PRESENT in the bulk builder (see the handoff).
   const [scoutOpen, setScoutOpen] = useState(false);
   const [scoutNewCount, setScoutNewCount] = useState(0);
-  const [scoutBuilding, setScoutBuilding] = useState(false);
-  type ScoutBufferEntry = { candidate: ScoutCandidate; comments: ScoutRedditComment[] | null };
-  const [scoutBuffer, setScoutBuffer] = useState<ScoutBufferEntry[]>(() => {
-    // Shape-validate, not just parse-guard: valid-JSON-wrong-shape (a legacy format, '{}', [null]) would
-    // crash later at .candidate.id. Malformed entries are dropped, not the whole buffer.
-    try {
-      const raw: unknown = JSON.parse(localStorage.getItem('scout:buffer') ?? '[]');
-      if (!Array.isArray(raw)) return [];
-      return raw.filter((e): e is ScoutBufferEntry =>
-        !!e && typeof e === 'object'
-        && typeof (e as ScoutBufferEntry).candidate?.id === 'string'
-        && (Array.isArray((e as ScoutBufferEntry).comments) || (e as ScoutBufferEntry).comments === null),
-      );
-    } catch { return []; }
+  const [scoutBuffer, setScoutBuffer] = useState<ScoutCandidate[]>(() => {
+    // Shape-validation + legacy migration live in the tested lib (migrateScoutBuffer).
+    try { return migrateScoutBuffer(JSON.parse(localStorage.getItem('scout:buffer') ?? '[]')); }
+    catch { return []; }
   });
   useEffect(() => {
     try { localStorage.setItem('scout:buffer', JSON.stringify(scoutBuffer)); } catch { /* quota/private */ }
   }, [scoutBuffer]);
-  const scoutBufferedIds = useMemo(() => new Set(scoutBuffer.map(e => e.candidate.id)), [scoutBuffer]);
-
-  /** Top comments for a post via the scout route (n=12: enough material for the copy stage + picking). */
-  const fetchScoutComments = useCallback(async (id: string): Promise<ScoutRedditComment[] | null> => {
-    try {
-      const res = await fetch('/api/reddit-scout', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'comments', id, n: 12 }),
-      });
-      const json = await res.json();
-      return res.ok ? ((json.comments ?? []) as ScoutRedditComment[]) : null;
-    } catch { return null; }
-  }, []);
+  const scoutBufferedIds = useMemo(() => new Set(scoutBuffer.map(c => c.id)), [scoutBuffer]);
 
   const scoutBufferAdd = useCallback((c: ScoutCandidate) => {
-    setScoutBuffer(prev => (prev.some(e => e.candidate.id === c.id) ? prev : [...prev, { candidate: c, comments: null }]));
-    // Prefetch comments in the background so Build is instant and the copy stage has real material.
-    void fetchScoutComments(c.id).then(comments => {
-      if (comments) setScoutBuffer(prev => prev.map(e => (e.candidate.id === c.id ? { ...e, comments } : e)));
-    });
-  }, [fetchScoutComments]);
-
-  const scoutBufferRemove = useCallback((id: string) => {
-    setScoutBuffer(prev => prev.filter(e => e.candidate.id !== id));
+    setScoutBuffer(prev => (prev.some(x => x.id === c.id) ? prev : [...prev, c]));
   }, []);
 
-  /** Turn the approved buffer into staged reels (capture-everything: comments attached, nothing
-      pre-selected — picking happens per reel in the Reddit flyout / bulk builder as today).
-      Returns a user-facing notice (cap truncation / failed cards) or null on a clean full build.
-      Buffer reconciliation (tested in lib/redditScout/buffer.ts): only the BUILT prefix leaves the
-      buffer — cap-truncated posts stay (they're already ledger-marked 'used'; wiping them would orphan
-      them forever), built posts always leave (retrying them would duplicate reels). */
-  const buildFromScoutBuffer = useCallback(async (): Promise<string | null> => {
-    if (!scoutBuffer.length || scoutBuilding) return null;
-    setScoutBuilding(true);
-    try {
-      const snapshot = scoutBuffer;
-      const threads = [];
-      for (const e of snapshot) {
-        // The Use-time prefetch usually landed; re-fetch stragglers now, and build with [] on failure
-        // (the copy stage still works — /api/description accepts a post-only thread).
-        const comments = e.comments ?? (await fetchScoutComments(e.candidate.id)) ?? [];
-        threads.push({
-          url: e.candidate.permalink,
-          post: toImportedPost(e.candidate),
-          comments,
-          selectedComments: [] as number[],
-          selectedParas: [] as number[],
-        });
-      }
-      const { built, failed } = await buildReelsFromThreads(threads);
-      const snapshotIds = snapshot.map(e => e.candidate.id);
-      setScoutBuffer(prev => remainingBufferAfterBuild(prev, snapshotIds, built, e => e.candidate.id));
-      const notice = buildOutcomeNotice(threads.length, built, failed, MAX_REELS);
-      if (!notice) setScoutOpen(false);
-      return notice;
-    } finally {
-      setScoutBuilding(false);
-    }
-  }, [scoutBuffer, scoutBuilding, fetchScoutComments, buildReelsFromThreads]);
+  const scoutBufferRemove = useCallback((id: string) => {
+    setScoutBuffer(prev => prev.filter(c => c.id !== id));
+  }, []);
+
+  // ── Scout → Import handoff. "Send N to Import" queues the approved urls for the bulk builder, which
+  // auto-imports them (full comment trees — richer than anything the Scout captured). The buffer releases
+  // a post only at BUILD time (release-at-build: builder threads are NOT reload-durable, a grid reel is) —
+  // so a failed import, a reload before Build, or a Start-over all leave the post buffered for a clean
+  // re-send (its ledger row already says 'used'; the builder dedups a re-sent thread that's still there).
+  const [scoutImportQueue, setScoutImportQueue] = useState<string[] | null>(null);
+  const [scoutHandoffRunning, setScoutHandoffRunning] = useState(false);
+  const scoutQueuedCountRef = useRef(0);
+  const sendScoutToImport = useCallback(() => {
+    if (!scoutBuffer.length) return;
+    scoutQueuedCountRef.current = scoutBuffer.length;
+    setScoutImportQueue(scoutBuffer.map(c => c.permalink));
+    setScoutOpen(false);
+    setBulkOpen(true);
+  }, [scoutBuffer]);
+  // Import finished (or failed): clear the running pulse and surface failures — visible even if the
+  // builder was closed mid-import (its internal error line wouldn't be).
+  const onScoutQueueDone = useCallback((presentUrls: string[]) => {
+    setScoutHandoffRunning(false);
+    const failed = scoutQueuedCountRef.current - presentUrls.length;
+    if (failed > 0) setBatchNotice(`${failed} approved post${failed === 1 ? '' : 's'} failed to import — still buffered in Scout for a re-send.`);
+  }, []);
+  // Release-at-build: exactly the threads that now HAVE a grid reel leave the buffer (tested lib fn).
+  const releaseScoutForBuilt = useCallback((builtUrls: string[]) => {
+    if (builtUrls.length) setScoutBuffer(prev => releaseByUrls(prev, builtUrls));
+  }, []);
 
   // ── Bulk pipeline (stages-as-nodes) — pure status derivation lives in '@/lib/pipelineStatus' (tested) ──
   const pipelineStages = useMemo(
@@ -2733,12 +2736,12 @@ export function CanvasGrid({
         key: 'scout' as const,
         done: scoutBuffer.length,
         total: scoutBuffer.length,
-        running: scoutBuilding,
+        running: scoutImportQueue !== null || scoutHandoffRunning,   // handoff queued or importing
         statusLine: `${scoutNewCount} new · ${scoutBuffer.length} buffered`,
       },
       ...computePipelineStages(entries, framingMap, { batchOp, batchProgress, isDownloadingAll, downloadProgress }),
     ],
-    [entries, framingMap, batchOp, batchProgress, isDownloadingAll, downloadProgress, scoutBuffer.length, scoutBuilding, scoutNewCount],
+    [entries, framingMap, batchOp, batchProgress, isDownloadingAll, downloadProgress, scoutBuffer.length, scoutImportQueue, scoutNewCount],
   );
   const pipelineTotalReels = pipelineStages.find(s => s.key === 'import')?.total ?? 0;   // NOT [0] — scout leads now
   const pipelineMusicId = useMemo(() => computePipelineMusicId(entries, framingMap), [entries, framingMap]);
@@ -3241,7 +3244,17 @@ export function CanvasGrid({
       </div>
       {/* Always mounted (renders null while closed) so pasted links, imported threads, and selections
           survive closing and reopening the panel. */}
-      <BulkBuilder open={bulkOpen} onClose={() => setBulkOpen(false)} onBuild={buildReelsFromThreads} speed={narrationSpeed} />
+      <BulkBuilder
+        open={bulkOpen} onClose={() => setBulkOpen(false)} speed={narrationSpeed}
+        onBuild={async ts => {
+          const r = await buildReelsFromThreads(ts);
+          releaseScoutForBuilt(r.builtUrls);   // release-at-build: reels exist for exactly these urls now
+          return r;
+        }}
+        queuedUrls={scoutImportQueue}
+        onQueueConsumed={() => { setScoutImportQueue(null); setScoutHandoffRunning(true); }}
+        onQueueDone={onScoutQueueDone}
+      />
       {/* Reddit Scout — the wide review panel opened from the pipeline's Scout node. */}
       <ScoutPanel
         open={scoutOpen}
@@ -3250,8 +3263,7 @@ export function CanvasGrid({
         bufferedIds={scoutBufferedIds}
         onBuffer={scoutBufferAdd}
         onUnbuffer={scoutBufferRemove}
-        onBuild={buildFromScoutBuffer}
-        building={scoutBuilding}
+        onSendToImport={sendScoutToImport}
         onNewCount={setScoutNewCount}
       />
 

@@ -6,11 +6,12 @@ import type { ScoutCandidate } from '@/lib/redditScout/types';
 import { SCOUT_SUBREDDITS } from '@/lib/redditScout/config';
 import { fmtAge, isLongStory } from '@/lib/redditScout/present';
 
-// The Scout review panel (REQUIREMENTS §4.5/§4.6): scan → a ranked, category-interleaved feed of unseen
-// candidates → Use / Reject / Skip / Open per card, an undo for the last decision, and a buffer tray that
-// "Build N reels" turns into staged reels. Decisions POST to /api/reddit-scout (server-side ledger);
-// Skip is local-only (§3.4: skips are NOT recorded). The BUFFER lives in the parent (CanvasGrid) so it
-// persists and feeds the node's status line + the build.
+// The Scout review panel (REQUIREMENTS §4.5–4.7): scan → a ranked, category-interleaved feed of unseen
+// candidates → Use / Reject / Skip / Open per card, an undo for the last decision, and a buffer tray whose
+// "Send N to Import" hands the approved posts to the bulk builder (auto-import → pick/tweak → build there).
+// Decisions POST to /api/reddit-scout (server-side ledger); Skip is local-only (§3.4: skips are NOT
+// recorded). The BUFFER lives in the parent (CanvasGrid), persists, and releases entries only when a reel
+// is actually built from them (release-at-build — never orphan a used-marked post).
 
 interface ScanStats { subsScanned: number; fetched: number; afterThresholds: number; afterSeen: number }
 interface ScanResponse { candidates: ScoutCandidate[]; failedSubs: string[]; stats: ScanStats; error?: string }
@@ -26,15 +27,16 @@ async function post(body: Record<string, unknown>): Promise<Record<string, unkno
   return json;
 }
 
-export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, onUnbuffer, onBuild, building, onNewCount }: {
+export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, onUnbuffer, onSendToImport, onNewCount }: {
   open: boolean;
   onClose: () => void;
   bufferCount: number;
   bufferedIds: Set<string>;            // so a re-scan can't show something already buffered
   onBuffer: (c: ScoutCandidate) => void;
   onUnbuffer: (id: string) => void;    // undo of a Use
-  onBuild: () => Promise<string | null>;   // resolves to an outcome notice (cap/failed cards) or null
-  building: boolean;
+  /** Hand the approved buffer to the Import stage (bulk builder auto-imports the threads; picking +
+      building happen THERE). The buffer releases entries only once their thread is actually present. */
+  onSendToImport: () => void;
   onNewCount: (n: number) => void;
 }) {
   const [candidates, setCandidates] = useState<ScoutCandidate[]>([]);
@@ -178,9 +180,9 @@ export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, 
                   {c.body && <p className="mt-0.5 line-clamp-1 text-caption text-fg-3">{c.body}</p>}
                 </div>
                 <div className="flex shrink-0 items-center gap-1 pt-0.5">
-                  <Button variant="primary" size="sm" disabled={busy || building} onClick={() => void decide(c, i, 'used')}>Use</Button>
-                  <Button variant="secondary" size="sm" disabled={busy || building} onClick={() => void decide(c, i, 'rejected')}>Reject</Button>
-                  <Button variant="ghost" size="sm" disabled={busy || building} onClick={() => removeById(c.id)}>Skip</Button>
+                  <Button variant="primary" size="sm" disabled={busy} onClick={() => void decide(c, i, 'used')}>Use</Button>
+                  <Button variant="secondary" size="sm" disabled={busy} onClick={() => void decide(c, i, 'rejected')}>Reject</Button>
+                  <Button variant="ghost" size="sm" disabled={busy} onClick={() => removeById(c.id)}>Skip</Button>
                   <Button variant="ghost" size="sm" onClick={() => window.open(c.permalink, '_blank', 'noopener')} aria-label="Open on Reddit">↗</Button>
                 </div>
               </div>
@@ -188,20 +190,21 @@ export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, 
           })}
         </div>
 
-        {/* Buffer tray */}
+        {/* Buffer tray — approved posts hand off to the Import stage (picking + building happen there). */}
         <div className="flex items-center gap-3 border-t border-line px-4 py-3 shrink-0">
           <span className="flex-1 text-caption text-fg-3 tabular-nums">
-            {bufferCount ? `${bufferCount} approved, ready to build` : 'Approved posts land here.'}
+            {bufferCount ? `${bufferCount} approved, ready for Import` : 'Approved posts land here.'}
           </span>
           <Button
-            variant="primary" size="sm" disabled={!bufferCount || building} loading={building}
-            onClick={() => void onBuild()
-              // Always drop the undo affordance after a build attempt: an "Undo use" surviving the build
-              // would delete the ledger row of a post that IS now a reel (→ re-suggestible → duplicate).
-              .then(msg => { setLastDecision(null); if (msg) setNotice(msg); })
-              .catch(e => setNotice(e instanceof Error ? e.message : 'Build failed — approved posts stay buffered.'))}
+            variant="primary" size="sm" disabled={!bufferCount}
+            onClick={() => {
+              // Drop the undo affordance at handoff: undoing a Use whose thread is now in the builder
+              // would delete its ledger row while the reel still gets built (→ re-suggestible → duplicate).
+              setLastDecision(null);
+              onSendToImport();
+            }}
           >
-            {building ? 'Building…' : `Build ${bufferCount || ''} reel${bufferCount === 1 ? '' : 's'}`}
+            {`Send ${bufferCount || ''} to Import`}
           </Button>
         </div>
       </div>

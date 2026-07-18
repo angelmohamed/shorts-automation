@@ -3,7 +3,6 @@ import {
   SCOUT_SUBREDDITS,
   SCOUT_TIMEFRAME,
   SCOUT_POSTS_PER_SUB,
-  SCOUT_COMMENTS_PER_POST,
   SCOUT_SESSION_SIZE,
   SCOUT_LONG_STORY_SECONDS,
   SCOUT_REQUEST_GAP_MS,
@@ -63,7 +62,6 @@ describe('scout knobs', () => {
   it('counts are positive and sane', () => {
     expect(SCOUT_POSTS_PER_SUB).toBeGreaterThan(0);
     expect(SCOUT_POSTS_PER_SUB).toBeLessThanOrEqual(100);   // Reddit listings cap at 100 per request
-    expect(SCOUT_COMMENTS_PER_POST).toBeGreaterThan(0);
     expect(SCOUT_SESSION_SIZE).toBeGreaterThan(0);
   });
 

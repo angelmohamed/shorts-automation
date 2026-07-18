@@ -85,18 +85,26 @@ The list + categories live in the **config file** (§6) and can grow without cod
 - Per candidate: **Use**, **Reject**, **Skip** (undecided), **Open** (the reddit permalink in a new tab).
 - **Session-level undo** of the last decision (guards against misclicks) before it's committed permanently.
 
-### 4.7 Buffer + build  **[decided]**
+### 4.7 Buffer + handoff to Import  **[decided — revised]**
 - **Use** → the post enters an **approved buffer** *and* its id is written `used` to Supabase immediately.
-- A **"Build N reels"** action turns the buffer into staged reels by calling the existing
-  `buildReelsFromThreads(threads[])` (`CanvasGrid.tsx`), where each thread supplies
-  `{ url, post: ImportedRedditPost, comments: ImportedRedditComment[], selectedComments, selectedParas }`.
-- Built reels arrive with footage + a rendered card and flow into Pick → Narrate → … as today.
+- **"Send N to Import"** hands the buffer's urls to the **bulk builder**, which auto-imports them exactly
+  like hand-pasted links (full comment trees, canonical-url dedup, concurrency 3, per-link failure
+  surfacing). Picking + text-tweaking + building then happen in the builder — so the pipeline's
+  Scout → Import → Pick → build edges carry real data. (The original direct "Build N reels" produced
+  title-only cards and bypassed Import/Pick; replaced 2026-07-18.)
+- Buffer entries are released **only at BUILD time** — when a grid reel actually exists for the post
+  (builder threads are not reload-durable; reels are). A failed import, a reload before Build, or a
+  builder "Start over" all leave the post buffered for a clean re-send (the builder dedups re-sent
+  threads that are still present), never silently orphaned.
+- Built reels arrive with footage + a rendered card and flow into Footage → Narrate → … as today.
 
-### 4.8 Output package captured on "Use"
-For each used post, capture (per the reel-build shape and for the durable record): title, full body text (if any),
-top **N comments (default 3)** with author + upvote count — **excluding** deleted/removed, stickied moderator, and
-bot comments (e.g. `AutoModerator`) — the permalink, and stats (score, comment count, age, subreddit). Identifiable
-by `subreddit + post id`.
+### 4.8 What "Use" captures  **[revised with the Import handoff]**
+On **Use**, the app durably captures the **candidate itself** — title, full body text (if any), permalink,
+score, comment count, age, subreddit, post id — as the buffered entry plus the permanent ledger row (with
+the §5.1 training features). **Comments are deferred to the Import handoff**: the bulk builder's import
+fetches the FULL comment tree via `/api/reddit`, which already applies the exclusion rules (deleted/
+removed, stickied moderator, and bots such as `AutoModerator`). Everything remains identifiable by
+`subreddit + post id`.
 
 ## 5. Data model
 
@@ -125,7 +133,7 @@ table reddit_seen
 A single typed config file (e.g. `src/lib/redditScout/config.ts`) — version-controlled, hot-reloaded, editable
 without touching core logic:
 - subreddit list, each with its **category** and **per-sub min score**
-- **timeframe** (`t=week` default), **posts fetched per sub** (~40), **N comments captured** (3)
+- **timeframe** (`t=week` default), **posts fetched per sub** (~40)
 - **NSFW inclusion** switch, **session size** (~25), **long-story threshold** (seconds)
 
 ## 7. Technical constraints & known pitfalls (verified)
@@ -147,7 +155,8 @@ without touching core logic:
 - **Fetch:** `redditBrowserJson('/r/<sub>/top.json?t=week&limit=40')` and
   `redditBrowserJson('/comments/<id>.json?raw_json=1&limit=<N>')`; parse with logic mirroring `flattenComments`
   (`src/app/api/reddit/route.ts`).
-- **Build:** buffer → `buildReelsFromThreads(...)`.
+- **Handoff:** buffer → "Send N to Import" queue → bulk-builder auto-import (dedup + failure surfacing)
+  → pick/tweak → the builder's Build (`buildReelsFromThreads`), which releases the buffer for built urls.
 - **Ledger hook:** wherever a reel gains/holds a `redditThread.url`, extract the post id and upsert `used`.
 - **UI:** a `'scout'` entry in `PipelineView`'s `ORDER` + a wide review panel; reuse the app's tokens/components.
 
@@ -156,7 +165,9 @@ without touching core logic:
 - Running "Scout now" returns a ranked, interleaved list of **only unseen** candidates across the configured subs,
   degrading gracefully when a sub fails.
 - Use/Reject persist to Supabase and the post never reappears — across restarts and across the manual build path.
-- "Build N reels" produces staged reels indistinguishable from manually-built ones.
+- "Send N to Import" lands the approved threads in the bulk builder indistinguishable from hand-pasted
+  links; building them produces reels indistinguishable from manually-built ones, and only built posts
+  leave the Scout buffer.
 - No global crash on any single fetch/parse failure.
 
 ## 10. Out of scope for v1 (phase-2)
