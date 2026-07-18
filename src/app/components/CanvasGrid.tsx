@@ -33,7 +33,8 @@ import { computePipelineStages, computePipelineMusicId } from '@/lib/pipelineSta
 import { markRedditUsed } from '@/lib/redditScout/markUsed';
 import { ScoutPanel } from './ScoutPanel';
 import { canonicalThreadKey, partitionImportUrls, releaseByUrls, migrateScoutBuffer, postIdFromUrl } from '@/lib/redditScout/handoff';
-import { applyThreadEdits, hasThreadEdits, remapCommentEdits, splitParagraphs } from '@/lib/redditThreadEdits';
+import { parseStoredThreads, serializeThreads } from '@/lib/redditScout/bulkPersist';
+import { applyThreadEdits, hasThreadEdits, remapCommentEdits, depth0IndexOf, writeCommentEdit, readCommentEdit, splitParagraphs } from '@/lib/redditThreadEdits';
 import type { RedditThreadEdits } from './TikTokCanvas/types';
 import type { ScoutCandidate } from '@/lib/redditScout/types';
 import { useObservedSize, fitScaleFor } from '@/app/hooks/useElementSize';
@@ -1147,12 +1148,30 @@ interface BulkThread {
   paragraphs: string[];
   selectedComments: Set<number>;
   selectedParas: Set<number>;
+  // Pick-stage text edits. Comment keys are DEPTH-0 space (the stored convention shared with the flyout
+  // + copy paths); paragraph keys are paragraph index; both carry *Orig anchors for drift-skip.
+  edits: RedditThreadEdits;
 }
+
+// The bulk builder's picking state (imported threads + comment/paragraph selections + text edits) is
+// PERSISTED so it survives a reload — and, critically, an HMR remount (adding a hook to this component
+// makes Fast Refresh drop its state, which once wiped a user's in-progress picks). localStorage, not
+// IndexedDB: a session's worth of threads is well under quota, and a QuotaExceededError degrades to
+// "not persisted" via the caller's try/catch rather than breaking the build.
+const BULK_STORE_KEY = 'bulk:threads';
+function loadBulkThreads(): BulkThread[] {
+  try {
+    // parseStoredThreads (tested) validates per-entry and never throws; wrap arrays back into Sets here.
+    const parsed = parseStoredThreads<ImportedRedditPost, ImportedRedditComment>(JSON.parse(localStorage.getItem(BULK_STORE_KEY) ?? '[]'));
+    return parsed.map(t => ({ ...t, selectedComments: new Set(t.selectedComments), selectedParas: new Set(t.selectedParas) }));
+  } catch { return []; }   // localStorage undefined on the server / parse error → fresh
+}
+const serializeBulkThreads = (threads: BulkThread[]): string => serializeThreads(threads);
 
 function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsumed, onQueueDone }: {
   open: boolean;
   onClose: () => void;
-  onBuild: (threads: Array<{ url: string; post: ImportedRedditPost; comments: ImportedRedditComment[]; selectedComments: number[]; selectedParas: number[] }>) => Promise<{ built: number; failed: number }>;
+  onBuild: (threads: Array<{ url: string; post: ImportedRedditPost; comments: ImportedRedditComment[]; selectedComments: number[]; selectedParas: number[]; edits?: RedditThreadEdits }>) => Promise<{ built: number; failed: number }>;
   speed: number;   // narration speed — scales the live length estimate shown while picking comments
   /** Scout → Import handoff: approved post urls to auto-import when the panel opens. */
   queuedUrls?: string[] | null;
@@ -1164,8 +1183,9 @@ function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsume
   onQueueDone?: (presentUrls: string[]) => void;
 }) {
   const [linksText, setLinksText] = useState('');
-  const [threads, setThreads] = useState<BulkThread[]>([]);
-  const [phase, setPhase] = useState<'input' | 'importing' | 'select' | 'building'>('input');
+  const [threads, setThreads] = useState<BulkThread[]>(loadBulkThreads);
+  // Restored threads land straight in the select phase (skip the empty paste screen).
+  const [phase, setPhase] = useState<'input' | 'importing' | 'select' | 'building'>(() => (threads.length ? 'select' : 'input'));
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [error, setError] = useState('');
   const [activeThread, setActiveThread] = useState(0);              // which thread's tab is open
@@ -1174,10 +1194,61 @@ function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsume
   const [addText, setAddText] = useState('');
   const [adding, setAdding] = useState(false);                     // importing appended threads
   const [reading, setReading] = useState<{ kind: 'c' | 'p'; idx: number } | null>(null);  // comment/para shown full-text in the reading pane
+  const [editing, setEditing] = useState<{ kind: 't' | 'c' | 'p'; idx: number } | null>(null);  // which item's text box is open (idx = FULL comment index / para index)
+  const [draft, setDraft] = useState('');
   const importGen = useRef(0);   // bumped by reset(); an in-flight import from a prior generation lands nothing
   const COMMENTS_PER_PAGE = 8;
-  // Reset the reading pane when the active thread changes, so a stale index from another thread never shows.
-  useEffect(() => { setReading(null); }, [activeThread]);
+
+  // Persist the picking state on every change. Same mount-echo guard as the Scout buffer: never write []
+  // over stored threads until a non-empty set has been committed this mount (value-based, so a StrictMode
+  // double-invoke or a failed read can't clobber). A genuine clear (Start over) writes [] after a real
+  // commit. Threads are re-serialised whole — cheap for a session's worth, and always fully consistent.
+  const bulkSawThreads = useRef(false);
+  useEffect(() => {
+    try {
+      if (threads.length > 0) { bulkSawThreads.current = true; localStorage.setItem(BULK_STORE_KEY, serializeBulkThreads(threads)); return; }
+      if (!bulkSawThreads.current) return;   // mount echo / failed read — don't clobber good data with []
+      localStorage.setItem(BULK_STORE_KEY, '[]');
+    } catch { /* quota exceeded / private mode — degrade to not-persisted, never break */ }
+  }, [threads]);
+  // Reset the reading pane + any open editor when the active thread changes (a stale index from another
+  // thread must never show or commit).
+  useEffect(() => { setReading(null); setEditing(null); }, [activeThread]);
+
+  // ── Pick-stage text editing (parity with the per-reel flyout; both persist to redditThread.edits). ──
+  const setActiveEdits = (fn: (e: RedditThreadEdits) => RedditThreadEdits) =>
+    setThreads(prev => prev.map((t, i) => (i === activeThread ? { ...t, edits: fn(t.edits) } : t)));
+  // Effective (edited-or-original) text getters. Comment edits are keyed by DEPTH-0 rank.
+  const editedTitle = (t: BulkThread) => (t.edits.title?.trim() ? t.edits.title : t.post.title);
+  const editedPara = (t: BulkThread, pi: number) => (t.edits.paras?.[pi]?.trim() ? t.edits.paras[pi] : t.paragraphs[pi]);
+  const editedComment = (t: BulkThread, fullIdx: number) => readCommentEdit(t.comments, fullIdx, t.edits).text;
+  const commentIsEdited = (t: BulkThread, fullIdx: number) => readCommentEdit(t.comments, fullIdx, t.edits).edited;
+  const openEditBulk = (t: BulkThread, kind: 't' | 'c' | 'p', idx: number) => {
+    setEditing({ kind, idx });
+    setDraft(kind === 't' ? editedTitle(t) : kind === 'p' ? editedPara(t, idx) : editedComment(t, idx));
+  };
+  const commitEditBulk = () => {
+    if (!editing) return;
+    const t = threads[activeThread];
+    if (!t) { setEditing(null); return; }
+    const { kind, idx } = editing;
+    setActiveEdits(prev => {
+      // Comments go through the shared, tested depth-0 keying helper; title/paragraph are index-keyed.
+      if (kind === 'c') return writeCommentEdit(t.comments, idx, draft, prev);
+      const val = draft.trim();
+      const next: RedditThreadEdits = { ...prev, paras: { ...prev.paras }, paraOrig: { ...prev.paraOrig } };
+      if (kind === 't') {
+        if (!val || val.replace(/\s*\n+\s*/g, ' ') === t.post.title) delete next.title; else next.title = val;
+      } else {
+        const orig = t.paragraphs[idx] ?? '';
+        if (!val || val.replace(/\n\s*\n/g, '\n') === orig) { delete next.paras![idx]; delete next.paraOrig![idx]; }
+        else { next.paras![idx] = val; next.paraOrig![idx] = orig; }
+      }
+      for (const key of ['paras', 'paraOrig'] as const) if (!Object.keys(next[key]!).length) delete next[key];
+      return next;
+    });
+    setEditing(null);
+  };
 
   // Import pasted links. append=false replaces the grid (initial import); append=true keeps the existing
   // threads and adds the new ones (dedup by URL) so more threads can be pulled in after the first fetch.
@@ -1208,7 +1279,7 @@ function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsume
         const json = await res.json();
         if (res.ok && json.post) {
           // Keep the full tree (top-level + replies) so the picker can group each comment with its reply.
-          return { url, post: json.post, comments: json.comments ?? [], paragraphs: splitParagraphs(json.post.body), selectedComments: new Set(), selectedParas: new Set() };
+          return { url, post: json.post, comments: json.comments ?? [], paragraphs: splitParagraphs(json.post.body), selectedComments: new Set(), selectedParas: new Set(), edits: {} };
         }
       } catch { /* skip a failed thread */ }
       return null;
@@ -1296,9 +1367,10 @@ function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsume
   // comments, at the current narration speed. Rough (real duration lands once narrated), but enough to flag
   // a thread that would blow past the 3:00 Shorts limit BEFORE any TTS is spent.
   const threadEstSeconds = (t: BulkThread) => {
-    const parts = [t.post.title];
-    for (const pi of t.selectedParas) if (t.paragraphs[pi]) parts.push(t.paragraphs[pi]);
-    for (const ci of t.selectedComments) if (t.comments[ci]) parts.push(t.comments[ci].body);
+    // Estimate the EDITED text (what actually narrates), so the length warning matches the built reel.
+    const parts = [editedTitle(t)];
+    for (const pi of t.selectedParas) if (t.paragraphs[pi]) parts.push(editedPara(t, pi));
+    for (const ci of t.selectedComments) if (t.comments[ci]) parts.push(editedComment(t, ci));
     return estimateNarrationSeconds(parts.join(' '), speed);
   };
   // Only estimate a thread that will actually build a reel (≥1 pick) — else a title-only phantom ~m:ss shows
@@ -1310,7 +1382,7 @@ function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsume
     if (!ready.length) return;
     setPhase('building'); setError('');
     try {
-      const r = await onBuild(ready.map(t => ({ url: t.url, post: t.post, comments: t.comments, selectedComments: [...t.selectedComments], selectedParas: [...t.selectedParas] })));
+      const r = await onBuild(ready.map(t => ({ url: t.url, post: t.post, comments: t.comments, selectedComments: [...t.selectedComments], selectedParas: [...t.selectedParas], edits: hasThreadEdits(t.edits) ? t.edits : undefined })));
       if (r.built >= ready.length && r.failed === 0) {
         // Clean full build: keep the imported threads (persistence) but clear their selections so
         // reopening the panel can't accidentally rebuild the same reels.
@@ -1439,24 +1511,36 @@ function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsume
                         <span className="block text-caption text-fg truncate">
                           {isReply && <span aria-hidden className="text-fg-3 mr-1">↳</span>}
                           {c.user.name}{c.isOP ? ' · OP' : ''}{isReply ? ' · reply' : ''}
+                          {commentIsEdited(t, idx) && <span className="text-accent-text"> · edited</span>}
                         </span>
-                        <span className="text-caption text-fg-3 line-clamp-2">{c.body}</span>
+                        <span className="text-caption text-fg-3 line-clamp-2">{editedComment(t, idx)}</span>
                       </span>
                     </button>
                   );
 
                   return (
                     <>
-                      <div className="text-caption text-fg font-medium leading-snug pb-1">
-                        {t.post.user.name} · {t.post.title}
-                      </div>
+                      {editing?.kind === 't' ? (
+                        <div className="pb-1"><ThreadEditBox label="Title" draft={draft} setDraft={setDraft} onSave={commitEditBulk} onCancel={() => setEditing(null)} rows={2} /></div>
+                      ) : (
+                        <div className="flex items-start gap-1 text-caption text-fg font-medium leading-snug pb-1">
+                          <span className="min-w-0 flex-1">
+                            {t.post.user.name} · {editedTitle(t)}
+                            {t.edits.title?.trim() && <span className="text-accent-text"> · edited</span>}
+                          </span>
+                          <button type="button" onClick={() => openEditBulk(t, 't', 0)} aria-label="Edit title" title="Tweak the title text"
+                            className="focus-ring shrink-0 rounded-sm p-0.5 text-fg-4 hover:text-fg hover:bg-hover"><PencilIcon size={11} /></button>
+                        </div>
+                      )}
                       {t.paragraphs.map((p, pi) => (
                         <button key={`p${pi}`} type="button"
                           onClick={() => { toggle(activeThread, 'p', pi); setReading({ kind: 'p', idx: pi }); }}
                           onMouseEnter={() => setReading({ kind: 'p', idx: pi })} onFocus={() => setReading({ kind: 'p', idx: pi })}
                           className={`flex items-start gap-2 px-1.5 py-1 rounded-sm text-left ${t.selectedParas.has(pi) ? 'bg-active' : isReading('p', pi) ? 'bg-hover' : 'hover:bg-hover'}`}>
                           <span className={`mt-0.5 flex items-center justify-center size-3.5 shrink-0 rounded-[3px] border ${t.selectedParas.has(pi) ? 'bg-action border-action text-action-fg' : 'border-line-strong text-transparent'}`}><CheckIcon size={9} /></span>
-                          <span className="min-w-0 flex-1 text-caption text-fg-3 line-clamp-2">Post: {p}</span>
+                          <span className="min-w-0 flex-1 text-caption text-fg-3 line-clamp-2">
+                            {t.edits.paras?.[pi]?.trim() && <span className="text-accent-text">edited · </span>}Post: {editedPara(t, pi)}
+                          </span>
                         </button>
                       ))}
                       {groups.slice(0, shown).map(g => (
@@ -1481,23 +1565,32 @@ function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsume
                 {(() => {
                   const t = threads[activeThread];
                   if (!t) return null;
-                  const target = reading
-                    ?? (t.comments.length ? { kind: 'c' as const, idx: 0 } : t.paragraphs.length ? { kind: 'p' as const, idx: 0 } : null);
+                  // While a comment/paragraph editor is open, PIN the pane to that item — else hovering a
+                  // left-list row would swap the pane and silently unmount the open editor mid-edit.
+                  const target = (editing && (editing.kind === 'c' || editing.kind === 'p'))
+                    ? { kind: editing.kind, idx: editing.idx }
+                    : reading ?? (t.comments.length ? { kind: 'c' as const, idx: 0 } : t.paragraphs.length ? { kind: 'p' as const, idx: 0 } : null);
                   if (!target) return <p className="text-caption text-fg-3">This thread has no comments to read.</p>;
                   if (target.kind === 'p') {
                     const p = t.paragraphs[target.idx];
                     if (p == null) return null;
                     const selected = t.selectedParas.has(target.idx);
+                    const isEditing = editing?.kind === 'p' && editing.idx === target.idx;
                     return (
                       <div className="flex flex-col gap-3">
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-caption text-fg font-medium">Post body</span>
-                          <button type="button" onClick={() => toggle(activeThread, 'p', target.idx)}
-                            className={`shrink-0 px-2.5 py-1 rounded-md text-caption ${selected ? 'bg-action text-action-fg' : 'border border-line-strong text-fg-2 hover:bg-hover'}`}>
-                            {selected ? 'Added ✓' : 'Add to reel'}
-                          </button>
+                          <span className="text-caption text-fg font-medium">Post body{t.edits.paras?.[target.idx]?.trim() && <span className="text-accent-text"> · edited</span>}</span>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {!isEditing && <button type="button" onClick={() => openEditBulk(t, 'p', target.idx)} className="px-2 py-1 rounded-md text-caption border border-line-strong text-fg-2 hover:bg-hover">Edit text</button>}
+                            <button type="button" onClick={() => toggle(activeThread, 'p', target.idx)}
+                              className={`px-2.5 py-1 rounded-md text-caption ${selected ? 'bg-action text-action-fg' : 'border border-line-strong text-fg-2 hover:bg-hover'}`}>
+                              {selected ? 'Added ✓' : 'Add to reel'}
+                            </button>
+                          </div>
                         </div>
-                        <p className="text-body text-fg-2 whitespace-pre-wrap break-words leading-relaxed">{p}</p>
+                        {isEditing
+                          ? <ThreadEditBox label={`Paragraph ${target.idx + 1}`} draft={draft} setDraft={setDraft} onSave={commitEditBulk} onCancel={() => setEditing(null)} rows={6} />
+                          : <p className="text-body text-fg-2 whitespace-pre-wrap break-words leading-relaxed">{editedPara(t, target.idx)}</p>}
                       </div>
                     );
                   }
@@ -1505,19 +1598,27 @@ function BulkBuilder({ open, onClose, onBuild, speed, queuedUrls, onQueueConsume
                   if (!c) return null;
                   const isReply = (c.depth ?? 0) > 0;
                   const selected = t.selectedComments.has(target.idx);
+                  const isEditing = editing?.kind === 'c' && editing.idx === target.idx;
                   return (
                     <div className="flex flex-col gap-3">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-caption text-fg font-medium min-w-0 truncate">
                           {isReply && <span aria-hidden className="text-fg-3 mr-1">↳</span>}
                           {c.user.name}{c.isOP ? ' · OP' : ''}{isReply ? ' · reply' : ''}{c.score ? ` · ${c.score}` : ''}{c.timeAgo ? ` · ${c.timeAgo}` : ''}
+                          {commentIsEdited(t, target.idx) && <span className="text-accent-text"> · edited</span>}
                         </span>
-                        <button type="button" onClick={() => toggle(activeThread, 'c', target.idx)}
-                          className={`shrink-0 px-2.5 py-1 rounded-md text-caption ${selected ? 'bg-action text-action-fg' : 'border border-line-strong text-fg-2 hover:bg-hover'}`}>
-                          {selected ? 'Added ✓' : 'Add to reel'}
-                        </button>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {/* Replies aren't editable — the edit key space is depth-0 only (parity with the flyout, which drops replies). */}
+                          {!isEditing && !isReply && <button type="button" onClick={() => openEditBulk(t, 'c', target.idx)} className="px-2 py-1 rounded-md text-caption border border-line-strong text-fg-2 hover:bg-hover">Edit text</button>}
+                          <button type="button" onClick={() => toggle(activeThread, 'c', target.idx)}
+                            className={`px-2.5 py-1 rounded-md text-caption ${selected ? 'bg-action text-action-fg' : 'border border-line-strong text-fg-2 hover:bg-hover'}`}>
+                            {selected ? 'Added ✓' : 'Add to reel'}
+                          </button>
+                        </div>
                       </div>
-                      <p className="text-body text-fg-2 whitespace-pre-wrap break-words leading-relaxed">{c.body}</p>
+                      {isEditing
+                        ? <ThreadEditBox label={`${c.user.name}'s comment`} draft={draft} setDraft={setDraft} onSave={commitEditBulk} onCancel={() => setEditing(null)} rows={6} />
+                        : <p className="text-body text-fg-2 whitespace-pre-wrap break-words leading-relaxed">{editedComment(t, target.idx)}</p>}
                     </div>
                   );
                 })()}
@@ -2333,7 +2434,7 @@ export function CanvasGrid({
   // (the Scout buffer keeps unbuilt entries; the bulk builder keeps selections + shows the error).
   const buildReelsFromThreads = useCallback(async (threads: Array<{
     url: string; post: ImportedRedditPost; comments: ImportedRedditComment[];
-    selectedComments: number[]; selectedParas: number[];
+    selectedComments: number[]; selectedParas: number[]; edits?: RedditThreadEdits;
   }>): Promise<{ built: number; failed: number; builtUrls: string[] }> => {
     if (!onAddReels || !threads.length) return { built: 0, failed: 0, builtUrls: [] };
     const segs = await fetchFootageManifest().catch(() => [] as FootageSegment[]);
@@ -2344,7 +2445,10 @@ export function CanvasGrid({
     const results = await Promise.allSettled(ids.map(async (reelId, i) => {
       const t = threads[i];
       if (!t) return;
-      const data = buildRedditCardData(t.post, t.comments, new Set(t.selectedComments), new Set(t.selectedParas));
+      // Apply the Pick-stage text edits (comment keys are depth-0 space; t.comments is the full tree, so
+      // remap depth-0→full first — identical to the copy paths). Empty/absent edits = identity.
+      const eff = applyThreadEdits(t.post, t.comments, remapCommentEdits(t.comments, t.edits));
+      const data = buildRedditCardData(eff.post, eff.comments, new Set(t.selectedComments), new Set(t.selectedParas));
       const card = await renderRedditCard(data);
       const postAuthor = data.user.name.replace(/^u\//, '');
       const blockAuthors = [postAuthor, postAuthor, ...data.comments.map(c => c.user.name.replace(/^u\//, ''))];
@@ -2353,7 +2457,11 @@ export function CanvasGrid({
       await saveOverlayImage(overlayId, card.blob, 'reddit-card.png');
       const overlay: Omit<ImageOverlay, 'src' | 'audioSrc'> = { id: overlayId, name: 'Reddit thread', ...rect, start: 0, end: 3600, ocrLines, blockAuthors };
       threadCacheRef.current.set(reelId, { url: t.url, post: t.post, comments: t.comments });   // url-tagged so copy skips the re-import ONLY while the thread is unchanged
-      setFramingMap(prev => ({ ...prev, [reelId]: { ...prev[reelId], overlays: [overlay], redditThread: { url: t.url, comments: t.selectedComments, paras: t.selectedParas } } }));
+      // Store the comment selection in DEPTH-0 space (the flyout — the sole reader of redditThread.comments
+      // — restores it onto its depth-0-filtered list; storing full-tree indices would mis-highlight for
+      // reply-heavy threads). Card + copy are unaffected (both use t.selectedComments / edits directly).
+      const selDepth0 = t.selectedComments.map(fi => depth0IndexOf(t.comments, fi)).filter((k): k is number => k != null);
+      setFramingMap(prev => ({ ...prev, [reelId]: { ...prev[reelId], overlays: [overlay], redditThread: { url: t.url, comments: selDepth0, paras: t.selectedParas, edits: hasThreadEdits(t.edits) ? t.edits : undefined } } }));
       // Shared no-repeat ledger — marked HERE, per reel, only after this reel actually framed: threads
       // truncated by the reel cap (addReels slices at MAX_REELS) or whose card failed to render must NOT
       // be recorded 'used' (§4.4: skipped ≠ decided), and one sibling's failure must not drop the others'

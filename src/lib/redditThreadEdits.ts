@@ -7,7 +7,7 @@ import type { RedditThreadEdits } from '@/app/components/TikTokCanvas/types';
 /** THE canonical paragraph splitter — the same function derives the pickable paragraph list and the
     edit indices, so they can never drift. (Blank-line separated, trimmed, empties dropped.) */
 export const splitParagraphs = (body?: string): string[] =>
-  (body ?? '').split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+  (typeof body === 'string' ? body : '').split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
 
 const usable = (s: unknown): s is string => typeof s === 'string' && s.trim().length > 0;
 
@@ -33,6 +33,53 @@ export function remapCommentEdits<C extends { depth?: number }>(
     return out;
   };
   return { ...edits, comments: remap(edits.comments), commentOrig: remap(edits.commentOrig) };
+}
+
+/** The DEPTH-0 rank (0-based) of the comment at full-array index `fullIdx`, or null if that comment is
+    not top-level. The inverse of remapCommentEdits' depth-0→full mapping: the bulk builder picks in
+    full-tree index space but must KEY edits in the shared depth-0 space, so it maps each editable
+    (top-level) comment's full index to its depth-0 rank. Identity when the tree has no replies. */
+export function depth0IndexOf(comments: { depth?: number }[], fullIdx: number): number | null {
+  if ((comments[fullIdx]?.depth ?? 0) !== 0) return null;
+  let k = 0;
+  for (let i = 0; i < fullIdx; i++) if ((comments[i]?.depth ?? 0) === 0) k++;
+  return k;
+}
+
+/** WRITE a comment text edit from a FULL-tree index, keyed in the shared DEPTH-0 space (via
+    depth0IndexOf), with a drift anchor (commentOrig) and clear-on-blank/match. Returns a NEW edits
+    object; inputs untouched. A reply (depth>0) has no depth-0 slot → edits returned unchanged (replies
+    aren't editable). This is the single source of truth for the bulk builder's comment-edit keying, so
+    the full↔depth-0 mapping is unit-testable (a mutant keying by full index fails the round-trip test). */
+export function writeCommentEdit(
+  comments: { body: string; depth?: number }[],
+  fullIdx: number,
+  value: string,
+  prev: RedditThreadEdits,
+): RedditThreadEdits {
+  const k = depth0IndexOf(comments, fullIdx);
+  if (k == null) return prev;
+  const val = value.trim();
+  const orig = comments[fullIdx]?.body ?? '';
+  const next: RedditThreadEdits = { ...prev, comments: { ...prev.comments }, commentOrig: { ...prev.commentOrig } };
+  if (!val || val === orig) { delete next.comments![k]; delete next.commentOrig![k]; }
+  else { next.comments![k] = val; next.commentOrig![k] = orig; }
+  if (!Object.keys(next.comments!).length) delete next.comments;
+  if (!Object.keys(next.commentOrig!).length) delete next.commentOrig;
+  return next;
+}
+
+/** READ the effective (edited-or-original) comment body + edited flag for a FULL-tree index — the
+    inverse of writeCommentEdit's keying. */
+export function readCommentEdit(
+  comments: { body: string; depth?: number }[],
+  fullIdx: number,
+  edits: RedditThreadEdits | undefined,
+): { text: string; edited: boolean } {
+  const k = depth0IndexOf(comments, fullIdx);
+  const e = k != null ? edits?.comments?.[k] : undefined;
+  const edited = !!e?.trim();
+  return { text: edited ? e! : (comments[fullIdx]?.body ?? ''), edited };
 }
 
 /** Apply edits to an imported thread, returning edited COPIES (inputs untouched) + the labels of any

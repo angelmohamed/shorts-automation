@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { applyThreadEdits, remapCommentEdits, splitParagraphs, hasThreadEdits } from './redditThreadEdits';
+import { applyThreadEdits, remapCommentEdits, depth0IndexOf, writeCommentEdit, readCommentEdit, splitParagraphs, hasThreadEdits } from './redditThreadEdits';
 
 // Expectations from the design contract: edits are keyed by the SAME indices the pickable lists use;
 // empty/garbage overrides never destroy content; a para edit must never change the paragraph COUNT
@@ -132,6 +132,78 @@ describe('remapCommentEdits (flyout depth-0 universe → raw unfiltered array)',
     expect(remapCommentEdits(raw, undefined)).toBeUndefined();
     const e = { title: 'T' };
     expect(remapCommentEdits(raw, e)).toBe(e);
+  });
+});
+
+describe('depth0IndexOf (bulk full-tree index → shared depth-0 key)', () => {
+  const raw = [
+    { body: 'top A', depth: 0 },     // full 0 → depth-0 rank 0
+    { body: 'reply', depth: 1 },     // full 1 → null (not top-level)
+    { body: 'top B', depth: 0 },     // full 2 → depth-0 rank 1
+    { body: 'top C', depth: 0 },     // full 3 → depth-0 rank 2
+  ];
+  it('maps each top-level comment to its depth-0 rank', () => {
+    expect(depth0IndexOf(raw, 0)).toBe(0);
+    expect(depth0IndexOf(raw, 2)).toBe(1);
+    expect(depth0IndexOf(raw, 3)).toBe(2);
+  });
+  it('returns null for a reply (not editable / not in depth-0 space)', () => {
+    expect(depth0IndexOf(raw, 1)).toBeNull();
+  });
+  it('is the round-trip inverse of remapCommentEdits for top-level comments', () => {
+    // edit keyed at depth-0 rank 1 → remap to full → full index 2 → depth0IndexOf back to 1.
+    const full = remapCommentEdits(raw, { comments: { 1: 'x' } })!.comments!;
+    const fullIdx = Number(Object.keys(full)[0]);
+    expect(fullIdx).toBe(2);
+    expect(depth0IndexOf(raw, fullIdx)).toBe(1);
+  });
+  it('is identity on a reply-free tree (the common case)', () => {
+    const flat = [{ depth: 0 }, { depth: 0 }, { depth: 0 }];
+    expect([0, 1, 2].map(i => depth0IndexOf(flat, i))).toEqual([0, 1, 2]);
+  });
+});
+
+describe('writeCommentEdit / readCommentEdit (bulk keying round-trip)', () => {
+  // reply-heavy tree: full idx 0 = C0(d0), 1 = R1(d1 reply), 2 = C2(d0).
+  const comments = [{ body: 'C0', depth: 0 }, { body: 'R1', depth: 1 }, { body: 'C2', depth: 0 }];
+
+  it('THE mutant-killer: editing full idx 2 keys DEPTH-0 rank 1, not full idx 2', () => {
+    const e = writeCommentEdit(comments, 2, 'C2 edited', {});
+    expect(e.comments).toEqual({ 1: 'C2 edited' });     // rank 1 — a full-index mutant would write {2:…}
+    expect(e.commentOrig).toEqual({ 1: 'C2' });          // drift anchor recorded
+  });
+
+  it('read reflects the edit on full idx 2 and NOT on the reply at full idx 1', () => {
+    const e = writeCommentEdit(comments, 2, 'C2 edited', {});
+    expect(readCommentEdit(comments, 2, e)).toEqual({ text: 'C2 edited', edited: true });
+    expect(readCommentEdit(comments, 1, e)).toEqual({ text: 'R1', edited: false });   // reply: never an edit
+    expect(readCommentEdit(comments, 0, e)).toEqual({ text: 'C0', edited: false });
+  });
+
+  it('round-trips through remapCommentEdits → applyThreadEdits onto the RIGHT full comment', () => {
+    const e = writeCommentEdit(comments, 2, 'C2 edited', {});
+    const applied = applyThreadEdits({ title: 't' }, comments, remapCommentEdits(comments, e));
+    expect(applied.comments[2].body).toBe('C2 edited');   // C2 rewritten
+    expect(applied.comments[1].body).toBe('R1');           // reply untouched
+    expect(applied.comments[0].body).toBe('C0');
+  });
+
+  it('a reply (depth>0) is never editable — write is a no-op', () => {
+    expect(writeCommentEdit(comments, 1, 'hacked reply', {})).toEqual({});
+  });
+
+  it('blank or original-matching value clears the override + its anchor', () => {
+    const e = writeCommentEdit(comments, 2, 'C2 edited', {});
+    expect(writeCommentEdit(comments, 2, '   ', e)).toEqual({});    // blank clears
+    expect(writeCommentEdit(comments, 2, 'C2', e)).toEqual({});     // back to original clears
+  });
+
+  it('preserves unrelated edits (title, paras, other comments) untouched', () => {
+    const prev = { title: 'T', paras: { 0: 'p' }, comments: { 0: 'c0 edit' }, commentOrig: { 0: 'C0' } };
+    const e = writeCommentEdit(comments, 2, 'C2 edited', prev);
+    expect(e.title).toBe('T');
+    expect(e.paras).toEqual({ 0: 'p' });
+    expect(e.comments).toEqual({ 0: 'c0 edit', 1: 'C2 edited' });
   });
 });
 
