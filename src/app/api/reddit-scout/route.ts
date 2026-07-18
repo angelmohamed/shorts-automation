@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { deleteDecision, getSeenIds, markDecision, listUsed } from '@/lib/redditScout/ledger';
 import { postIdFromUrl, subredditFromUrl } from '@/lib/redditScout/handoff';
-import { runScan, type ScanResult } from '@/lib/redditScout/scan';
+import { runScan } from '@/lib/redditScout/scan';
 import { browserSource } from '@/lib/redditScout/source';
 import { SCOUT_SUBREDDITS } from '@/lib/redditScout/config';
 import { sanitizeDecisionFeatures, cleanText, MAX_TITLE_CHARS } from '@/lib/redditScout/features';
@@ -20,10 +20,11 @@ export const runtime = 'nodejs';
 // self-hosted Node server (no route timeout there); declared for any platform that enforces limits.
 export const maxDuration = 120;
 
-// Single-flight for 'scan': App Router handlers run concurrently in one Node process, so a double-clicked
-// "Scout now" (or an impatient retry) would interleave two full scans through the serialized browser chain,
-// defeating the §4.1 politeness gap. Concurrent callers join the SAME in-flight scan and share its result.
-let scanInFlight: Promise<ScanResult> | null = null;
+// Serialized scan QUEUE: App Router handlers run concurrently in one Node process, so two scans would
+// interleave through the shared browser chain, defeating the §4.1 politeness gap. A chained tail runs
+// scans strictly one-at-a-time — and, unlike a single-flight promise, each caller awaits its OWN run, so
+// two scans with DIFFERENT subreddit selections can't cross results (a joiner getting the other's subs).
+let scanQueue: Promise<unknown> = Promise.resolve();
 
 export async function POST(request: NextRequest) {
   // `?? {}`: a literal `null` JSON body parses successfully (json() doesn't reject), so the catch alone
@@ -32,8 +33,17 @@ export async function POST(request: NextRequest) {
   const action = body.action;
   try {
     if (action === 'scan') {
-      scanInFlight ??= runScan(browserSource, { getSeenIds }).finally(() => { scanInFlight = null; });
-      return NextResponse.json(await scanInFlight);
+      // Optional subreddit subset from the client — filter CONFIG to the requested names (case-insensitive)
+      // so only configured subs can ever be fetched (no arbitrary sub / SSRF). Absent → all (default).
+      const requested = Array.isArray(body.subs)
+        ? new Set(body.subs.filter((s): s is string => typeof s === 'string').map(s => s.toLowerCase()))
+        : null;
+      const subs = requested ? SCOUT_SUBREDDITS.filter(s => requested.has(s.name.toLowerCase())) : undefined;
+      // Chain onto the queue tail (both branches re-invoke so a prior scan's rejection can't poison it);
+      // await THIS run's own result. The panel's disabled-while-scanning guard makes same-tab dupes moot.
+      const run = scanQueue.then(() => runScan(browserSource, { getSeenIds, subs }), () => runScan(browserSource, { getSeenIds, subs }));
+      scanQueue = run.catch(() => {});
+      return NextResponse.json(await run);
     }
     if (action === 'mark-used') {
       const url = String(body.url ?? '');

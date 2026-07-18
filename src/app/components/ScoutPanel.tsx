@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from './ui/Button';
 import type { ScoutCandidate } from '@/lib/redditScout/types';
 import type { UsedRow } from '@/lib/redditScout/ledger';   // type-only — erased at build, pulls no supabase
@@ -18,6 +18,30 @@ interface ScanStats { subsScanned: number; fetched: number; afterThresholds: num
 interface ScanResponse { candidates: ScoutCandidate[]; failedSubs: string[]; stats: ScanStats; error?: string }
 
 const CATEGORY_BY_SUB = new Map(SCOUT_SUBREDDITS.map(s => [s.name.toLowerCase(), s.category]));
+
+// The subreddits a scan CAN include — image subs are excluded in v1 (the format renders a text card).
+const SELECTABLE_SUBS = SCOUT_SUBREDDITS.filter(s => !s.image);
+const ALL_SUB_NAMES = SELECTABLE_SUBS.map(s => s.name);
+const SUB_CATEGORIES = ['A', 'B', 'C', 'D'] as const;
+
+/** Restore the enabled-subreddit selection. An explicit stored selection (incl. empty) is honoured;
+    only a first run / corrupt value defaults to all. Unknown names (config changed) are dropped. */
+function loadSelectedSubs(): Set<string> {
+  try {
+    const stored = localStorage.getItem('scout:subs');
+    if (stored != null) {
+      const raw: unknown = JSON.parse(stored);
+      if (Array.isArray(raw)) {
+        const known = raw.filter((n): n is string => typeof n === 'string' && ALL_SUB_NAMES.includes(n));
+        // Honour an explicit None (stored []); but a non-empty selection whose every name was removed/
+        // renamed in config drifted to empty — fall back to all rather than stranding the user at 0.
+        if (known.length === 0 && raw.length > 0) return new Set(ALL_SUB_NAMES);
+        return new Set(known);
+      }
+    }
+  } catch { /* corrupt/private → default all */ }
+  return new Set(ALL_SUB_NAMES);
+}
 
 async function post(body: Record<string, unknown>): Promise<Record<string, unknown>> {
   const res = await fetch('/api/reddit-scout', {
@@ -51,13 +75,30 @@ export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, 
   // Last committed decision, for the §4.6 undo (one step, cleared by the next scan).
   const [lastDecision, setLastDecision] = useState<{ kind: 'used' | 'rejected'; candidate: ScoutCandidate; index: number } | null>(null);
   const [deciding, setDeciding] = useState<string | null>(null);   // candidate id with an in-flight decide
+  // Which subreddits a scan includes — persisted, defaults to all. The scan sends the names; the server
+  // filters its config to them (so only configured subs can ever be fetched).
+  const [selectedSubs, setSelectedSubs] = useState<Set<string>>(loadSelectedSubs);
+  const [subsOpen, setSubsOpen] = useState(false);
+  // Skip the mount echo: an UNTOUCHED default stays unpersisted, so loadSelectedSubs keeps returning "all"
+  // dynamically — a subreddit later added to config is auto-included instead of frozen out. A real toggle/
+  // All/None still writes (incl. an explicit empty None).
+  const didMountSubs = useRef(false);
+  useEffect(() => {
+    if (!didMountSubs.current) { didMountSubs.current = true; return; }
+    try { localStorage.setItem('scout:subs', JSON.stringify([...selectedSubs])); } catch { /* quota/private */ }
+  }, [selectedSubs]);
+  const toggleSub = (name: string) => setSelectedSubs(prev => {
+    const next = new Set(prev);
+    if (next.has(name)) next.delete(name); else next.add(name);
+    return next;
+  });
 
   useEffect(() => { onNewCount(candidates.length); }, [candidates.length, onNewCount]);
 
   const scan = useCallback(async () => {
     setScanning(true); setNotice(null); setLastDecision(null);
     try {
-      const r = (await post({ action: 'scan' })) as unknown as ScanResponse;
+      const r = (await post({ action: 'scan', subs: [...selectedSubs] })) as unknown as ScanResponse;
       setScannedAtUtc(Date.now() / 1000);
       const fresh = r.candidates.filter(c => !bufferedIds.has(c.id));
       setCandidates(fresh);
@@ -75,7 +116,7 @@ export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, 
     } finally {
       setScanning(false);
     }
-  }, [bufferedIds]);
+  }, [bufferedIds, selectedSubs]);
 
   // Remove by ID, never by index: the index captured at click time goes stale while the POST is in
   // flight (a Skip or another decide resolving first) and would delete the WRONG candidate. The index
@@ -187,12 +228,53 @@ export function ScoutPanel({ open, onClose, bufferCount, bufferedIds, onBuffer, 
               Undo {lastDecision.kind === 'used' ? 'use' : 'reject'}
             </button>
           )}
-          <Button variant="primary" size="sm" loading={scanning} disabled={scanning} onClick={() => void scan()}>
+          <Button variant="primary" size="sm" loading={scanning} disabled={scanning || selectedSubs.size === 0} onClick={() => void scan()}>
             {scanning ? 'Scouting…' : 'Scout now'}
           </Button>
           <button type="button" onClick={onClose} aria-label="Close" className="focus-ring rounded-md p-1 text-fg-3 hover:bg-hover hover:text-fg">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden><path d="M18 6 6 18M6 6l12 12" /></svg>
           </button>
+        </div>
+
+        {/* Subreddit selector — choose which subs this scan includes (persisted). */}
+        <div className="border-b border-line px-4 py-2 shrink-0">
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => setSubsOpen(o => !o)} className="flex items-center gap-1 text-caption text-fg-2 hover:text-fg">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden
+                style={{ transform: subsOpen ? 'rotate(90deg)' : 'none', transition: 'transform .12s' }}><path d="m9 18 6-6-6-6" /></svg>
+              <span className="font-medium">Subreddits</span>
+              <span className="tabular-nums text-fg-3">{selectedSubs.size} of {ALL_SUB_NAMES.length}</span>
+            </button>
+            {selectedSubs.size === 0 && <span className="text-caption text-warning-text">pick at least one to scan</span>}
+            {subsOpen && (
+              <div className="ml-auto flex items-center gap-2 text-caption">
+                <button type="button" onClick={() => setSelectedSubs(new Set(ALL_SUB_NAMES))} className="text-fg-3 underline underline-offset-2 hover:text-fg">All</button>
+                <button type="button" onClick={() => setSelectedSubs(new Set())} className="text-fg-3 underline underline-offset-2 hover:text-fg">None</button>
+              </div>
+            )}
+          </div>
+          {subsOpen && (
+            <div className="mt-2 flex flex-col gap-1.5">
+              {SUB_CATEGORIES.map(cat => {
+                const subs = SELECTABLE_SUBS.filter(s => s.category === cat);
+                if (!subs.length) return null;
+                return (
+                  <div key={cat} className="flex flex-wrap items-center gap-1.5">
+                    <span className="w-3 shrink-0 text-[10px] font-semibold text-fg-4">{cat}</span>
+                    {subs.map(s => {
+                      const on = selectedSubs.has(s.name);
+                      return (
+                        <button key={s.name} type="button" onClick={() => toggleSub(s.name)}
+                          className={`rounded-full border px-2 py-0.5 text-caption transition-colors ${on ? 'bg-action border-action text-action-fg' : 'border-line-strong text-fg-3 hover:bg-hover'}`}>
+                          r/{s.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Candidate feed */}
